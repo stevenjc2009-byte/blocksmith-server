@@ -238,17 +238,78 @@ host):
 
 ```bash
 bsgate-keys identity                   # server pubkey + network PSK, for a client build
-bsgate-keys list                       # who is currently allowed
-bsgate-keys add <64-hex-key> <label>   # allow someone
+bsgate-keys list                       # who is allowed, plus any armed invite
+bsgate-keys invite <label>             # one-time code — the easy way, see below
+bsgate-keys add <64-hex-key> <label>   # allow someone by pasting their key
 bsgate-keys revoke <label|64-hex-key>  # remove them — disconnects them NOW, not at next login
 ```
 
-Each friend generates their own keypair in the client build and gives you
-the public half (64 hex characters) to add. `bsgate-keys add`/`revoke`
-validate the resulting allowlist against `bsgate`'s own parser before
-installing it, then reload `bsgate` with `SIGHUP` — a malformed file is
-refused outright rather than partially applied, so a bad edit can't
-silently lock everyone out or leave a revoked key working.
+Each friend's console generates its own keypair on first run. The
+authorisation model is that console's 32-byte public key appearing in
+`/var/lib/bsgate/allowlist`; there are two ways to get it there.
+
+### The easy way: an invite code
+
+```bash
+bsgate-keys invite tom
+```
+
+prints something like
+
+```
+  Send this to tom:
+
+      9K4B2-HMQ7X
+
+  They enter it once on their 3DS. Their console is then added to the
+  allowlist as 'tom' and they can join whenever they like, with no code
+  and nothing to accept — this is a one-time introduction, not a password.
+```
+
+Send it however you like. They type it into the console once, and their
+console's key is written into the allowlist under `tom`, permanently. **They
+never need the code again, and you never have to accept anything.** From
+that moment they are an ordinary allowlist entry — indistinguishable from
+one added by hand, and removed the same way, with `bsgate-keys revoke tom`.
+
+This exists because the alternative asks two devices that share no clipboard
+to move 64 hex characters between them. A 3DS cannot copy, paste or email
+its key; reading it off a screen and retyping it is where this actually
+falls over in practice.
+
+What the code is and is not:
+
+- **One use.** The first correct entry consumes it. A second friend needs a
+  second `bsgate-keys invite`.
+- **Fifteen minutes**, on the wall clock, so a reboot cannot silently extend
+  it. `bsgate-keys invite --cancel` ends it early; `bsgate-status` shows the
+  time remaining, because an armed invite is the one temporarily-open door on
+  a box otherwise designed around having none.
+- **Three wrong attempts and it is dead**, and it says so in the journal.
+- **Stored hashed.** Nothing on the box can print it a second time. Lost it?
+  Arm another; it costs nothing.
+- **Not a way in on its own.** A code is only reachable by a peer that has
+  already completed the full Noise XX handshake, which needs the network PSK
+  from your client build. It admits nobody by itself — it causes a key to be
+  *added to the allowlist*, and the ordinary allowlist check is what admits
+  them, on that connection and every one after it.
+- **With no invite armed, nothing changes.** An unknown key is dropped and
+  logged exactly as it always was. Enrolment is not a permanently reachable
+  code path; it exists only in the minutes after you deliberately armed a
+  code.
+
+Only one invite exists at a time, and only one console may be part-way
+through redeeming it — a peer on probation is not a player, holds no slot in
+the game logic, and is discarded after ten seconds of silence.
+
+### The manual way: paste their key
+
+If you can get the 64 hex characters off the console some other way, `bsgate-keys
+add <key> <label>` still works and is unchanged. `add`/`revoke` validate the
+resulting allowlist against `bsgate`'s own parser before installing it, then
+reload `bsgate` with `SIGHUP` — a malformed file is refused outright rather
+than partially applied, so a bad edit can't silently lock everyone out or
+leave a revoked key working.
 
 ---
 
@@ -283,7 +344,14 @@ where a socket would be another listener with another parser.
 players with their real IP, position, and how long since they were last
 heard from; stored block diffs and edit counters (accepted, plus rejections
 split into out-of-range, rate-limited, and store-full); allowlist size,
-sessions used/max, handshakes in flight, and total dropped packets.
+sessions used/max, handshakes in flight, and total dropped packets; and
+whether an invite is armed, for whom, and how long it has left.
+
+A console part-way through redeeming an invite is reported separately, as
+`enrolling now`, and deliberately kept out of the player table — it is not a
+player, `bsgame` has never heard of it, and listing it alongside real
+players would make a stranger look like a friend for the ten seconds it
+exists.
 
 **What it does not show, and why.** No ping, no latency, no lag figure —
 the server has no way to measure any of that, because it never solicits a
@@ -336,7 +404,7 @@ Layers a packet must survive, outermost first:
 | 4 | Token-bucket rate limits (per-IP + global) | a proven-real address flooding handshakes |
 | 5 | Network PSK | anyone without a client build — no handshake even starts |
 | 6 | Noise XX (via libhydrogen) | passive capture and MITM; gives forward secrecy and mutual authentication |
-| 7 | Public-key allowlist | anyone who has a build and the PSK but isn't a named friend |
+| 7 | Public-key allowlist | anyone who has a build and the PSK but isn't a named friend — unless an invite is armed, in which case they get one guess at a ~49-bit code and nothing else |
 | 8 | AEAD + sliding replay window | tampering, and re-sending a captured packet |
 
 Design points worth knowing, all confirmed against the source:
@@ -360,6 +428,18 @@ Design points worth knowing, all confirmed against the source:
   amplification *reduction*, not a DDoS reflector.
 - **Revocation is immediate.** `bsgate-keys revoke` disconnects the peer
   mid-session over `SIGHUP`, it does not wait for their next login.
+- **Enrolment never bypasses the allowlist; it writes to it.** A correct
+  invite code causes the peer's key to be appended to the allowlist file,
+  which is validated with the daemon's own parser and reloaded *before*
+  anything treats them as admitted. There is no path that admits a session
+  without an allowlist entry existing, so a crash mid-enrolment leaves either
+  "not enrolled" or "enrolled and allowed", never "playing but not listed".
+- **A probation session is not a player.** It is created after the handshake
+  but produces no `JOIN`, so `bsgame` never learns the session exists unless
+  the code checks out; it may send exactly one kind of packet, anything else
+  ends it; there is at most one at a time; and it is swept after ten seconds.
+- **The invite is stored hashed and its strike count is persisted on every
+  wrong guess**, so hammering it cannot be reset by restarting the daemon.
 - **`bsgame` trusts nothing it receives, even though it only ever hears from
   an already-authenticated session.** Every block edit and position update
   is re-validated server-side; a client sending a structurally malformed
@@ -408,7 +488,8 @@ receives the full current diff set as a batch (`BS_APP_WORLD_SYNC`).
 proto/bs_proto.h        wire format — shared verbatim by the 3DS client,
                          bsgate, and bsgame
 gateway/bsgate.c         the transport + authentication daemon
-gateway/allowlist.[ch]   friend public-key list
+gateway/allowlist.[ch]   friend public-key list (and the enrolment append)
+gateway/invite.[ch]      the single armed one-time enrolment code
 gateway/ratelimit.[ch]   token buckets
 gateway/replay.[ch]      sliding anti-replay window
 gateway/proxyproto.[ch]  PROXY protocol v2 parsing
@@ -420,7 +501,9 @@ game/validate.[ch]       server-side edit/position validation
 game/bsgame_test.c       host test suite
 systemd/bsgate.service   sandboxed gateway unit
 systemd/bsgame.service   sandboxed game-logic unit
-tools/bsgate-keys        allowlist management
+tools/bsgate-keys        allowlist and invite management
+docs/CLIENT-ENROLMENT-SPEC.md
+                         what the 3DS build must do to send an invite code
 install/                 Proxmox host + in-container provisioning scripts
 VERSION                  version the `update` command checks against
 ```
@@ -447,8 +530,14 @@ into `gateway/.deps/` on first run (see `deps`), builds `bsgate` and
 
 **Verified, by actually running these:**
 
-- `gateway/bsgate_test.c`: **89/89 checks pass.**
-- `game/bsgame_test.c`: **23/23 checks pass.**
+- `gateway/bsgate_test.c`: **196/196 checks pass.**
+- `game/bsgame_test.c`: **30/30 checks pass.**
+- The enrolment path is covered by six end-to-end cases against a real
+  daemon, and each was proved able to fail: five deliberate mutations
+  (accept any code / never write the allowlist / never consume the invite /
+  drop the one-probation cap / hand out probation with no invite armed) each
+  turn the relevant checks red, 7, 13, 3, 4 and 22 of them respectively,
+  while the rest of the suite stays green.
 - A 3DS client transport test suite: **19/19 checks pass**, run against a
   real, forked `bsgate` process.
 - A block-diff-store test suite: **70/70 checks pass.**
@@ -482,6 +571,16 @@ through v1.0.5); if you are running an older tag, don't.
 - `bsgate-status` has been exercised against a live local daemon pair and
   against hand-written snapshot files, but **not** on the real Proxmox
   container and **not** with a real 3DS connected.
+- **No 3DS can enter an invite code yet.** The server side of enrolment is
+  complete and tested; the console-side entry screen belongs to the client
+  build and does not exist. Until it ships, `bsgate-keys add` is still the
+  only way a real console gets on the allowlist.
+- **`bsgate-keys invite` has not been run as a different uid.** The script
+  drops to the `bsgate` account with `runuser` so the invite file is
+  readable by the daemon; that branch cannot be exercised on a dev machine
+  with no `bsgate` account (`runuser` also refuses to set groups inside a
+  user namespace), so it is first exercised on the container. If it were
+  wrong, the symptom would be an armed invite the daemon reports as `none`.
 
 If you're standing this up for the first time, the honest summary is: the
 container, the build, the hardening and the two daemons are proven on real

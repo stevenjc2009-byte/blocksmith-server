@@ -33,6 +33,7 @@
 
 #include "../proto/bs_proto.h"
 #include "allowlist.h"
+#include "invite.h"
 #include "proxyproto.h"
 #include "ratelimit.h"
 #include "replay.h"
@@ -358,6 +359,164 @@ static void test_allowlist_parsing(void)
     check(!bs_allowlist_load(&bad, path, err, sizeof err), "malformed line refused");
     check(bad.count == 1 && bs_allowlist_find(&bad, pk) != NULL,
           "refused load leaves the previous list untouched");
+}
+
+static void test_allowlist_append(void)
+{
+    puts("allowlist append");
+    char path[192], err[256];
+    snprintf(path, sizeof path, "%s/ap_test", g_dir);
+
+    uint8_t a_pk[BS_KX_PUBLICKEYBYTES], b_pk[BS_KX_PUBLICKEYBYTES];
+    memset(a_pk, 0x11, sizeof a_pk);
+    memset(b_pk, 0x22, sizeof b_pk);
+    char a_hex[2 * BS_KX_PUBLICKEYBYTES + 1];
+    hydro_bin2hex(a_hex, sizeof a_hex, a_pk, sizeof a_pk);
+
+    /* Deliberately written with NO trailing newline. The real allowlist is
+     * mostly explanatory comments written by the provisioner, and a file whose
+     * last line lacks one would otherwise absorb the appended key into it and
+     * produce a list the daemon then refuses to reload — locking everyone out
+     * as the delayed consequence of one enrolment. */
+    FILE *f = fopen(path, "w");
+    fprintf(f, "# keep me\n%s alice", a_hex);
+    fclose(f);
+
+    check(bs_allowlist_append(path, b_pk, "bob", err, sizeof err), "append succeeds");
+
+    struct bs_allowlist al;
+    check(bs_allowlist_load(&al, path, err, sizeof err), "appended file still parses");
+    check(al.count == 2, "both entries present");
+    check(bs_allowlist_find(&al, b_pk) != NULL, "the new key is findable");
+
+    /* The comment is what proves this is an append and not a rewrite. */
+    char buf[512] = {0};
+    f = fopen(path, "r");
+    size_t got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    check(got > 0 && strstr(buf, "# keep me") != NULL, "existing comments survive");
+
+    check(!bs_allowlist_append(path, b_pk, "bob2", err, sizeof err),
+          "duplicate key refused");
+    check(!bs_allowlist_append(path, a_pk, "alice", err, sizeof err),
+          "duplicate label refused");
+    check(!bs_allowlist_append(path, b_pk, "bad label!", err, sizeof err),
+          "invalid label refused");
+
+    /* A refusal must not have touched the file. */
+    struct bs_allowlist after;
+    check(bs_allowlist_load(&after, path, err, sizeof err) && after.count == 2,
+          "refused appends leave the file unchanged");
+}
+
+static void test_invite_unit(void)
+{
+    puts("invite record");
+    char path[192], err[256];
+    snprintf(path, sizeof path, "%s/inv_test", g_dir);
+    unlink(path);
+
+    /* A missing file is the normal state — most of this server's life has no
+     * invite armed — so it must read as success with armed=false, never as an
+     * error the daemon refuses to start on. */
+    struct bs_invite iv;
+    memset(&iv, 0xFF, sizeof iv);
+    check(bs_invite_load(&iv, path, err, sizeof err), "missing invite file is not an error");
+    check(!iv.armed, "...and reads as disarmed");
+    check(!bs_invite_valid(&iv, 1000), "a disarmed invite is never valid");
+
+    char code[BS_INVITE_CODE_MAX + 1];
+    bs_invite_generate(code, sizeof code);
+    check(strlen(code) == BS_INVITE_CODE_LEN, "generated code is the right length");
+    bool in_alphabet = true;
+    for (size_t i = 0; code[i]; i++) {
+        if (strchr(BS_INVITE_ALPHABET, code[i]) == NULL) in_alphabet = false;
+    }
+    check(in_alphabet, "every symbol comes from the confusable-free alphabet");
+
+    /* Two in a row being equal would mean the generator is not random at all;
+     * at 49 bits this cannot happen by chance. */
+    char code2[BS_INVITE_CODE_MAX + 1];
+    bs_invite_generate(code2, sizeof code2);
+    check(strcmp(code, code2) != 0, "two generated codes differ");
+
+    struct bs_invite armed;
+    memset(&armed, 0, sizeof armed);
+    armed.armed        = true;
+    armed.expires_unix = 2000;
+    armed.strikes_left = BS_INVITE_STRIKES;
+    snprintf(armed.label, sizeof armed.label, "tom");
+    bs_invite_hash_code(code, armed.code_hash);
+
+    check(bs_invite_save(&armed, path, err, sizeof err), "invite saves");
+
+    struct stat st;
+    check(stat(path, &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)) == 0,
+          "invite file is owner-only");
+
+    /* The stored record must not contain the code. This is the whole reason
+     * the operator cannot be shown it twice. */
+    char raw[512] = {0};
+    FILE *f = fopen(path, "r");
+    if (f) { if (fread(raw, 1, sizeof raw - 1, f) == 0) { /* empty */ } fclose(f); }
+    check(strstr(raw, code) == NULL, "the plaintext code is not stored on disk");
+
+    struct bs_invite back;
+    check(bs_invite_load(&back, path, err, sizeof err), "invite loads back");
+    check(back.armed && !strcmp(back.label, "tom"), "label round-trips");
+    check(back.expires_unix == 2000, "expiry round-trips");
+    check(back.strikes_left == BS_INVITE_STRIKES, "strike count round-trips");
+
+    check(bs_invite_valid(&back, 1999),  "valid one second before expiry");
+    check(!bs_invite_valid(&back, 2000), "not valid at the expiry instant");
+    check(!bs_invite_valid(&back, 2001), "not valid after expiry");
+
+    check(bs_invite_matches(&back, code, 1999), "the exact code matches");
+    check(!bs_invite_matches(&back, code2, 1999), "a different code does not");
+    check(!bs_invite_matches(&back, code, 2001), "the right code does not match once expired");
+
+    /* Normalisation: the separator is presentation, and a 3DS software
+     * keyboard makes people fight for a hyphen. Lower case, spaces and the
+     * hyphen must all resolve to the same digest. */
+    char pretty[64], lower[64], spaced[64];
+    snprintf(pretty, sizeof pretty, "%.5s-%.5s", code, code + 5);
+    snprintf(spaced, sizeof spaced, "%.5s %.5s", code, code + 5);
+    snprintf(lower, sizeof lower, "%s", code);
+    for (size_t i = 0; lower[i]; i++) {
+        if (lower[i] >= 'A' && lower[i] <= 'Z') lower[i] = (char)(lower[i] - 'A' + 'a');
+    }
+    check(bs_invite_matches(&back, pretty, 1999), "XXXXX-XXXXX form matches");
+    check(bs_invite_matches(&back, spaced, 1999), "space-separated form matches");
+    check(bs_invite_matches(&back, lower,  1999), "lower case matches");
+    check(!bs_invite_matches(&back, "", 1999),    "an empty code does not match");
+
+    /* Zero strikes is a burnt invite: still on disk, but dead. */
+    struct bs_invite burnt = back;
+    burnt.strikes_left = 0;
+    check(!bs_invite_valid(&burnt, 1999), "an invite with no strikes left is not valid");
+
+    /* Disarming is expressed as the file's absence, so "consumed",
+     * "cancelled" and "burnt out" converge on one state. */
+    struct bs_invite off;
+    memset(&off, 0, sizeof off);
+    check(bs_invite_save(&off, path, err, sizeof err), "saving a disarmed invite succeeds");
+    check(stat(path, &st) != 0, "...by removing the file");
+    check(bs_invite_save(&off, path, err, sizeof err), "disarming twice is not an error");
+
+    f = fopen(path, "w");
+    fprintf(f, "label tom\ncode_hash not-hex\n");
+    fclose(f);
+    struct bs_invite keep = back;
+    check(!bs_invite_load(&keep, path, err, sizeof err), "malformed invite refused");
+    check(keep.armed && !strcmp(keep.label, "tom"),
+          "refused load leaves the previous invite untouched");
+
+    f = fopen(path, "w");
+    fprintf(f, "label tom\n");
+    fclose(f);
+    check(!bs_invite_load(&keep, path, err, sizeof err), "incomplete invite refused");
+
+    unlink(path);
 }
 
 static void test_ppv2_parse(void)
@@ -897,6 +1056,402 @@ static void test_revocation(void)
     check(n > 0 && m[0] == BS_GAME_JOIN, "reconnect produces a fresh JOIN");
 }
 
+/* ------------------------------------------------------------- enrolment */
+
+/* Runs one of the daemon's one-shot invite modes and returns its stdout. The
+ * real `bsgate-keys` drives it exactly this way, so the test is exercising the
+ * shipped mechanism rather than a test-only shortcut into the file format. */
+static void invite_cmd(const char *args, char *out, size_t cap)
+{
+    char cmd[384];
+    snprintf(cmd, sizeof cmd, "./bsgate --state-dir %s %s 2>&1", g_dir, args);
+
+    out[0] = '\0';
+    FILE *p = popen(cmd, "r");
+    if (p == NULL) die("popen invite");
+    size_t n = fread(out, 1, cap - 1, p);
+    out[n] = '\0';
+    pclose(p);
+}
+
+/* Arms an invite and returns the code. SIGHUPs the daemon afterwards, because
+ * that is the only channel `bsgate-keys` has to tell it. */
+static void arm_invite(const char *label, char *code, size_t cap)
+{
+    char args[128], out[512];
+    snprintf(args, sizeof args, "--arm-invite %s", label);
+    invite_cmd(args, out, sizeof out);
+
+    code[0] = '\0';
+    char *line = strstr(out, "invite_code");
+    if (line != NULL) {
+        char buf[64];
+        if (sscanf(line, "invite_code %63s", buf) == 1) snprintf(code, cap, "%s", buf);
+    }
+
+    kill(g_daemon, SIGHUP);
+    msleep(300);
+}
+
+/* True if an invite is currently armed, according to the daemon's own reader. */
+static bool invite_is_armed(void)
+{
+    char out[256];
+    invite_cmd("--show-invite", out, sizeof out);
+    return strstr(out, "invite_armed none") == NULL;
+}
+
+static unsigned invite_strikes_left(void)
+{
+    char out[256], label[64];
+    long long secs = 0;
+    unsigned strikes = 0;
+    invite_cmd("--show-invite", out, sizeof out);
+    if (sscanf(out, "invite_armed %63s %lld %u", label, &secs, &strikes) != 3) return 0;
+    if (!strcmp(label, "none")) return 0;
+    return strikes;
+}
+
+/* Sends `text` as an ENROL packet: framed exactly like DATA, differing only in
+ * the type byte, so the client side needs no new crypto. */
+static void client_send_enrol(struct client *c, const char *text)
+{
+    uint8_t out[BS_MAX_PACKET];
+    size_t len = strlen(text);
+    bs_put_hdr(out, BS_PKT_ENROL);
+    bs_put_u32(out + BS_HDR_BYTES, c->sid);
+    uint64_t msg_id = c->tx_msg_id++;
+    bs_put_u64(out + BS_HDR_BYTES + BS_SID_BYTES, msg_id);
+    hydro_secretbox_encrypt(out + BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES,
+                            text, len, msg_id, BS_CTX_C2S, c->keys.tx);
+    udp_send(out, BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES
+                  + hydro_secretbox_HEADERBYTES + len);
+}
+
+/* Counts allowlist entries carrying `label`, read straight off disk — the
+ * enrolment's whole job is to put one there. */
+static int allowlist_count_label(const char *label)
+{
+    char path[192];
+    snprintf(path, sizeof path, "%s/allowlist", g_dir);
+
+    struct bs_allowlist al;
+    char err[256];
+    if (!bs_allowlist_load(&al, path, err, sizeof err)) return -1;
+
+    int n = 0;
+    for (size_t i = 0; i < al.count; i++) {
+        if (!strcmp(al.entry[i].label, label)) n++;
+    }
+    return n;
+}
+
+/* Takes a fresh SIGUSR1 snapshot and returns its whole text. The status file
+ * is the only outside view of the session table, and a probation session is
+ * exactly the thing that must not be sitting in it unnoticed. */
+static bool status_snapshot(char *out, size_t cap)
+{
+    char path[192];
+    snprintf(path, sizeof path, "%s/status.txt", g_dir);
+    unlink(path);
+    kill(g_daemon, SIGUSR1);
+
+    out[0] = '\0';
+    for (int i = 0; i < 40; i++) {
+        FILE *f = fopen(path, "r");
+        if (f != NULL) {
+            size_t n = fread(out, 1, cap - 1, f);
+            out[n] = '\0';
+            fclose(f);
+            return n > 0;
+        }
+        msleep(50);
+    }
+    return false;
+}
+
+static struct client g_bob;      /* enrols during the run */
+
+/* The control arm for everything below: with nothing armed, an unlisted key
+ * must be dropped exactly as it was before this feature existed. If this ever
+ * goes green for the wrong reason the rest of the section proves nothing. */
+static void test_enrol_disabled_by_default(void)
+{
+    puts("enrolment: no invite armed behaves exactly as before");
+    drain();
+
+    check(!invite_is_armed(), "no invite is armed to begin with");
+
+    struct client stranger;
+    memset(&stranger, 0, sizeof stranger);
+    hydro_kx_keygen(&stranger.kp);
+    check(client_connect(&stranger, g_psk, false), "handshake still completes");
+
+    uint8_t m[2048];
+    check(game_recv(m, sizeof m, 600) < 0, "no JOIN for an unlisted key");
+
+    /* "No JOIN" alone would still pass if the gate had quietly handed the
+     * stranger a probation session and then turned them away when their code
+     * failed — which is a session slot an unlisted peer could occupy at will.
+     * The snapshot is what distinguishes "dropped" from "let in, then
+     * rejected", and it has to be taken BEFORE any code is sent, because a
+     * rejected code frees the slot again and hides the difference. */
+    char st[4096];
+    check(status_snapshot(st, sizeof st), "status snapshot taken");
+    check(strstr(st, "enrolling") == NULL, "no probation session was created");
+    check(strstr(st, "invite_armed none 0 0") != NULL, "status reports no armed invite");
+    check(strstr(st, "enrolments_total 0") != NULL, "nothing has been enrolled");
+
+    /* And sending a code — any code — must do nothing, because the session the
+     * gate would have needed does not exist. */
+    client_send_enrol(&stranger, "AAAAA-AAAAA");
+    check(game_recv(m, sizeof m, 400) < 0, "an unsolicited code changes nothing");
+    check(udp_recv(m, sizeof m, 400) < 0, "and gets no answer");
+    check(allowlist_count_label("bob") == 0, "nothing was written to the allowlist");
+}
+
+static void test_enrol_happy_path(void)
+{
+    puts("enrolment: correct code joins the allowlist for good");
+    drain();
+
+    char code[64];
+    arm_invite("bob", code, sizeof code);
+    check(strlen(code) == BS_INVITE_CODE_LEN + 1, "arming prints an XXXXX-XXXXX code");
+    check(invite_is_armed(), "the invite is armed");
+
+    memset(&g_bob, 0, sizeof g_bob);
+    hydro_kx_keygen(&g_bob.kp);
+    check(client_connect(&g_bob, g_psk, false), "unlisted peer completes the handshake");
+
+    uint8_t m[2048];
+    check(game_recv(m, sizeof m, 400) < 0,
+          "no JOIN before the code — probation is not membership");
+
+    client_send_enrol(&g_bob, code);
+
+    uint8_t rx[2048];
+    ssize_t n = udp_recv(rx, sizeof rx, 1500);
+    check(n > 0 && rx[0] == BS_PKT_ENROL_OK, "the console is told it is enrolled");
+
+    n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_JOIN, "and only then does the game see a JOIN");
+    check(n > 0 && !strcmp((char *)m + 5 + BS_KX_PUBLICKEYBYTES, "bob"),
+          "JOIN carries the invite's label");
+
+    check(allowlist_count_label("bob") == 1, "the key is on the allowlist exactly once");
+    check(!invite_is_armed(), "the invite is consumed");
+}
+
+/* steve's requirement, stated in as many words: invited once, they connect
+ * whenever they want, with nothing to accept. */
+static void test_enrol_persists_across_reconnects(void)
+{
+    puts("enrolment: an enrolled console reconnects with no code");
+    drain();
+
+    check(!invite_is_armed(), "no invite armed for this reconnect");
+
+    struct client again;
+    memset(&again, 0, sizeof again);
+    again.kp = g_bob.kp;
+    check(client_connect(&again, g_psk, false), "bob reconnects");
+
+    /* One key, one session: bob's previous session is still live, so the gate
+     * replaces it and the game logic sees LEAVE before JOIN. Asserted in order
+     * rather than skipped, because a JOIN with no matching LEAVE would leave
+     * bsgame holding two players for one console. */
+    uint8_t m[2048];
+    ssize_t n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_LEAVE, "the stale session is closed first");
+
+    n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_JOIN, "straight to JOIN, no enrolment");
+    check(n > 0 && !strcmp((char *)m + 5 + BS_KX_PUBLICKEYBYTES, "bob"),
+          "still known as bob");
+
+    /* And a full daemon restart must not lose it: the allowlist is the record,
+     * not the session table. */
+    stop_daemon();
+    start_daemon();
+    if (!wait_ready(5000)) { check(false, "daemon restarted"); return; }
+    check(true, "daemon restarted");
+    drain();
+
+    struct client after_restart;
+    memset(&after_restart, 0, sizeof after_restart);
+    after_restart.kp = g_bob.kp;
+    check(client_connect(&after_restart, g_psk, false), "bob reconnects after a restart");
+    n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_JOIN, "still admitted with no code");
+    g_bob.sid  = after_restart.sid;
+    g_bob.keys = after_restart.keys;
+    g_bob.tx_msg_id = after_restart.tx_msg_id;
+}
+
+static void test_enrol_wrong_code_burns_strikes(void)
+{
+    puts("enrolment: wrong codes burn strikes and disarm the invite");
+    drain();
+
+    char code[64];
+    arm_invite("carol", code, sizeof code);
+    check(invite_strikes_left() == BS_INVITE_STRIKES, "starts with a full strike count");
+
+    unsigned expected = BS_INVITE_STRIKES;
+    for (unsigned attempt = 1; attempt <= BS_INVITE_STRIKES; attempt++) {
+        struct client c;
+        memset(&c, 0, sizeof c);
+        hydro_kx_keygen(&c.kp);
+        if (!client_connect(&c, g_psk, false)) { check(false, "probation handshake"); return; }
+
+        client_send_enrol(&c, "ZZZZZ-ZZZZZ");
+        msleep(300);
+
+        uint8_t m[2048];
+        char what[64];
+        snprintf(what, sizeof what, "attempt %u gets no JOIN", attempt);
+        check(game_recv(m, sizeof m, 300) < 0, what);
+
+        expected--;
+        snprintf(what, sizeof what, "attempt %u leaves %u strike(s)", attempt, expected);
+        check(invite_strikes_left() == expected, what);
+        drain();
+    }
+
+    check(!invite_is_armed(), "the invite is burnt after the last strike");
+    check(allowlist_count_label("carol") == 0, "carol was never written to the allowlist");
+
+    /* And the correct code is now worthless, which is the point of burning it. */
+    struct client late;
+    memset(&late, 0, sizeof late);
+    hydro_kx_keygen(&late.kp);
+    check(client_connect(&late, g_psk, false), "a later handshake still completes");
+    client_send_enrol(&late, code);
+    msleep(300);
+    uint8_t m[2048];
+    check(game_recv(m, sizeof m, 300) < 0, "the real code no longer enrols anyone");
+    check(allowlist_count_label("carol") == 0, "...and still writes nothing");
+}
+
+static void test_enrol_replay_and_established(void)
+{
+    puts("enrolment: a captured code cannot be reused");
+    drain();
+
+    char code[64];
+    arm_invite("dave", code, sizeof code);
+
+    struct client dave;
+    memset(&dave, 0, sizeof dave);
+    hydro_kx_keygen(&dave.kp);
+    check(client_connect(&dave, g_psk, false), "dave reaches probation");
+
+    /* Capture the exact ENROL datagram, then reuse it. */
+    uint8_t wire[BS_MAX_PACKET];
+    size_t len = strlen(code);
+    bs_put_hdr(wire, BS_PKT_ENROL);
+    bs_put_u32(wire + BS_HDR_BYTES, dave.sid);
+    uint64_t msg_id = dave.tx_msg_id++;
+    bs_put_u64(wire + BS_HDR_BYTES + BS_SID_BYTES, msg_id);
+    hydro_secretbox_encrypt(wire + BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES,
+                            code, len, msg_id, BS_CTX_C2S, dave.keys.tx);
+    size_t wire_len = BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES
+                    + hydro_secretbox_HEADERBYTES + len;
+    udp_send(wire, wire_len);
+
+    uint8_t m[2048];
+    ssize_t n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_JOIN, "dave enrols");
+    check(allowlist_count_label("dave") == 1, "dave is on the allowlist once");
+    drain();
+
+    /* Byte-identical replay. The replay window alone should stop it, and the
+     * established-session check behind that. Either way: no second entry. */
+    udp_send(wire, wire_len);
+    msleep(300);
+    check(allowlist_count_label("dave") == 1, "replaying the code adds nothing");
+    check(game_recv(m, sizeof m, 300) < 0, "and produces no second JOIN");
+
+    /* A fresh, correctly-framed ENROL from a peer who is already in must also
+     * go nowhere — the invite is consumed and they are not on probation. */
+    client_send_enrol(&dave, code);
+    msleep(300);
+    check(allowlist_count_label("dave") == 1, "an established peer cannot re-enrol");
+    check(!invite_is_armed(), "the invite stayed consumed");
+}
+
+static void test_enrol_one_at_a_time(void)
+{
+    puts("enrolment: only one probation session at a time");
+    drain();
+
+    char code[64];
+    arm_invite("erin", code, sizeof code);
+
+    struct client first, second;
+    memset(&first, 0, sizeof first);
+    memset(&second, 0, sizeof second);
+    hydro_kx_keygen(&first.kp);
+    hydro_kx_keygen(&second.kp);
+
+    check(client_connect(&first, g_psk, false), "the first stranger reaches probation");
+
+    /* The second is refused at KX3, before a session exists — so an armed
+     * invite cannot be used to fill every slot with handshakes that never
+     * enrol. client_connect() cannot see that: the gate sends nothing on a
+     * successful KX3 either, so there is no reply to distinguish. The refusal
+     * is proved by what the second stranger can then do, which is nothing:
+     * they hold the correct code and it gets them exactly nowhere. */
+    client_connect(&second, g_psk, false);
+    client_send_enrol(&second, code);
+    msleep(400);
+
+    uint8_t m[2048];
+    check(game_recv(m, sizeof m, 300) < 0, "the second stranger produces no JOIN");
+    check(allowlist_count_label("erin") == 0, "...and is not written to the allowlist");
+    check(invite_is_armed(), "...and did not consume the invite");
+    drain();
+
+    /* The slot still belongs to the first stranger, and their code works. */
+    client_send_enrol(&first, code);
+    ssize_t n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_JOIN, "the probation slot still belongs to the first");
+    check(allowlist_count_label("erin") == 1, "erin is on the allowlist exactly once");
+    drain();
+
+    /* An abandoned probation session must free its slot rather than hold it
+     * for the full idle timeout. BS_ENROL_WINDOW_MS is 10 s in the daemon;
+     * waited out for real so the sweep in tick() is what is being tested. */
+    char code2[64];
+    arm_invite("frank", code2, sizeof code2);
+
+    struct client silent, late;
+    memset(&silent, 0, sizeof silent);
+    memset(&late, 0, sizeof late);
+    hydro_kx_keygen(&silent.kp);
+    hydro_kx_keygen(&late.kp);
+
+    check(client_connect(&silent, g_psk, false), "a stranger takes the slot and says nothing");
+    msleep(11000);
+    drain();
+
+    client_connect(&late, g_psk, false);
+    client_send_enrol(&late, code2);
+    n = game_recv(m, sizeof m, 1500);
+    check(n > 0 && m[0] == BS_GAME_JOIN, "the slot is released when the window expires");
+    check(allowlist_count_label("frank") == 1, "frank is on the allowlist");
+
+    /* Tidy up: leave nothing armed for the relay section that follows. */
+    char out[256];
+    arm_invite("gina", out, sizeof out);
+    check(invite_is_armed(), "an invite can be armed again");
+    invite_cmd("--cancel-invite", out, sizeof out);
+    kill(g_daemon, SIGHUP);
+    msleep(300);
+    check(!invite_is_armed(), "cancelling disarms an invite");
+}
+
 static void test_key_file_permissions(void)
 {
     puts("state file permissions");
@@ -1154,6 +1709,8 @@ int main(void)
     test_replay_window();
     test_ratelimit();
     test_allowlist_parsing();
+    test_allowlist_append();
+    test_invite_unit();
     test_ppv2_parse();
 
     /* Creates server.seed and network.psk as a side effect. */
@@ -1184,6 +1741,15 @@ int main(void)
     test_wrong_psk_rejected();
     test_unknown_key_rejected();
     test_revocation();
+
+    /* Enrolment. The first case is the control: with nothing armed the gate
+     * must behave exactly as it did before any of this existed. */
+    test_enrol_disabled_by_default();
+    test_enrol_happy_path();
+    test_enrol_persists_across_reconnects();
+    test_enrol_wrong_code_burns_strikes();
+    test_enrol_replay_and_established();
+    test_enrol_one_at_a_time();
 
     /* Everything from here runs against a daemon configured the way the
      * playit deployment actually runs it: loopback bind, every datagram

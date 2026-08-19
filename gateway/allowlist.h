@@ -45,4 +45,29 @@ bool bs_allowlist_load(struct bs_allowlist *out, const char *path,
 const struct bs_allow_entry *bs_allowlist_find(const struct bs_allowlist *al,
                                                const uint8_t pk[BS_KX_PUBLICKEYBYTES]);
 
+/* True if `label` is safe to write into the allowlist file and later print into
+ * the journal: 1..BS_ALLOW_LABEL_MAX-1 characters of [A-Za-z0-9_-]. Exposed so
+ * an invite can be refused at ARM time rather than at enrolment time — a label
+ * that only fails when the friend types their code turns a typo by the operator
+ * into a mystery failure on someone else's console. */
+bool bs_allowlist_label_ok(const char *label);
+
+/* Appends `<hex pk> <label>` to the file at `path`, atomically: the existing
+ * bytes are copied to a temp file, the new line added, and the temp renamed
+ * over the original. Comments and ordering therefore survive, which matters
+ * because the file the provisioner writes is mostly explanatory text.
+ *
+ * Used by enrolment (invite.h), which is the only thing that ever makes the
+ * daemon a writer of its own authorisation file. Kept here rather than in
+ * bsgate.c so the append uses the same escaping and validation assumptions as
+ * the parser two functions above it.
+ *
+ * Refuses rather than duplicates if the key is already present: bs_allowlist_load
+ * rejects a file with a duplicate key outright, so appending one blindly would
+ * produce a file the daemon then will not reload — locking everybody out on the
+ * next SIGHUP as the delayed consequence of one enrolment. */
+bool bs_allowlist_append(const char *path,
+                         const uint8_t pk[BS_KX_PUBLICKEYBYTES],
+                         const char *label, char *errbuf, size_t errbuf_len);
+
 #endif /* BS_ALLOWLIST_H */

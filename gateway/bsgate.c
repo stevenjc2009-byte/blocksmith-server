@@ -53,6 +53,7 @@
 
 #include "../proto/bs_proto.h"
 #include "allowlist.h"
+#include "invite.h"
 #include "proxyproto.h"
 #include "ratelimit.h"
 #include "replay.h"
@@ -72,6 +73,12 @@ _Static_assert(sizeof BS_CTX_C2S - 1 == hydro_secretbox_CONTEXTBYTES, "ctx len")
 #define BS_MAX_PENDING     32u   /* half-open handshakes                      */
 #define BS_HANDSHAKE_MS  5000u   /* a pending slot lives this long            */
 #define BS_SESSION_IDLE_MS 30000u
+
+/* How long a probation session gets to send its BS_PKT_ENROL. Short on
+ * purpose: the console types the code BEFORE it connects, so by the time the
+ * handshake finishes the code is already in hand and the packet goes out
+ * immediately. This is a network timeout, not thinking time. */
+#define BS_ENROL_WINDOW_MS 10000u
 #define BS_COOKIE_ROTATE_MS 60000u
 #define BS_LOG_SUMMARY_MS  10000u
 
@@ -110,6 +117,19 @@ struct bs_session {
     uint8_t  peer_pk[BS_KX_PUBLICKEYBYTES];
     char     label[BS_ALLOW_LABEL_MAX];
     uint64_t last_seen_ms;
+
+    /* Enrolment probation. A session in this state has completed the Noise
+     * handshake and holds real session keys, but its key is NOT on the
+     * allowlist yet and it has NOT been announced to the game server. The only
+     * packet it may send is BS_PKT_ENROL; everything else is dropped, and it
+     * evaporates at enrol_deadline_ms whether or not anything arrives.
+     *
+     * Reusing a session slot rather than inventing a third kind of half-peer
+     * is deliberate: the AEAD decrypt, the replay window and the address
+     * rebinding are then the same code that guards everybody else, instead of
+     * a parallel implementation nobody looks at twice. */
+    bool     enrolling;
+    uint64_t enrol_deadline_ms;
 };
 
 struct bs_pending {
@@ -138,6 +158,13 @@ struct bs_gate {
 
     struct bs_allowlist allow;
     char                allow_path[512];
+
+    /* At most one invite is armed at a time — see invite.h for why that is a
+     * property and not a limitation. Reloaded on SIGHUP alongside the
+     * allowlist, so `bsgate-keys invite` takes effect without a restart. */
+    struct bs_invite    invite;
+    char                invite_path[512];
+    uint64_t            enrol_total;
 
     /* Where write_status() drops its snapshot. Written only on SIGUSR1, so
      * this costs nothing while nobody is looking — see write_status(). */
@@ -514,24 +541,50 @@ static void handle_kx3(struct bs_gate *g, const struct bs_peer *peer,
     }
 
     const struct bs_allow_entry *entry = bs_allowlist_find(&g->allow, peer_pk);
+    bool enrolling = false;
+
     if (entry == NULL) {
         char hex[2 * BS_KX_PUBLICKEYBYTES + 1];
         char a[32];
         hydro_bin2hex(hex, sizeof hex, peer_pk, sizeof peer_pk);
         addr_str(&peer->real, a, sizeof a);
-        /* Logged in full, unlike ordinary drops: a cryptographically valid
-         * handshake from an unknown key is either a friend whose key was never
-         * added, or someone who has your build and PSK. Both are worth seeing,
-         * and the hex is exactly what you paste into the allowlist. */
-        logf_("gate: REJECTED unknown key %s from %s", hex, a);
-        hydro_memzero(&kp, sizeof kp);
-        pending_free(p);
-        return;
+
+        /* With no invite armed this is the end of the road, exactly as it has
+         * always been. That is the important half of this branch: enrolment is
+         * not a permanently reachable code path, it exists only for the
+         * minutes after an operator deliberately armed a code. */
+        if (!bs_invite_valid(&g->invite, (int64_t)time(NULL))) {
+            /* Logged in full, unlike ordinary drops: a cryptographically valid
+             * handshake from an unknown key is either a friend whose key was
+             * never added, or someone who has your build and PSK. Both are
+             * worth seeing, and the hex is exactly what you paste into the
+             * allowlist. */
+            logf_("gate: REJECTED unknown key %s from %s", hex, a);
+            hydro_memzero(&kp, sizeof kp);
+            pending_free(p);
+            return;
+        }
+
+        /* One probation slot at a time, matching the one armed invite. Without
+         * this cap, an armed invite would let anyone holding the PSK fill
+         * every session slot with handshakes that never enrol. */
+        for (unsigned i = 0; i < BS_MAX_SESSIONS; i++) {
+            if (g->session[i].used && g->session[i].enrolling) {
+                logf_("gate: enrolment already in progress, refused %s", a);
+                hydro_memzero(&kp, sizeof kp);
+                pending_free(p);
+                return;
+            }
+        }
+
+        enrolling = true;
+        logf_("gate: unknown key %s from %s may attempt enrolment as '%s'",
+              hex, a, g->invite.label);
     }
 
     struct bs_session *s = session_alloc(g);
     if (s == NULL) {
-        logf_("gate: server full, refused %s", entry->label);
+        logf_("gate: server full, refused %s", enrolling ? "an enrolment" : entry->label);
         hydro_memzero(&kp, sizeof kp);
         pending_free(p);
         return;
@@ -556,17 +609,81 @@ static void handle_kx3(struct bs_gate *g, const struct bs_peer *peer,
     s->tx_msg_id = 0;
     bs_replay_init(&s->replay);
     memcpy(s->peer_pk, peer_pk, sizeof peer_pk);
-    snprintf(s->label, sizeof s->label, "%s", entry->label);
+    snprintf(s->label, sizeof s->label,
+             "%s", enrolling ? g->invite.label : entry->label);
     s->last_seen_ms = t;
 
     hydro_memzero(&kp, sizeof kp);
     pending_free(p);
+
+    if (enrolling) {
+        /* Not a player yet: no join counter, and crucially no
+         * game_notify_join(), so bsgame never learns this sid exists unless
+         * and until the code checks out. */
+        s->enrolling         = true;
+        s->enrol_deadline_ms = t + BS_ENROL_WINDOW_MS;
+        return;
+    }
 
     g->join_total++;
 
     char a[32]; addr_str(&peer->real, a, sizeof a);
     logf_("gate: %s joined (sid %08x) from %s", s->label, s->sid, a);
     game_notify_join(g, s);
+}
+
+/* Turns a probation session into a real one: writes the key into the
+ * allowlist, reloads it, consumes the invite, and only then announces the
+ * player. Ordering is the point — the allowlist entry must exist and be
+ * readable before anything treats this peer as admitted, so that a crash
+ * anywhere in here leaves either "not enrolled" or "enrolled and allowed",
+ * never "playing but not on the list". */
+static void enrol_succeed(struct bs_gate *g, struct bs_session *s, uint64_t t)
+{
+    char why[192];
+
+    if (!bs_allowlist_append(g->allow_path, s->peer_pk, s->label, why, sizeof why)) {
+        logf_("gate: enrolment of '%s' FAILED to write the allowlist: %s",
+              s->label, why);
+        session_free(s);
+        return;
+    }
+
+    struct bs_allowlist fresh;
+    if (!bs_allowlist_load(&fresh, g->allow_path, why, sizeof why)) {
+        /* Should be unreachable: append validates the candidate before
+         * installing it. Logged rather than ignored because if it ever does
+         * happen, the running daemon and the file on disk now disagree. */
+        logf_("gate: enrolment wrote the allowlist but it will not reload: %s", why);
+        session_free(s);
+        return;
+    }
+    g->allow = fresh;
+    hydro_memzero(&fresh, sizeof fresh);
+
+    g->invite.armed = false;
+    if (!bs_invite_save(&g->invite, g->invite_path, why, sizeof why)) {
+        /* The key is already on the allowlist, so refusing to admit them now
+         * would be pointless. But a code that outlives its single use is a
+         * standing door, so this is loud. */
+        logf_("gate: WARNING could not clear the used invite at %s: %s — "
+              "run `bsgate-keys invite --cancel`", g->invite_path, why);
+    }
+
+    s->enrolling = false;
+    s->enrol_deadline_ms = 0;
+    g->enrol_total++;
+    g->join_total++;
+
+    char a[32]; addr_str(&s->peer.real, a, sizeof a);
+    char hex[2 * BS_KX_PUBLICKEYBYTES + 1];
+    hydro_bin2hex(hex, sizeof hex, s->peer_pk, sizeof s->peer_pk);
+    logf_("gate: ENROLLED '%s' key %s from %s — invite consumed", s->label, hex, a);
+
+    send_encrypted(g, s, BS_PKT_ENROL_OK, NULL, 0);
+    logf_("gate: %s joined (sid %08x) from %s", s->label, s->sid, a);
+    game_notify_join(g, s);
+    (void)t;
 }
 
 static void handle_data(struct bs_gate *g, const struct bs_peer *peer,
@@ -604,6 +721,62 @@ static void handle_data(struct bs_gate *g, const struct bs_peer *peer,
      * console sleeps, or the relay moving the player to a fresh local socket. */
     s->peer = *peer;
     s->last_seen_ms = t;
+
+    /* A probation session is not a player. It may send exactly one kind of
+     * packet, and every other kind — including a perfectly well-formed DATA —
+     * ends it. Handled before the DISCONNECT and DATA branches below so that
+     * neither can be reached by a peer who is not on the allowlist. */
+    if (s->enrolling) {
+        if (pkt[0] != BS_PKT_ENROL) {
+            logf_("gate: enrolment attempt sent 0x%02x instead of a code — dropped",
+                  pkt[0]);
+            session_free(s);
+            hydro_memzero(plain, sizeof plain);
+            return;
+        }
+
+        char code[BS_INVITE_CODE_MAX + 1];
+        size_t n = plain_len < BS_INVITE_CODE_MAX ? plain_len : BS_INVITE_CODE_MAX;
+        memcpy(code, plain, n);
+        code[n] = '\0';
+
+        bool good = bs_invite_matches(&g->invite, code, (int64_t)time(NULL));
+        hydro_memzero(code, sizeof code);
+        hydro_memzero(plain, sizeof plain);
+
+        if (good) {
+            enrol_succeed(g, s, t);
+            return;
+        }
+
+        /* Wrong code. Burn a strike and persist it, so that hammering cannot
+         * be reset by restarting the daemon, and disarm once they are gone. */
+        char a[32]; addr_str(&s->peer.real, a, sizeof a);
+        if (g->invite.strikes_left > 0) g->invite.strikes_left--;
+        if (g->invite.strikes_left == 0) {
+            g->invite.armed = false;
+            logf_("gate: wrong invite code from %s — invite for '%s' is now BURNT, "
+                  "arm a new one with `bsgate-keys invite`", a, g->invite.label);
+        } else {
+            logf_("gate: wrong invite code from %s — %u attempt(s) left",
+                  a, g->invite.strikes_left);
+        }
+
+        char why[192];
+        if (!bs_invite_save(&g->invite, g->invite_path, why, sizeof why)) {
+            logf_("gate: could not persist the invite strike count: %s", why);
+        }
+
+        session_free(s);
+        return;
+    }
+
+    if (pkt[0] == BS_PKT_ENROL) {
+        /* An allowlisted peer has no business enrolling; it is already in. */
+        drop(g, "enrol from an established session");
+        hydro_memzero(plain, sizeof plain);
+        return;
+    }
 
     if (pkt[0] == BS_PKT_DISCONNECT) {
         logf_("gate: %s left (sid %08x)", s->label, s->sid);
@@ -702,6 +875,7 @@ static void handle_udp(struct bs_gate *g)
     case BS_PKT_KX3:   handle_kx3(g, &peer, body, body_len, t);   break;
     case BS_PKT_DATA:
     case BS_PKT_DISCONNECT:
+    case BS_PKT_ENROL:
                        handle_data(g, &peer, body, body_len, t);  break;
     default:           drop(g, "type");                           break;
     }
@@ -716,6 +890,11 @@ static void handle_game(struct bs_gate *g)
     uint32_t sid = bs_get_u32(buf + 1);
     struct bs_session *s = session_by_sid(g, sid);
     if (s == NULL) return;      /* the player left while the game was replying */
+
+    /* bsgame is never told about a probation sid, so it cannot legitimately
+     * name one. Belt and braces: a bug there must not be able to push traffic
+     * to a peer who is not on the allowlist. */
+    if (s->enrolling) return;
 
     switch (buf[0]) {
     case BS_GAME_DATA:
@@ -782,6 +961,19 @@ static void write_status(struct bs_gate *g, uint64_t t)
     fprintf(f, "sessions_max %u\n", BS_MAX_SESSIONS);
     fprintf(f, "joins_total %llu\n", (unsigned long long)g->join_total);
     fprintf(f, "dropped_total %llu\n", (unsigned long long)g->drop_total);
+    fprintf(f, "enrolments_total %llu\n", (unsigned long long)g->enrol_total);
+
+    /* An armed invite is a temporarily open door and belongs in the same
+     * report as the firewall state — the one thing an operator must not be
+     * able to forget about. The code itself is not here and could not be
+     * printed even if it were wanted: only its hash exists on this box. */
+    if (bs_invite_valid(&g->invite, (int64_t)time(NULL))) {
+        long long left = (long long)g->invite.expires_unix - (long long)time(NULL);
+        fprintf(f, "invite_armed %s %lld %u\n",
+                g->invite.label, left < 0 ? 0 : left, g->invite.strikes_left);
+    } else {
+        fprintf(f, "invite_armed none 0 0\n");
+    }
 
     unsigned pending = 0;
     for (unsigned i = 0; i < BS_MAX_PENDING; i++) if (g->pending[i].used) pending++;
@@ -803,9 +995,10 @@ static void write_status(struct bs_gate *g, uint64_t t)
          * is not a round-trip time and must never be presented as one: the
          * server never solicits a reply, so it has no RTT to report. See
          * tools/bsgate-status, which labels this column accordingly. */
-        fprintf(f, "session %08x %s %s %s %llu\n",
+        fprintf(f, "session %08x %s %s %s %llu%s\n",
                 s->sid, s->label, real, reply,
-                (unsigned long long)(t - s->last_seen_ms));
+                (unsigned long long)(t - s->last_seen_ms),
+                s->enrolling ? " enrolling" : "");
     }
 
     fclose(f);
@@ -823,9 +1016,20 @@ static void tick(struct bs_gate *g, uint64_t t)
         }
     }
 
+    /* Probation sessions expire on their own, much shorter clock. Swept before
+     * the idle sweep below so an enrolment slot can never sit occupied for the
+     * full 30-second idle timeout and block the next attempt. */
     for (unsigned i = 0; i < BS_MAX_SESSIONS; i++) {
         struct bs_session *s = &g->session[i];
-        if (s->used && t - s->last_seen_ms > BS_SESSION_IDLE_MS) {
+        if (s->used && s->enrolling && t > s->enrol_deadline_ms) {
+            logf_("gate: enrolment attempt expired without a code");
+            session_free(s);
+        }
+    }
+
+    for (unsigned i = 0; i < BS_MAX_SESSIONS; i++) {
+        struct bs_session *s = &g->session[i];
+        if (s->used && !s->enrolling && t - s->last_seen_ms > BS_SESSION_IDLE_MS) {
             logf_("gate: %s timed out (sid %08x)", s->label, s->sid);
             game_notify_leave(g, s->sid);
             session_free(s);
@@ -971,7 +1175,90 @@ static void usage(void)
         "                        running behind the playit agent, and only safe when\n"
         "                        nothing untrusted can reach --listen.\n"
         "  --trusted-proxy CIDR  who may assert that header (default 127.0.0.0/8)\n"
-        "  --print-identity      print the server public key and PSK, then exit\n");
+        "  --print-identity      print the server public key and PSK, then exit\n"
+        "  --arm-invite LABEL    generate a one-time enrolment code for LABEL,\n"
+        "                        print it once, then exit. Replaces any existing\n"
+        "                        invite. The code is stored hashed and cannot be\n"
+        "                        printed again.\n"
+        "  --cancel-invite       disarm the current invite, then exit\n"
+        "  --show-invite         report the armed invite, then exit\n");
+}
+
+/* The three invite modes below are one-shot operations run by `bsgate-keys`,
+ * not by the daemon. They are handled here rather than in the shell script for
+ * one reason: the hash and the file format must have exactly one implementation.
+ * A shell reimplementation of either would be a second thing to keep in step
+ * with invite.c, and the failure mode of it drifting is an invite nobody can
+ * redeem — or worse, one that validates against the wrong digest.
+ *
+ * Each returns the process exit code. Output is machine-readable `key value`
+ * lines, matching --print-identity, because bsgate-keys parses it. */
+static int mode_arm_invite(struct bs_invite *iv, const char *path,
+                           const char *label)
+{
+    if (!bs_allowlist_label_ok(label)) {
+        fprintf(stderr, "bsgate: invalid label '%s' — use 1-%u characters of "
+                        "A-Z a-z 0-9 _ -\n", label, BS_ALLOW_LABEL_MAX - 1);
+        return 1;
+    }
+
+    char code[BS_INVITE_CODE_MAX + 1];
+    bs_invite_generate(code, sizeof code);
+
+    memset(iv, 0, sizeof *iv);
+    iv->armed        = true;
+    iv->expires_unix = (int64_t)time(NULL) + BS_INVITE_TTL_SEC;
+    iv->strikes_left = BS_INVITE_STRIKES;
+    snprintf(iv->label, sizeof iv->label, "%s", label);
+    bs_invite_hash_code(code, iv->code_hash);
+
+    char why[256];
+    if (!bs_invite_save(iv, path, why, sizeof why)) {
+        fprintf(stderr, "bsgate: %s\n", why);
+        hydro_memzero(code, sizeof code);
+        return 1;
+    }
+
+    /* Printed with the separator for a human to read out; the daemon strips it
+     * again on the way in, so the friend may type it with or without. */
+    printf("invite_label   %s\n", label);
+    printf("invite_code    %.5s-%.5s\n", code, code + 5);
+    printf("invite_expires %lld\n", (long long)iv->expires_unix);
+    printf("invite_ttl_s   %d\n", (int)BS_INVITE_TTL_SEC);
+    hydro_memzero(code, sizeof code);
+    return 0;
+}
+
+static int mode_cancel_invite(struct bs_invite *iv, const char *path)
+{
+    memset(iv, 0, sizeof *iv);
+    iv->armed = false;
+
+    char why[256];
+    if (!bs_invite_save(iv, path, why, sizeof why)) {
+        fprintf(stderr, "bsgate: %s\n", why);
+        return 1;
+    }
+    printf("invite_armed none 0 0\n");
+    return 0;
+}
+
+static int mode_show_invite(struct bs_invite *iv, const char *path)
+{
+    char why[256];
+    if (!bs_invite_load(iv, path, why, sizeof why)) {
+        fprintf(stderr, "bsgate: %s\n", why);
+        return 1;
+    }
+
+    int64_t now = (int64_t)time(NULL);
+    if (bs_invite_valid(iv, now)) {
+        long long left = (long long)iv->expires_unix - (long long)now;
+        printf("invite_armed %s %lld %u\n", iv->label, left, iv->strikes_left);
+    } else {
+        printf("invite_armed none 0 0\n");
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -981,6 +1268,8 @@ int main(int argc, char **argv)
     const char *trusted_cidr = "127.0.0.0/8";
     bool print_identity = false;
     bool proxy_proto = false;
+    const char *arm_invite = NULL;
+    bool cancel_invite = false, show_invite = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--listen") && i + 1 < argc)            listen_arg = argv[++i];
@@ -990,9 +1279,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--trusted-proxy") && i + 1 < argc) trusted_cidr = argv[++i];
         else if (!strcmp(argv[i], "--proxy-protocol"))               proxy_proto = true;
         else if (!strcmp(argv[i], "--print-identity"))               print_identity = true;
+        else if (!strcmp(argv[i], "--arm-invite") && i + 1 < argc)   arm_invite = argv[++i];
+        else if (!strcmp(argv[i], "--cancel-invite"))                cancel_invite = true;
+        else if (!strcmp(argv[i], "--show-invite"))                  show_invite = true;
         else { usage(); return 2; }
     }
-    if (state_dir == NULL || (listen_arg == NULL && !print_identity)) {
+
+    /* Every one-shot mode needs only --state-dir; the daemon additionally needs
+     * --listen. Grouped into one flag so adding a mode cannot accidentally
+     * leave the daemon startable without an address. */
+    bool oneshot = print_identity || arm_invite != NULL
+                || cancel_invite || show_invite;
+
+    if (state_dir == NULL || (listen_arg == NULL && !oneshot)) {
         usage();
         return 2;
     }
@@ -1025,12 +1324,31 @@ int main(int argc, char **argv)
      && (game_sock ? path_set(game_path, sizeof game_path, "%s", game_sock)
                    : path_set(game_path, sizeof game_path, "%s/game.sock", state_dir))
      && path_set(g.game_sock_path, sizeof g.game_sock_path, "%s", game_path)
-     && path_set(g.status_path, sizeof g.status_path, "%s/status.txt", state_dir);
+     && path_set(g.status_path, sizeof g.status_path, "%s/status.txt", state_dir)
+     && path_set(g.invite_path, sizeof g.invite_path, "%s/invite", state_dir);
 
     if (!paths_ok) {
         logf_("gate: --state-dir or a --*-socket path is too long "
               "(unix sockets cap at %zu bytes)", sizeof g.game_sock_path - 1);
         return 1;
+    }
+
+    /* Handled before the identity keys are touched, deliberately: arming an
+     * invite must never be the thing that creates server.seed. If someone runs
+     * this against the wrong --state-dir, the mistake should be an invite file
+     * in an odd place, not a second server identity that later starts a daemon
+     * every existing client refuses to talk to. */
+    if (arm_invite != NULL || cancel_invite || show_invite) {
+        if ((arm_invite != NULL) + (cancel_invite ? 1 : 0) + (show_invite ? 1 : 0) > 1) {
+            fprintf(stderr, "bsgate: pick one of --arm-invite / --cancel-invite / "
+                            "--show-invite\n");
+            return 2;
+        }
+        int rc = arm_invite  ? mode_arm_invite(&g.invite, g.invite_path, arm_invite)
+               : cancel_invite ? mode_cancel_invite(&g.invite, g.invite_path)
+                               : mode_show_invite(&g.invite, g.invite_path);
+        hydro_memzero(&g, sizeof g);
+        return rc;
     }
 
     /* A 32-byte seed is stored, not the keypair: both halves are re-derived
@@ -1066,6 +1384,22 @@ int main(int argc, char **argv)
         return 1;
     }
     logf_("gate: %zu peer(s) allowed", g.allow.count);
+
+    /* A malformed invite file is fatal for the same reason a malformed
+     * allowlist is: both decide who gets in, and starting anyway would mean
+     * running with a security record the operator believes is in force and
+     * isn't. A MISSING file is not malformed — that is the normal state and
+     * bs_invite_load reports it as success with armed=false. */
+    if (!bs_invite_load(&g.invite, g.invite_path, err, sizeof err)) {
+        logf_("gate: %s", err);
+        return 1;
+    }
+    if (bs_invite_valid(&g.invite, (int64_t)time(NULL))) {
+        logf_("gate: invite armed for '%s', %lld second(s) left, %u attempt(s)",
+              g.invite.label,
+              (long long)g.invite.expires_unix - (long long)time(NULL),
+              g.invite.strikes_left);
+    }
 
     char ip[64];
     const char *colon = strrchr(listen_arg, ':');
@@ -1149,7 +1483,14 @@ int main(int argc, char **argv)
                  * Anyone no longer on the list is disconnected immediately. */
                 for (unsigned i = 0; i < BS_MAX_SESSIONS; i++) {
                     struct bs_session *s = &g.session[i];
-                    if (s->used && bs_allowlist_find(&g.allow, s->peer_pk) == NULL) {
+
+                    /* A probation session is not on the allowlist BY
+                     * DEFINITION — that is what it is for. Sweeping it here
+                     * would report an enrolling stranger as a revoked player
+                     * and tell the game logic somebody left who never
+                     * arrived. It has its own 10-second deadline in tick(). */
+                    if (s->used && !s->enrolling
+                        && bs_allowlist_find(&g.allow, s->peer_pk) == NULL) {
                         logf_("gate: %s revoked, disconnecting (sid %08x)",
                               s->label, s->sid);
                         send_encrypted(&g, s, BS_PKT_DISCONNECT, NULL, 0);
@@ -1161,6 +1502,26 @@ int main(int argc, char **argv)
                 logf_("gate: allowlist reload REFUSED, keeping previous: %s", e);
             }
             hydro_memzero(&fresh, sizeof fresh);
+
+            /* Reloaded on the same signal, because `bsgate-keys invite` arms
+             * one by writing the file and then SIGHUPing us — the daemon owns
+             * no other channel for it. Kept independent of the allowlist
+             * result above: a broken allowlist must not silently strand an
+             * invite the operator has already sent out. */
+            struct bs_invite iv;
+            if (bs_invite_load(&iv, g.invite_path, e, sizeof e)) {
+                g.invite = iv;
+                if (bs_invite_valid(&g.invite, (int64_t)time(NULL))) {
+                    logf_("gate: invite armed for '%s', %lld second(s) left",
+                          g.invite.label,
+                          (long long)g.invite.expires_unix - (long long)time(NULL));
+                } else {
+                    logf_("gate: no invite armed");
+                }
+            } else {
+                logf_("gate: invite reload REFUSED, keeping previous: %s", e);
+            }
+            hydro_memzero(&iv, sizeof iv);
         }
 
         if (r > 0) {

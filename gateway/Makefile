@@ -32,7 +32,7 @@ CFLAGS  := -std=c11 -O2 -g \
 
 LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 
-OBJS    := bsgate.o allowlist.o proxyproto.o ratelimit.o replay.o $(HYDRO)/hydrogen.o
+OBJS    := bsgate.o allowlist.o invite.o proxyproto.o ratelimit.o replay.o $(HYDRO)/hydrogen.o
 
 .PHONY: all deps test clean install-check
 
@@ -63,7 +63,7 @@ $(HYDRO)/hydrogen.o: $(HYDRO)/hydrogen.c
 bsgate: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
-bsgate_test: bsgate_test.o allowlist.o proxyproto.o ratelimit.o replay.o $(HYDRO)/hydrogen.o
+bsgate_test: bsgate_test.o allowlist.o invite.o proxyproto.o ratelimit.o replay.o $(HYDRO)/hydrogen.o
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 test: all bsgate_test

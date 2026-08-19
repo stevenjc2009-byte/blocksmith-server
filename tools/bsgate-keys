@@ -4,6 +4,8 @@
 #   bsgate-keys list
 #   bsgate-keys add <64-hex-public-key> <label>
 #   bsgate-keys revoke <label|64-hex-public-key>
+#   bsgate-keys invite <label>  arm a one-time code your friend types in
+#   bsgate-keys invite --cancel
 #   bsgate-keys identity        server public key + network PSK (for a client build)
 #
 # Every mutation validates the resulting file with the daemon's own parser
@@ -14,9 +16,33 @@ set -euo pipefail
 
 STATE_DIR=${BSGATE_STATE_DIR:-/var/lib/bsgate}
 ALLOWLIST="${STATE_DIR}/allowlist"
+INVITE="${STATE_DIR}/invite"
 BSGATE_BIN=${BSGATE_BIN:-/opt/bsgate/bsgate}
+SERVICE_USER=${BSGATE_USER:-bsgate}
 
 die() { echo "bsgate-keys: $*" >&2; exit 1; }
+
+# The invite file is read by the daemon, which runs as an unprivileged account,
+# from a 0700 state directory. A file this script created as root would be
+# root-owned and unreadable to it — and an unreadable invite file looks exactly
+# like no invite at all, so the failure would be a friend told to type a code
+# that silently cannot work. Dropping to the service user to write it removes
+# that failure mode instead of papering over it with a chown afterwards.
+as_service_user() {
+    # Already the service user (a bare-metal or test install where root and
+    # bsgate are the same account): dropping privileges is a no-op, and
+    # runuser would only add a way to fail.
+    if [[ $(id -un) == "$SERVICE_USER" ]]; then
+        "$@"
+        return
+    fi
+
+    command -v runuser >/dev/null 2>&1 \
+        || die "runuser not found (util-linux); cannot write ${INVITE} as ${SERVICE_USER}"
+    id -u "$SERVICE_USER" >/dev/null 2>&1 \
+        || die "no such user '${SERVICE_USER}' — is bsgate installed?"
+    runuser -u "$SERVICE_USER" -- "$@"
+}
 
 need_root() {
     [[ $EUID -eq 0 ]] || die "must run as root (the allowlist is 0600 root-adjacent)"
@@ -50,6 +76,75 @@ cmd_list() {
         n=$((n + 1))
     done < "$ALLOWLIST"
     echo "($n peer(s))"
+
+    # An armed invite is a door that is currently open. It belongs next to the
+    # list of who is already through it, not behind a separate command nobody
+    # remembers to run.
+    local armed
+    armed=$("$BSGATE_BIN" --state-dir "$STATE_DIR" --show-invite 2>/dev/null || true)
+    case "$armed" in
+        "invite_armed none 0 0"|"") : ;;
+        *)
+            read -r _ label secs strikes <<< "$armed"
+            printf '\ninvite armed for %s — %s minute(s) left, %s attempt(s)\n' \
+                "$label" "$(( (secs + 59) / 60 ))" "$strikes"
+            ;;
+    esac
+}
+
+cmd_invite() {
+    need_root
+    local who=${1:-}
+
+    case "$who" in
+        --cancel)
+            as_service_user "$BSGATE_BIN" --state-dir "$STATE_DIR" --cancel-invite >/dev/null
+            echo "invite cancelled"
+            reload
+            return
+            ;;
+        --show)
+            "$BSGATE_BIN" --state-dir "$STATE_DIR" --show-invite
+            return
+            ;;
+        "" | -*)
+            die "usage: bsgate-keys invite <label> | invite --cancel | invite --show"
+            ;;
+    esac
+
+    [[ $who =~ ^[A-Za-z0-9_-]{1,31}$ ]] || die "label must be 1-31 chars of [A-Za-z0-9_-]"
+
+    # Refused here as well as in the daemon, because failing at ARM time costs
+    # the operator one retry, while failing at ENROL time is a friend staring
+    # at a rejected code with no idea why.
+    if [[ -f $ALLOWLIST ]] \
+       && awk -v l="$who" '$1 !~ /^#/ && $2 == l { found = 1 } END { exit !found }' "$ALLOWLIST"; then
+        die "label '$who' is already on the allowlist — pick another, or revoke it first"
+    fi
+
+    local out
+    out=$(as_service_user "$BSGATE_BIN" --state-dir "$STATE_DIR" --arm-invite "$who")
+
+    local code ttl
+    code=$(awk '$1 == "invite_code"  { print $2 }' <<< "$out")
+    ttl=$(awk  '$1 == "invite_ttl_s" { print $2 }' <<< "$out")
+    [[ -n $code ]] || die "bsgate did not return a code; nothing was armed"
+
+    cat <<EOF
+
+  Send this to ${who}:
+
+      ${code}
+
+  They enter it once on their 3DS. Their console is then added to the
+  allowlist as '${who}' and they can join whenever they like, with no code
+  and nothing to accept — this is a one-time introduction, not a password.
+
+  Valid for $((ttl / 60)) minutes, or 3 wrong attempts, whichever comes first.
+  It cannot be shown again. Losing it costs nothing: arm another.
+
+EOF
+    reload
 }
 
 cmd_add() {
@@ -120,14 +215,20 @@ case "${1:-}" in
     list)     shift; cmd_list "$@" ;;
     add)      shift; cmd_add "$@" ;;
     revoke)   shift; cmd_revoke "$@" ;;
+    invite)   shift; cmd_invite "$@" ;;
     identity) shift; cmd_identity "$@" ;;
     *)
         cat >&2 <<EOF
 usage: bsgate-keys <command>
 
-  list                        show allowed peers
+  list                        show allowed peers and any armed invite
   add <64-hex> <label>        allow a friend's public key
   revoke <label|64-hex>       remove a peer and disconnect them now
+  invite <label>              arm a one-time code for a new friend to type in;
+                              on success their console joins the allowlist for
+                              good, so they never need a code again
+  invite --cancel             disarm it early
+  invite --show               is one armed, and for how much longer
   identity                    print server public key + network PSK
 EOF
         exit 2

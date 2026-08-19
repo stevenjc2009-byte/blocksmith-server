@@ -66,8 +66,24 @@ enum bs_pkt_type {
     BS_PKT_KX2        = 0x04, /* S->C  session id + Noise XX message 2       */
     BS_PKT_KX3        = 0x05, /* C->S  session id + Noise XX message 3       */
     BS_PKT_DATA       = 0x06, /* both  AEAD payload                          */
-    BS_PKT_DISCONNECT = 0x07  /* both  AEAD, empty payload                   */
+    BS_PKT_DISCONNECT = 0x07, /* both  AEAD, empty payload                   */
+    BS_PKT_ENROL      = 0x08, /* C->S  AEAD, one-time invite code as text    */
+    BS_PKT_ENROL_OK   = 0x09  /* S->C  AEAD, empty; you are on the allowlist */
 };
+
+/* Enrolment exists so a human never has to move a 64-hex key between a 3DS and
+ * the server. The operator runs `bsgate-keys invite <label>`, which arms a
+ * single short-lived one-time code; the friend types that code into the console
+ * once, and the console's own static key is written into the allowlist under
+ * <label>. From then on they are an ordinary allowlisted peer and the code is
+ * gone — it is a one-time door, not a password.
+ *
+ * The code rides inside an AEAD packet on a session whose Noise XX handshake
+ * has ALREADY completed, so it is never on the wire in the clear and the peer
+ * has already had to hold the network PSK to get this far. With no invite
+ * armed, an unlisted key is dropped exactly as it always was: enrolment adds no
+ * reachable code path at all unless the operator has just armed one. */
+#define BS_INVITE_CODE_MAX  32u
 
 #define BS_HDR_BYTES        4u   /* type, version, 2 reserved (must be zero) */
 #define BS_NONCE_BYTES     32u

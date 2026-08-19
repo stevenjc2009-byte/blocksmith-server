@@ -162,6 +162,7 @@ refresh_snapshot() {
 declare -A GATE_KV=()
 declare -A GATE_SESSION=()
 declare -a GATE_SESSION_ORDER=()
+declare -a GATE_ENROLLING=()
 
 declare -A GAME_KV=()
 declare -A GAME_PLAYER=()
@@ -169,13 +170,22 @@ declare -a GAME_PLAYER_ORDER=()
 
 parse_gate_file() {
     local file=$1 line key rest
-    GATE_KV=(); GATE_SESSION=(); GATE_SESSION_ORDER=()
+    GATE_KV=(); GATE_SESSION=(); GATE_SESSION_ORDER=(); GATE_ENROLLING=()
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -z $line ]] && continue
         read -r key rest <<< "$line"
         if [[ $key == session ]]; then
-            local sid label real reply idle
-            read -r sid label real reply idle <<< "$rest"
+            # The trailing field is only present on a probation session (a
+            # console part-way through redeeming an invite). It is deliberately
+            # kept out of GATE_SESSION_ORDER: it is not a player, bsgame has
+            # never heard of it, and listing it in the player table would make
+            # a stranger look like a friend for the ten seconds it exists.
+            local sid label real reply idle flag
+            read -r sid label real reply idle flag <<< "$rest"
+            if [[ ${flag:-} == enrolling ]]; then
+                GATE_ENROLLING+=("${label}|${real}")
+                continue
+            fi
             GATE_SESSION[$sid]="${label}|${real}|${reply}|${idle}"
             GATE_SESSION_ORDER+=("$sid")
         else
@@ -387,6 +397,22 @@ if [[ $gate_ok -eq 1 ]]; then
     printf 'sessions            %s / %s\n' "${GATE_KV[sessions]:-n/a}" "${GATE_KV[sessions_max]:-n/a}"
     printf 'handshakes in flight %s\n' "${GATE_KV[handshakes_in_flight]:-n/a}"
     printf 'dropped total       %s (unauthenticated packets, since bsgate started)\n' "${GATE_KV[dropped_total]:-n/a}"
+    printf 'enrolments total    %s\n' "${GATE_KV[enrolments_total]:-n/a}"
+
+    # An armed invite is the one temporarily-open door on a box whose whole
+    # design is zero inbound ports, so it is reported here rather than left to
+    # a separate command the operator has to remember to run.
+    read -r inv_label inv_secs inv_strikes <<< "${GATE_KV[invite_armed]:-none 0 0}"
+    if [[ ${inv_label:-none} == none ]]; then
+        echo "invite              none armed"
+    else
+        printf 'invite              ARMED for %s — %sm%02ss left, %s attempt(s) — cancel with: bsgate-keys invite --cancel\n' \
+            "$inv_label" "$(( inv_secs / 60 ))" "$(( inv_secs % 60 ))" "$inv_strikes"
+    fi
+    for e in ${GATE_ENROLLING+"${GATE_ENROLLING[@]}"}; do
+        IFS='|' read -r e_label e_real <<< "$e"
+        printf 'enrolling now       %s from %s (not a player yet)\n' "$e_label" "$e_real"
+    done
 else
     echo "unavailable (bsgate snapshot not refreshed)"
 fi
