@@ -14,7 +14,10 @@ Type=simple
 # it binds a high UDP port, so there is nothing to grant.
 User=bsgate
 Group=bsgate
-# The game-logic process joins this group to reach the gateway socket.
+# bsgame.service runs with SupplementaryGroups=bsgate — that is the membership
+# which actually grants it access to /run/bsgate and the sockets below. This
+# line is the reverse direction, and exists so the gateway can read anything
+# bsgame owns; it is not what makes the socket path work.
 SupplementaryGroups=bsgame
 
 # /var/lib/bsgate, created 0700 and owned by the service user. Holds
@@ -22,8 +25,12 @@ SupplementaryGroups=bsgame
 StateDirectory=bsgate
 StateDirectoryMode=0700
 
-# /run/bsgate, 0750 group bsgame, so the game process can reach the sockets
-# and nothing else on the box can.
+# /run/bsgate — created 0750 and owned bsgate:bsgate, since RuntimeDirectory
+# takes this unit's own User=/Group=. bsgame reaches it by being a member of
+# the bsgate group (SupplementaryGroups=bsgate in bsgame.service), which gives
+# it r-x here and rw on the 0770 sockets bsgate binds inside — see the
+# umask(0007) around the bind() calls in gateway/bsgate.c. Nothing else on the
+# box is in that group, so nothing else can reach the sockets.
 RuntimeDirectory=bsgate
 RuntimeDirectoryMode=0750
 

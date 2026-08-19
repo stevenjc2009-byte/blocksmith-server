@@ -23,15 +23,11 @@ Type=simple
 #
 # That second part is deliberate, not a guess: bsgate.service runs as
 # User=bsgate/Group=bsgate, so its RuntimeDirectory (/run/bsgate) is owned
-# bsgate:bsgate. bsgate.service's own comment above its RuntimeDirectory=
-# line says "0750 group bsgame", but its actual Group= directive is
-# `bsgate` — the socket files it binds are 0770 group-bsgate too (see
-# gateway/bsgate.c's umask(0007) around its bind() calls, which is what
-# overrides the process-wide UMask=0077 for just those two files). This
-# unit is written against that verified, real permission boundary (group
-# `bsgate`), not the comment text in bsgate.service, which this task is not
-# permitted to touch — see server/README.md and the install-time notes for
-# the discrepancy if bsgate.service is ever revisited.
+# bsgate:bsgate at 0750, and the sockets it binds inside are 0770
+# group-bsgate — see gateway/bsgate.c's umask(0007) around its bind() calls,
+# which is what overrides the process-wide UMask=0077 for just those two
+# files. Membership of `bsgate` is therefore the real permission boundary,
+# and it is the one this unit is written against.
 User=bsgame
 Group=bsgame
 SupplementaryGroups=bsgate

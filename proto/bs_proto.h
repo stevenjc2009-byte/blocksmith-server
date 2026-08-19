@@ -84,9 +84,19 @@ enum bs_pkt_type {
 
 #define BS_DATA_OVERHEAD   (BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES + BS_AEAD_HEADERBYTES)
 
-/* Largest plaintext the gateway will carry. Chosen to keep every DATA packet
- * inside a 1280-byte IPv6-safe MTU after the WireGuard relay's own 60-byte
- * overhead, because a fragmented UDP datagram on 3DS Wi-Fi is a dropped one. */
+/* Largest plaintext the gateway will carry. Sized so every DATA packet stays
+ * inside a 1280-byte IPv6-safe MTU on both legs of the path, because a
+ * fragmented UDP datagram on 3DS Wi-Fi is a dropped one:
+ *
+ *   BS_MAX_PACKET                        = 4 + 4 + 8 + 36 + 1024 = 1076
+ *   3DS -> playit edge                   = 1076
+ *   playit edge -> agent, + PROXY v2 v4  = 1076 + 28             = 1104
+ *
+ * (An earlier revision of this comment justified the number against a
+ * WireGuard relay's 60-byte overhead. That relay was replaced by the playit
+ * tunnel — see the README's topology section — and 28 bytes of PROXY protocol
+ * v2 is the header that actually rides along now. The bound is looser than it
+ * was, so 1024 remains correct; only the reasoning changed.) */
 #define BS_MAX_PAYLOAD     1024u
 #define BS_MAX_PACKET      (BS_DATA_OVERHEAD + BS_MAX_PAYLOAD)
 

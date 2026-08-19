@@ -228,9 +228,25 @@ say "both builds and both test suites passed — installing"
 
 # --------------------------------------------------------------- install
 
+# Keep a copy of everything the rollback below has to be able to undo. The unit
+# files are in here for a reason: a release can perfectly well ship a good
+# binary and a bad unit (a typo in ExecStart, a hardening directive the kernel
+# on this box rejects), and the service then fails to come up for a reason that
+# rolling back only the binaries cannot fix. Restoring one half and leaving the
+# other is worse than either — it produces a running system in a state that was
+# never tested.
 for bin in bsgate bsgame; do
     if [[ -f ${INSTALL_ROOT}/${bin} ]]; then
         mv -f "${INSTALL_ROOT}/${bin}" "${INSTALL_ROOT}/${bin}.prev"
+    fi
+done
+
+# Unit backups live under INSTALL_ROOT, not beside the units: systemd scans
+# UNIT_DIR, and dropping unfamiliar files in there is a good way to earn a
+# confusing warning from daemon-reload for no benefit.
+for unit in bsgate.service bsgame.service; do
+    if [[ -f ${UNIT_DIR}/${unit} ]]; then
+        cp -a "${UNIT_DIR}/${unit}" "${INSTALL_ROOT}/${unit}.prev"
     fi
 done
 
@@ -253,7 +269,7 @@ systemctl is-active --quiet bsgate || FAILED=1
 systemctl is-active --quiet bsgame || FAILED=1
 
 if [[ $FAILED -eq 1 ]]; then
-    warn "a service did not come back up after the update — rolling back binaries"
+    warn "a service did not come back up after the update — rolling back"
     journalctl -u bsgate -u bsgame -n 40 --no-pager >&2 || true
 
     for bin in bsgate bsgame; do
@@ -261,6 +277,15 @@ if [[ $FAILED -eq 1 ]]; then
             mv -f "${INSTALL_ROOT}/${bin}.prev" "${INSTALL_ROOT}/${bin}"
         fi
     done
+
+    # Units too, or a release whose unit file is what broke the start would be
+    # left permanently broken by a rollback that "succeeded".
+    for unit in bsgate.service bsgame.service; do
+        if [[ -f ${INSTALL_ROOT}/${unit}.prev ]]; then
+            mv -f "${INSTALL_ROOT}/${unit}.prev" "${UNIT_DIR}/${unit}"
+        fi
+    done
+
     echo "$CURRENT_VERSION" > "$VERSION_FILE"
 
     systemctl daemon-reload
@@ -268,11 +293,14 @@ if [[ $FAILED -eq 1 ]]; then
     systemctl restart bsgame
     sleep 1
 
-    die "update to v${TARGET_VERSION} did not come up cleanly — rolled back binaries to v${CURRENT_VERSION} and restarted. (Unit files under ${UNIT_DIR} are still the new ones; only the binaries were rolled back — investigate before retrying.)"
+    if systemctl is-active --quiet bsgate && systemctl is-active --quiet bsgame; then
+        die "update to v${TARGET_VERSION} did not come up cleanly — rolled back binaries AND unit files to v${CURRENT_VERSION}, and both services are running again. Investigate before retrying."
+    fi
+    die "update to v${TARGET_VERSION} did not come up cleanly, AND the rollback to v${CURRENT_VERSION} did not come up either. The box needs hands: check 'systemctl status bsgate bsgame' and 'journalctl -u bsgate -u bsgame'."
 fi
 
-for bin in bsgate bsgame; do
-    rm -f "${INSTALL_ROOT}/${bin}.prev"
+for old in bsgate bsgame bsgate.service bsgame.service; do
+    rm -f "${INSTALL_ROOT}/${old}.prev"
 done
 
 say "Updated v${CURRENT_VERSION} -> v${TARGET_VERSION}"
