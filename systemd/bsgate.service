@@ -25,14 +25,21 @@ SupplementaryGroups=bsgame
 StateDirectory=bsgate
 StateDirectoryMode=0700
 
-# /run/bsgate — created 0750 and owned bsgate:bsgate, since RuntimeDirectory
-# takes this unit's own User=/Group=. bsgame reaches it by being a member of
-# the bsgate group (SupplementaryGroups=bsgate in bsgame.service), which gives
-# it r-x here and rw on the 0770 sockets bsgate binds inside — see the
-# umask(0007) around the bind() calls in gateway/bsgate.c. Nothing else on the
-# box is in that group, so nothing else can reach the sockets.
+# /run/bsgate — owned bsgate:bsgate, since RuntimeDirectory takes this unit's
+# own User=/Group=. bsgame reaches it by being a member of the bsgate group
+# (SupplementaryGroups=bsgate in bsgame.service), and gets rw on the 0770
+# sockets bsgate binds inside — see the umask(0007) around the bind() calls in
+# gateway/bsgate.c. Nothing else on the box is in that group, so nothing else
+# can reach the sockets.
+#
+# 0770, not 0750. bsgame does not merely read this directory: it *binds*
+# game.sock in it, and creating a file needs write on the containing
+# directory. At 0750 the group has r-x only and bsgame died on startup with
+#     game: bind /run/bsgate/game.sock: Permission denied
+# The group is exactly {bsgate, bsgame}, so this grants write to the two
+# daemons that need it and to nothing else — other stays --- either way.
 RuntimeDirectory=bsgate
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0770
 
 # bsgate binds loopback only and never sees a public address. The playit
 # agent (a separate service, dialing out from this same container) forwards

@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/stat.h>   /* umask, around the socket bind below */
 #include <sys/un.h>
 
 #include "../proto/bs_proto.h"
@@ -405,7 +406,16 @@ static bool unix_bind(struct bs_game *g, const char *path)
 
     unlink(path);
 
-    if (bind(g->unix_fd, (struct sockaddr *)&un, sizeof un) != 0) {
+    /* 0770 with the shared group, matching gateway/bsgate.c's unix_bind: the
+     * gate process has to connect() to this socket, which needs write on the
+     * socket file, and it only ever reaches it through group membership.
+     * Without this the unit's UMask=0077 would leave game.sock 0700
+     * bsgame:bsgame and the gate would be locked out of its own game link. */
+    mode_t old = umask(0007);
+    bool ok = bind(g->unix_fd, (struct sockaddr *)&un, sizeof un) == 0;
+    umask(old);
+
+    if (!ok) {
         logf_("game: bind %s: %s", path, strerror(errno));
         return false;
     }
