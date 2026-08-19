@@ -1,0 +1,6 @@
+# Build artefacts and the pinned libhydrogen checkout. .deps contains its own
+# git repository — it must never be committed into this one.
+.deps/
+*.o
+bsgate
+bsgate_test

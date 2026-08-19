@@ -1,0 +1,100 @@
+[Unit]
+Description=Blocksmith secure transport gateway
+Documentation=file:/opt/bsgate/README.md
+# bsgate binds loopback only, which is always available early, but it should
+# still come up after the firewall so the box is never mid-boot with the
+# gateway running and the outbound/inbound rules not yet applied.
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# A dedicated unprivileged account. The binary needs no capabilities at all:
+# it binds a high UDP port, so there is nothing to grant.
+User=bsgate
+Group=bsgate
+# The game-logic process joins this group to reach the gateway socket.
+SupplementaryGroups=bsgame
+
+# /var/lib/bsgate, created 0700 and owned by the service user. Holds
+# server.seed, network.psk and allowlist.
+StateDirectory=bsgate
+StateDirectoryMode=0700
+
+# /run/bsgate, 0750 group bsgame, so the game process can reach the sockets
+# and nothing else on the box can.
+RuntimeDirectory=bsgate
+RuntimeDirectoryMode=0750
+
+# bsgate binds loopback only and never sees a public address. The playit
+# agent (a separate service, dialing out from this same container) forwards
+# to this address over loopback with a PROXY protocol v2 header, which is why
+# --proxy-protocol is on with the trust boundary pinned to loopback: nothing
+# outside 127.0.0.0/8 is allowed to assert a client's real address.
+ExecStart=/opt/bsgate/bsgate \
+    --listen ${BSGATE_LISTEN} \
+    --state-dir /var/lib/bsgate \
+    --gate-socket /run/bsgate/gate.sock \
+    --game-socket /run/bsgate/game.sock \
+    --proxy-protocol \
+    --trusted-proxy 127.0.0.0/8
+EnvironmentFile=/etc/bsgate/bsgate.env
+
+# SIGHUP reloads the allowlist and disconnects anyone revoked.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=2s
+
+# ---- sandbox ------------------------------------------------------------
+# This process parses attacker-controlled bytes on its first instruction, so
+# it is locked down to roughly nothing: no capabilities, no new privileges,
+# a read-only filesystem, no devices, no kernel surface.
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+
+# UDP on loopback (to the playit agent, not "the world" any more), a Unix
+# socket to the game logic. Nothing else — no raw sockets, no netlink, no
+# bluetooth.
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @cpu-emulation @swap
+
+# NOTE: PrivateUsers is deliberately NOT set. It needs a nested user
+# namespace, which requires `features: nesting=1` on the LXC — a strictly
+# larger container attack surface than the one setting buys back. Everything
+# above works in an unprivileged container without nesting.
+
+# Bounded so a leak or a flood cannot take the host down with it.
+MemoryMax=128M
+TasksMax=16
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

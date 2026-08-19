@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# bsgate-keys — manage the friend allowlist.
+#
+#   bsgate-keys list
+#   bsgate-keys add <64-hex-public-key> <label>
+#   bsgate-keys revoke <label|64-hex-public-key>
+#   bsgate-keys identity        server public key + network PSK (for a client build)
+#
+# Every mutation validates the resulting file with the daemon's own parser
+# before installing it, then reloads with SIGHUP. A revoke takes effect
+# immediately — the peer is disconnected mid-session, not at next login.
+
+set -euo pipefail
+
+STATE_DIR=${BSGATE_STATE_DIR:-/var/lib/bsgate}
+ALLOWLIST="${STATE_DIR}/allowlist"
+BSGATE_BIN=${BSGATE_BIN:-/opt/bsgate/bsgate}
+
+die() { echo "bsgate-keys: $*" >&2; exit 1; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "must run as root (the allowlist is 0600 root-adjacent)"
+}
+
+reload() {
+    if systemctl is-active --quiet bsgate; then
+        systemctl reload bsgate
+        echo "reloaded bsgate"
+    else
+        echo "bsgate is not running; the change applies at next start"
+    fi
+}
+
+# Installs a candidate file only if it parses. The daemon refuses a malformed
+# allowlist on reload and keeps the old one, so an unvalidated write would
+# leave the running config and the on-disk config silently disagreeing.
+install_validated() {
+    local candidate=$1
+    install -m 0600 -o bsgate -g bsgate "$candidate" "$ALLOWLIST"
+    rm -f "$candidate"
+}
+
+cmd_list() {
+    [[ -f $ALLOWLIST ]] || die "no allowlist at $ALLOWLIST"
+    local n=0
+    printf '%-8s  %s\n' "LABEL" "PUBLIC KEY"
+    while read -r key label; do
+        [[ -z ${key:-} || ${key:0:1} == "#" ]] && continue
+        printf '%-8s  %s\n' "$label" "$key"
+        n=$((n + 1))
+    done < "$ALLOWLIST"
+    echo "($n peer(s))"
+}
+
+cmd_add() {
+    need_root
+    local key=${1:-} label=${2:-}
+    [[ -n $key && -n $label ]] || die "usage: bsgate-keys add <64-hex> <label>"
+    [[ $key =~ ^[0-9a-fA-F]{64}$ ]] || die "key must be exactly 64 hex characters"
+    [[ $label =~ ^[A-Za-z0-9_-]{1,31}$ ]] || die "label must be 1-31 chars of [A-Za-z0-9_-]"
+
+    key=${key,,}
+    touch "$ALLOWLIST"
+    if grep -qi "^${key} " "$ALLOWLIST" 2>/dev/null; then
+        die "that key is already present"
+    fi
+    if awk -v l="$label" '$2 == l { found = 1 } END { exit !found }' "$ALLOWLIST"; then
+        die "label '$label' is already used — labels must be unique to be revocable"
+    fi
+
+    local tmp
+    tmp=$(mktemp "${STATE_DIR}/.allowlist.XXXXXX")
+    cat "$ALLOWLIST" > "$tmp"
+    echo "${key} ${label}" >> "$tmp"
+    install_validated "$tmp"
+
+    echo "added ${label}"
+    reload
+}
+
+cmd_revoke() {
+    need_root
+    local who=${1:-}
+    [[ -n $who ]] || die "usage: bsgate-keys revoke <label|64-hex>"
+    [[ -f $ALLOWLIST ]] || die "no allowlist at $ALLOWLIST"
+
+    local tmp
+    tmp=$(mktemp "${STATE_DIR}/.allowlist.XXXXXX")
+    local removed=0
+    while IFS= read -r line; do
+        local key label
+        key=$(awk '{print $1}' <<< "$line")
+        label=$(awk '{print $2}' <<< "$line")
+        if [[ ${key,,} == "${who,,}" || $label == "$who" ]]; then
+            removed=$((removed + 1))
+            continue
+        fi
+        echo "$line" >> "$tmp"
+    done < "$ALLOWLIST"
+
+    if [[ $removed -eq 0 ]]; then
+        rm -f "$tmp"
+        die "no entry matched '$who'"
+    fi
+
+    install_validated "$tmp"
+    echo "revoked ${removed} entr$([[ $removed -eq 1 ]] && echo y || echo ies)"
+    reload
+}
+
+cmd_identity() {
+    need_root
+    echo "# Bake these into the 3DS client build. The PSK is a shared secret:"
+    echo "# anyone holding a client build can attempt a handshake, and only the"
+    echo "# allowlist decides who actually gets in."
+    "$BSGATE_BIN" --state-dir "$STATE_DIR" --print-identity
+}
+
+case "${1:-}" in
+    list)     shift; cmd_list "$@" ;;
+    add)      shift; cmd_add "$@" ;;
+    revoke)   shift; cmd_revoke "$@" ;;
+    identity) shift; cmd_identity "$@" ;;
+    *)
+        cat >&2 <<EOF
+usage: bsgate-keys <command>
+
+  list                        show allowed peers
+  add <64-hex> <label>        allow a friend's public key
+  revoke <label|64-hex>       remove a peer and disconnect them now
+  identity                    print server public key + network PSK
+EOF
+        exit 2
+        ;;
+esac

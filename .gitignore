@@ -1,0 +1,34 @@
+# Blocksmith server — top-level ignores.
+# Complements gateway/.gitignore and game/.gitignore (does not override them);
+# repeated here so the rules hold even if a new build directory shows up
+# somewhere else in the tree later.
+
+# Pinned libhydrogen checkout — gateway/Makefile `git clone`s this at build
+# time (see gateway/Makefile's `deps` target). It carries its own nested
+# .git (gateway/.deps/libhydrogen/.git) and must never be committed here.
+gateway/.deps/
+
+# Built binaries
+gateway/bsgate
+gateway/bsgate_test
+game/bsgame
+game/bsgame_test
+
+# Object and dependency files, anywhere in the tree
+*.o
+*.d
+
+# Any build-output directory
+build/
+build*/
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini

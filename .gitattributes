@@ -1,0 +1,16 @@
+# Everything in this repo is run on Linux — inside the Proxmox container, or on
+# the Proxmox host. A CRLF line ending in a shell script is not cosmetic there:
+# the shebang becomes "/usr/bin/env bash\r", which the kernel tries to execute
+# verbatim and fails with a bad-interpreter error. Cloning on Windows with
+# core.autocrlf=true would do exactly that, so the endings are pinned here
+# rather than left to whatever the cloner's global config happens to say.
+* text=auto eol=lf
+
+# Belt and braces for the files where a CR is actually fatal.
+*.sh        text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+Makefile    text eol=lf
+*.service   text eol=lf
+tools/*     text eol=lf
+VERSION     text eol=lf

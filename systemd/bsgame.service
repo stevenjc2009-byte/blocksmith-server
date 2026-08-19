@@ -1,0 +1,122 @@
+[Unit]
+Description=Blocksmith authoritative game-logic process
+Documentation=file:/opt/bsgate/README.md
+# bsgame speaks to bsgate purely over /run/bsgate/{gate,game}.sock. That
+# directory is bsgate.service's own RuntimeDirectory — it does not exist
+# until bsgate.service creates it — so bsgame must never start before it,
+# and has nothing useful to do once bsgate is gone. After= orders the
+# start; BindsTo= is the stronger half: it also stops/restarts bsgame
+# whenever bsgate.service stops, fails, or restarts, instead of leaving a
+# game process alive and sending into sockets nobody is listening on.
+After=bsgate.service
+BindsTo=bsgate.service
+# No network target here at all, unlike bsgate.service — this process never
+# touches a network socket, only the two local Unix datagram sockets above,
+# so it has no reason to wait on network-online.target.
+
+[Service]
+Type=simple
+
+# A dedicated unprivileged account. Primary group bsgame (owns this
+# process's own state directory below); supplementary group bsgate, which
+# is what actually grants access to /run/bsgate and its socket files.
+#
+# That second part is deliberate, not a guess: bsgate.service runs as
+# User=bsgate/Group=bsgate, so its RuntimeDirectory (/run/bsgate) is owned
+# bsgate:bsgate. bsgate.service's own comment above its RuntimeDirectory=
+# line says "0750 group bsgame", but its actual Group= directive is
+# `bsgate` — the socket files it binds are 0770 group-bsgate too (see
+# gateway/bsgate.c's umask(0007) around its bind() calls, which is what
+# overrides the process-wide UMask=0077 for just those two files). This
+# unit is written against that verified, real permission boundary (group
+# `bsgate`), not the comment text in bsgate.service, which this task is not
+# permitted to touch — see server/README.md and the install-time notes for
+# the discrepancy if bsgate.service is ever revisited.
+User=bsgame
+Group=bsgame
+SupplementaryGroups=bsgate
+
+# /var/lib/bsgame, created 0700 and owned bsgame:bsgame. Holds
+# block_diffs.bin — the authoritative log of every player-made block edit
+# (game/diffstore.h). Never the same directory as /var/lib/bsgate (bsgate's
+# own identity/allowlist state) — an update must leave both alone, and
+# keeping them physically separate is what makes that easy to get right.
+StateDirectory=bsgame
+StateDirectoryMode=0700
+
+# No RuntimeDirectory= here: the sockets this process binds/sends to live
+# under bsgate's /run/bsgate, owned and created by bsgate.service, not this
+# unit. Creating a second one would just be an unused empty directory.
+ExecStart=/opt/bsgate/bsgame \
+    --game-socket /run/bsgate/game.sock \
+    --gate-socket /run/bsgate/gate.sock \
+    --state-dir /var/lib/bsgame
+
+Restart=on-failure
+RestartSec=2s
+
+# ---- sandbox ------------------------------------------------------------
+# Same posture as bsgate.service, and for the same reason: this process
+# accepts bytes that already passed bsgate's authentication, but
+# "authenticated" is not "trusted" — a compromised or merely buggy client
+# is explicitly in scope (see game/bsgame.c's header comment), so it is
+# locked down to roughly nothing: no capabilities, no new privileges, a
+# read-only filesystem, no devices, no kernel surface.
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+
+# bsgame needs NO network access at all — it never opens an IP socket, only
+# the two AF_UNIX datagram sockets above. PrivateNetwork=yes is the wrong
+# tool for that: it puts the unit in its own network namespace, which is
+# an orthogonal control (it hides network *interfaces*, not address
+# families) and, like PrivateUsers below, wants namespace nesting this
+# unprivileged LXC does not have. RestrictAddressFamilies= is the right
+# tool: it is a seccomp filter on socket(2)'s address-family argument, so
+# it can permit AF_UNIX and refuse every IP family outright with no
+# namespace involved at all.
+RestrictAddressFamilies=AF_UNIX
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @cpu-emulation @swap
+
+# NOTE: PrivateUsers is deliberately NOT set, for the same reason as
+# bsgate.service — it needs a nested user namespace, which requires
+# `features: nesting=1` on the LXC, a strictly larger container attack
+# surface than the one setting buys back. Everything above works in an
+# unprivileged container without nesting.
+
+# Bounded so a leak or a flood on the game-logic side cannot take the host
+# down with it. This process holds one bounded in-memory diff table
+# (game/diffstore.h: BS_DIFF_MAX = 65536 entries, ~1.5 MiB live + ~512 KiB
+# index) plus a small fixed-size player table — 128M is generous headroom,
+# not a tight fit, same ceiling as bsgate for the same reason.
+MemoryMax=128M
+TasksMax=16
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target
