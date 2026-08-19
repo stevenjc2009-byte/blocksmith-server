@@ -73,7 +73,24 @@ say "bsgate will bind ${LISTEN_IP} (loopback only — playit forwards to it loca
 # ------------------------------------------------------------- packages
 
 say "installing packages"
-apt-get update -qq
+
+# apt-get update exits 0 even when every mirror failed to resolve — those come
+# out as W: warnings, not errors — so `set -e` does not catch it, and the
+# install below then goes looking for packages it can never reach. Checking the
+# outcome rather than the exit status. This matters more than it looks: the
+# install is -qq with its output discarded, so the entire failure presents as
+# the "installing packages" line above and then silence.
+apt-get update -qq || die "apt-get update failed — see the errors above"
+
+if ! apt-cache policy build-essential 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+    die "apt cannot see build-essential, so the package lists are empty.
+     This is almost always DNS or blocked egress from the container:
+         cat /etc/resolv.conf
+         getent hosts deb.debian.org
+     If DNS is the problem, destroy this container and re-run the installer
+     with --nameserver (e.g. --nameserver 1.1.1.1)."
+fi
+
 apt-get install -y -qq --no-install-recommends \
     build-essential git ca-certificates \
     nftables \

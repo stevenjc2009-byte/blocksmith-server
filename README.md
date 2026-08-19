@@ -102,6 +102,7 @@ over DHCP):
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--nameserver ADDR` | host's resolvers, else `--gw` | DNS for the container — see below |
 | `--ctid N` | next free id | container id |
 | `--hostname NAME` | `blocksmith-gw` | container hostname |
 | `--storage NAME` | autodetected | rootfs storage |
@@ -113,6 +114,31 @@ over DHCP):
 | `--playit-secret KEY` | — | claim playit non-interactively with an already-issued secret |
 | `--skip-playit` | off | don't install/claim playit; `bsgate` stays LAN-reachable only |
 | `--no-start` | off | create but don't start the container |
+
+### DNS, and the one failure that looks like a hang
+
+A static `--ip` gives the container an address and a route and **nothing else** —
+no resolver. Proxmox only copies the host's DNS settings when the host has
+usable ones to copy, and a node whose `/etc/resolv.conf` points at a local stub
+(`127.0.0.53`, `systemd-resolved`, `dnsmasq`) has nothing meaningful to hand
+over. The container then boots with no DNS at all.
+
+The installer now works one out for you — the host's own non-loopback resolvers
+first, the `--gw` address second — and **verifies it before doing anything that
+depends on it**. If your setup needs something else:
+
+```bash
+./install/proxmox-lxc-install.sh --ip 192.168.1.50/24 --gw 192.168.1.1 --nameserver 1.1.1.1
+```
+
+This is called out because of how the failure used to present. Provisioning runs
+`apt-get` with `-qq` and its output discarded, so a container with no DNS showed
+a bare `-> installing packages` line and then nothing for minutes, eventually
+followed by `W: Failed to fetch http://deb.debian.org/... Temporary failure
+resolving`. It reads like a hung install rather than a missing setting. Both
+halves are now checked explicitly: the host-side script refuses to continue if
+the container can't resolve `deb.debian.org`, and the container-side script
+refuses to continue if `apt` can't see `build-essential` after an update.
 
 This creates an **unprivileged** Debian LXC (`--unprivileged 1`, `nesting=0`,
 no device passthrough), copies the source in, and runs

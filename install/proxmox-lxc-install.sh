@@ -36,6 +36,7 @@ BRIDGE="vmbr0"
 GAME_PORT=41234
 STATIC_IP=""
 GATEWAY_IP=""
+NAMESERVER=""
 START_AFTER=1
 PLAYIT_SECRET=""
 SKIP_PLAYIT=0
@@ -46,6 +47,12 @@ usage: $0 [options]
 
   --ip CIDR             static address, e.g. 192.168.1.50/24  (STRONGLY advised)
   --gw ADDR             default gateway, e.g. 192.168.1.1     (required with --ip)
+  --nameserver ADDR     DNS server(s) for the container, space separated.
+                         Default: the host's own non-loopback resolvers, and
+                         failing that the --gw address. A static --ip does NOT
+                         come with a resolver, so without this the container
+                         has no DNS and every apt fetch fails with
+                         "Temporary failure resolving deb.debian.org".
   --ctid N              container id            (default: next free)
   --hostname NAME       container hostname      (default: ${HOSTNAME})
   --storage NAME        rootfs storage          (default: autodetected)
@@ -77,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --ip)             STATIC_IP=$2; shift 2 ;;
         --gw)             GATEWAY_IP=$2; shift 2 ;;
+        --nameserver)     NAMESERVER=$2; shift 2 ;;
         --ctid)           CTID=$2; shift 2 ;;
         --hostname)       HOSTNAME=$2; shift 2 ;;
         --storage)        STORAGE=$2; shift 2 ;;
@@ -122,6 +130,37 @@ else
     NETCONF="name=eth0,bridge=${BRIDGE},ip=dhcp,firewall=1"
 fi
 
+# A static ip= gives the container an address and a route and NOTHING ELSE — no
+# resolver. Proxmox only falls back to copying the host's DNS settings when the
+# container has no nameserver of its own AND the host has usable ones to copy;
+# on a node whose /etc/resolv.conf points at a local stub (127.0.0.53, dnsmasq,
+# systemd-resolved) there is nothing meaningful to inherit. The container then
+# boots with no DNS at all and the first symptom is apt sitting silently on
+# "installing packages" before printing
+#   W: Failed to fetch http://deb.debian.org/... Temporary failure resolving
+# which reads like a hung install rather than a config gap. Setting this
+# explicitly, and checking it below before anything depends on it.
+if [[ -z $NAMESERVER && -r /etc/resolv.conf ]]; then
+    NAMESERVER=$(awk '$1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" {
+                          print $2
+                      }' /etc/resolv.conf | head -3 | paste -sd' ')
+fi
+
+# The gateway is the fallback because a home router is a DNS forwarder far more
+# often than not, and it is an address the user has already had to supply
+# correctly for anything else to work.
+if [[ -z $NAMESERVER && -n $GATEWAY_IP ]]; then
+    NAMESERVER=$GATEWAY_IP
+    warn "no usable resolver in the host's /etc/resolv.conf; falling back to the"
+    warn "gateway ${GATEWAY_IP} for container DNS. Override with --nameserver."
+fi
+
+# DHCP hands out a resolver with the lease, so an empty value is only a problem
+# on a static address.
+if [[ -z $NAMESERVER && -n $STATIC_IP ]]; then
+    die "could not work out a DNS server for the container. Pass one explicitly, e.g. --nameserver 1.1.1.1"
+fi
+
 if [[ -z $CTID ]]; then
     CTID=$(pvesh get /cluster/nextid)
     say "using next free container id ${CTID}"
@@ -159,8 +198,10 @@ say "template: ${TEMPLATE}"
 # Unprivileged, no nesting, no device passthrough of any kind. The container
 # needs nothing beyond a network interface, so it is given nothing else.
 say "creating unprivileged container ${CTID}"
+[[ -n $NAMESERVER ]] && say "container DNS: ${NAMESERVER}"
 pct create "$CTID" "$TEMPLATE" \
     --hostname     "$HOSTNAME" \
+    ${NAMESERVER:+--nameserver "$NAMESERVER"} \
     --unprivileged 1 \
     --features     nesting=0 \
     --memory       "$MEMORY_MB" \
@@ -184,6 +225,30 @@ for _ in $(seq 1 60); do
 done
 pct exec "$CTID" -- test -d /run/systemd/system \
     || die "container ${CTID} did not boot into systemd"
+
+# Checked here, before anything expensive depends on it, because the failure it
+# catches is otherwise almost unreadable: provisioning runs apt-get with -qq and
+# its output sent to /dev/null, so a container with no DNS shows a bare
+# "installing packages" line and then nothing at all for minutes. Ten seconds of
+# retries covers a resolver that is up but slow to answer on a cold boot.
+say "checking the container can resolve DNS"
+for _ in $(seq 1 10); do
+    pct exec "$CTID" -- getent hosts deb.debian.org &>/dev/null && DNS_OK=1 && break
+    sleep 1
+done
+if [[ ${DNS_OK:-0} -ne 1 ]]; then
+    warn "container ${CTID} cannot resolve deb.debian.org."
+    warn "configured nameserver: ${NAMESERVER:-<none — DHCP-supplied>}"
+    warn ""
+    warn "The container is left in place so you can look at it:"
+    warn "    pct exec ${CTID} -- cat /etc/resolv.conf"
+    warn "    pct exec ${CTID} -- ping -c1 ${GATEWAY_IP:-192.168.1.1}"
+    warn ""
+    warn "Then remove it and re-run with a resolver you know works:"
+    warn "    pct stop ${CTID} && pct destroy ${CTID}"
+    warn "    $0 <your flags> --nameserver 1.1.1.1"
+    die "no DNS in container ${CTID} — stopping before the package install hangs on it"
+fi
 
 # ------------------------------------------------------------- push source
 
