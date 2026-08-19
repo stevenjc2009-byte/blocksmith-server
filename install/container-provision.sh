@@ -20,7 +20,7 @@ set -euo pipefail
 GAME_PORT=41234
 LISTEN_IP=""
 SRC_DIR="/opt/bsgate/src"
-PLAYIT_SECRET=""
+CTID_HINT=""
 SKIP_PLAYIT=0
 
 usage() {
@@ -30,10 +30,9 @@ usage: $0 [options]
   --port N              game UDP port                 (default: ${GAME_PORT})
   --listen-ip IP        override bsgate's bind address (default: 127.0.0.1)
   --src DIR             source tree location           (default: ${SRC_DIR})
-  --playit-secret KEY   claim the playit agent non-interactively with an
-                         already-issued secret key, instead of running the
-                         interactive claim-code flow. Use this to re-provision
-                         a container without visiting the dashboard again.
+  --ctid N              container id, used only to print an accurate
+                         'pct enter N' hint if the playit claim has to be
+                         finished by hand.
   --skip-playit         do not install or claim the playit agent at all.
                          bsgate still binds loopback only, so the box is
                          reachable from the LAN only — useful for local testing.
@@ -46,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --port)           GAME_PORT=$2; shift 2 ;;
         --listen-ip)      LISTEN_IP=$2; shift 2 ;;
         --src)            SRC_DIR=$2; shift 2 ;;
-        --playit-secret)  PLAYIT_SECRET=$2; shift 2 ;;
+        --ctid)           CTID_HINT=$2; shift 2 ;;
         --skip-playit)    SKIP_PLAYIT=1; shift ;;
         -h|--help)        usage ;;
         *) echo "container-provision: unknown option $1" >&2; exit 2 ;;
@@ -136,39 +135,8 @@ EOF
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends playit >/dev/null
 
-    PLAYIT_TOML=/etc/playit/playit.toml
-
-    if [[ -f $PLAYIT_TOML ]] && grep -q '^secret_key = ' "$PLAYIT_TOML" 2>/dev/null; then
-        say "playit already claimed (${PLAYIT_TOML} has a secret_key) — skipping claim"
-    elif [[ -n $PLAYIT_SECRET ]]; then
-        say "writing the supplied playit secret (non-interactive claim)"
-        SECRET_VALUE=$PLAYIT_SECRET
-    else
-        say "claiming the playit agent — this needs one manual step in a browser"
-        CLAIM_CODE=$(playit claim generate)
-        [[ -n $CLAIM_CODE ]] || die "playit claim generate produced no code"
-        CLAIM_URL=$(playit claim url --name "$(hostname)" --type self-managed "$CLAIM_CODE")
-        printf '\n'
-        printf '  \033[1;35m========================================================\033[0m\n'
-        printf '  \033[1;35m Visit this URL and approve the agent within 5 minutes:\033[0m\n'
-        printf '  \033[1;35m %s\033[0m\n' "$CLAIM_URL"
-        printf '  \033[1;35m========================================================\033[0m\n\n'
-        SECRET_VALUE=$(playit claim exchange --wait 300 "$CLAIM_CODE") \
-            || die "playit claim was not approved within 300s — re-run this script, or pass --playit-secret once you have claimed it another way"
-        [[ -n $SECRET_VALUE ]] || die "playit claim exchange produced no secret"
-    fi
-
-    if [[ -n ${SECRET_VALUE:-} ]]; then
-        install -d -m 0750 -o playit -g playit /etc/playit
-        TMP_TOML=$(mktemp /etc/playit/.playit.toml.XXXXXX)
-        printf 'secret_key = "%s"\n' "$SECRET_VALUE" > "$TMP_TOML"
-        chown playit:playit "$TMP_TOML"
-        chmod 0600 "$TMP_TOML"
-        mv -f "$TMP_TOML" "$PLAYIT_TOML"
-        unset SECRET_VALUE
-        say "playit secret written to ${PLAYIT_TOML}"
-    fi
-
+    # The daemon has to be up and holding its IPC socket before it can be
+    # provisioned, so it is started here rather than after the claim.
     say "enabling and starting playit"
     systemctl enable playit >/dev/null 2>&1
     systemctl restart playit
@@ -178,6 +146,48 @@ EOF
     else
         journalctl -u playit -n 30 --no-pager >&2
         die "playit failed to start"
+    fi
+
+    # Provisioning is an IPC call, NOT a file.
+    #
+    # This used to write `secret_key = "..."` into /etc/playit/playit.toml and
+    # restart the daemon. playitd 1.0.10 ignores that completely: it starts,
+    # logs "Waiting for frontend secret provisioning over IPC", and reports
+    # `Secret configured: false` with the file sitting right there at the
+    # secret_path it prints. The secret only counts if a frontend hands it over
+    # via the daemon's provision_service_secret IPC call, which is what
+    # `playit setup` does — see the "secret_provisioning" capability in
+    # `playit status`. The old code produced an agent that was permanently
+    # offline with no error anywhere, and cost an afternoon to find.
+    #
+    # `playit setup` takes no arguments (Usage: agent setup), so there is no
+    # way to hand it a secret you already hold. That is why --playit-secret is
+    # gone: it could not be made to work, and a flag that silently does nothing
+    # is worse than no flag.
+    if playit status 2>/dev/null | grep -q 'Secret configured: true'; then
+        say "playit is already provisioned — skipping setup"
+    elif [[ -t 0 ]]; then
+        say "claiming the playit agent — this needs one manual step in a browser"
+        say "a URL will appear below; approve it and let setup finish on its own"
+        playit setup || die "playit setup failed — run 'playit setup' inside the container and try again"
+        playit status 2>/dev/null | grep -q 'Secret configured: true' \
+            || die "playit setup returned but the daemon still reports no secret"
+        say "playit is provisioned"
+    else
+        # pct exec gives the provisioning script no tty, and `playit setup` is
+        # an interactive poll. Running it here would hang or half-complete and
+        # leave an orphaned claim in the dashboard, so it is deferred with
+        # instructions rather than attempted and botched.
+        warn "playit is installed and running but NOT yet claimed, and this"
+        warn "script has no terminal to run the interactive setup on."
+        warn "Finish it by hand, on the Proxmox host:"
+        warn ""
+        warn "    pct enter ${CTID_HINT:-<ctid>}"
+        warn "    playit setup          # approve the URL, let it finish"
+        warn "    playit status         # expect: Secret configured: true"
+        warn "    exit"
+        warn ""
+        warn "Nothing reaches the game server until that is done."
     fi
 fi
 
@@ -321,6 +331,16 @@ else
         meta skuid playit accept"
 fi
 
+# Emitted as a uid rather than the name: nft resolves "_apt" fine, but the
+# leading underscore is easy to mistake for a typo when reading the live
+# ruleset back, and `nft list` prints numeric uids anyway.
+if APT_UID=$(id -u _apt 2>/dev/null); then
+    APT_EGRESS_RULE="        meta skuid ${APT_UID} tcp dport { 80, 443 } accept"
+else
+    APT_EGRESS_RULE="        # no _apt user on this system, so no rule for it. If apt starts
+        # failing to fetch after an upgrade, check whether it has gained one."
+fi
+
 say "installing the nftables ruleset"
 cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
@@ -367,6 +387,14 @@ table inet filter {
 
         # Root needs egress for apt-get and unattended-upgrades.
         meta skuid root accept
+
+        # ...but apt's HTTPS transport does NOT run as root: /usr/lib/apt/
+        # methods/https drops to the _apt user, so the rule above never covers
+        # it. Without this line unattended-upgrades looks healthy and silently
+        # downloads nothing — the fetch just sits in SYN-SENT until it times
+        # out, which is how it was found. Narrowed to the two ports a package
+        # fetch actually needs rather than trusting the uid broadly.
+${APT_EGRESS_RULE}
 
 ${PLAYIT_EGRESS_RULE}
 

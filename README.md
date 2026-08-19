@@ -111,7 +111,6 @@ over DHCP):
 | `--memory MB` | `512` | RAM |
 | `--cores N` | `1` | CPU cores |
 | `--port N` | `41234` | game UDP port |
-| `--playit-secret KEY` | — | claim playit non-interactively with an already-issued secret |
 | `--skip-playit` | off | don't install/claim playit; `bsgate` stays LAN-reachable only |
 | `--no-start` | off | create but don't start the container |
 
@@ -147,7 +146,8 @@ no device passthrough), copies the source in, and runs
 1. Installs packages (`build-essential git ca-certificates nftables curl
    gnupg unattended-upgrades apt-listchanges`) and enables unattended
    security upgrades.
-2. Installs and claims the playit.gg agent (unless `--skip-playit`).
+2. Installs and starts the playit.gg agent (unless `--skip-playit`). It does
+   **not** claim it — see below.
 3. Creates the `bsgate` and `bsgame` service accounts and the shared
    `bsgame` group.
 4. Builds `bsgate` and `bsgame`, **runs both test suites, and refuses to
@@ -165,15 +165,38 @@ If it fails partway — a test suite failing, a hardening check failing, an
 invalid nftables ruleset — the script stops rather than installing something
 that can't prove it's safe.
 
-### The one step you do by hand: the playit tunnel
+### The two steps you do by hand: claiming the agent, and the tunnel
 
-Creating the tunnel itself happens in the playit.gg dashboard and is **not
-scriptable**. Claiming the agent (the browser-approval step) is handled by
-the installer; adding the tunnel is not.
+Neither of these is scriptable, and the installer says so rather than
+pretending otherwise.
 
-1. Claim the agent when the installer prompts (or pass `--playit-secret` to
-   skip the browser step on a re-provision).
-2. In the [playit.gg](https://playit.gg/) dashboard, add a tunnel:
+1. **Claim the agent.** The installer installs, enables and starts `playitd`,
+   but leaves it unclaimed. Two reasons, both hard:
+
+   - `playit setup` is an interactive browser approval that polls a terminal,
+     and `pct exec` gives the provisioning script no tty.
+   - There is no non-interactive alternative. `playitd` **ignores**
+     `secret_key` written into `/etc/playit/playit.toml` — it starts, logs
+     `Waiting for frontend secret provisioning over IPC`, and reports
+     `Secret configured: false` with the file sitting right there at the
+     `secret_path` it prints. The secret only counts if a frontend hands it
+     over via the daemon's `provision_service_secret` IPC call, which is what
+     `playit setup` does — and `playit setup` takes no arguments, so you
+     cannot hand it a secret you already hold.
+
+   So, on the Proxmox host after the installer finishes:
+
+   ```
+   pct enter <ctid>
+   playit setup          # approve the URL it prints, let it finish
+   playit status         # expect: Secret configured: true
+   exit
+   ```
+
+   Nothing reaches the game server until `Secret configured: true`.
+
+2. **Create the tunnel.** In the [playit.gg](https://playit.gg/) dashboard,
+   add a tunnel:
 
    | Field | Value |
    |---|---|
@@ -391,26 +414,31 @@ into `gateway/.deps/` on first run (see `deps`), builds `bsgate` and
   confirm RELRO/BIND_NOW, PIE, and a non-executable stack in the built
   binaries.
 
+**Verified on a real Proxmox host (2026-08-19, v1.0.5):** the installer ran
+end to end on a live node — container created, both test suites green inside
+it (`PASS 89`, `PASS 23`), `bsgate` and `bsgame` both `active`, both unix
+sockets `srwxrwx---`, `bsgate` listening on `127.0.0.1:41234/udp` with
+`PROXY protocol v2 expected, trusting 127.0.0.0/8`, the playit agent claimed
+and online, zero inbound ports. It took five fixes to get there (v1.0.3
+through v1.0.5); if you are running an older tag, don't.
+
 **Not verified — read this before assuming any of it works:**
 
-- **Nothing here has ever run on a real Proxmox LXC.** All of the above was
-  exercised off-target. The Proxmox-specific parts of the installer (`pct`,
-  `pveam`, `pvesm` calls) have not been run against a real Proxmox host.
-- The **playit claim flow**, `bsgate --proxy-protocol` actually running
-  behind a real playit tunnel, and the **nftables firewall actually taking
-  effect** in a live container are all untested on real hardware — only the
-  rendered ruleset has been checked with `nft -c`.
+- **No traffic has yet crossed a real playit tunnel.** `bsgate
+  --proxy-protocol` is running and expecting PROXY v2 headers, but nothing
+  has sent it one over the wire; the PPv2 parser is covered by the test
+  suite only.
 - **No real 3DS console has connected to this server.** All transport
   testing so far is against a forked `bsgate`, not a live pairing between a
   console and a container.
-- `bsgate` ↔ `bsgame` interop is verified only against the derived wire
-  contract between the two test suites, not against a live process pair
-  handling a real handshake end to end.
+- `bsgate` ↔ `bsgame` interop: both daemons now start and hold their sockets
+  as two different uids on a live container, but no real handshake has been
+  driven through the pair — only the derived wire contract between the two
+  test suites.
 - `game/diffstore.c`'s full-table and torn-record recovery paths have no
   test coverage.
 
 If you're standing this up for the first time, the honest summary is: the
-crypto, the parsers, and the game logic have been exercised hard in
-isolation, but the two things that make this a *server* — a real network
-path through playit, and a real Proxmox container — have not yet been
-proven end to end.
+container, the build, the hardening and the two daemons are proven on real
+hardware; the *network path* — a packet from a console, through playit, into
+`bsgame` — is not.

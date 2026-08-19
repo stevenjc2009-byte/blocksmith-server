@@ -38,7 +38,6 @@ STATIC_IP=""
 GATEWAY_IP=""
 NAMESERVER=""
 START_AFTER=1
-PLAYIT_SECRET=""
 SKIP_PLAYIT=0
 
 usage() {
@@ -61,10 +60,10 @@ usage: $0 [options]
   --memory MB           RAM                     (default: ${MEMORY_MB})
   --cores N             cpu cores               (default: ${CORES})
   --port N              game UDP port           (default: ${GAME_PORT})
-  --playit-secret KEY   claim the playit agent non-interactively with an
-                         already-issued secret key instead of the interactive
-                         claim-code flow. Passed straight through to
-                         container-provision.sh.
+                        There is no non-interactive way to claim the playit
+                        agent: playitd only accepts a secret over its IPC
+                        socket and 'playit setup' takes no arguments, so the
+                        claim is always a manual browser step. See README.
   --skip-playit         do not install or claim the playit agent. bsgate
                          still binds loopback only, so the container is
                          reachable from the LAN only — useful for local
@@ -93,7 +92,6 @@ while [[ $# -gt 0 ]]; do
         --memory)         MEMORY_MB=$2; shift 2 ;;
         --cores)          CORES=$2; shift 2 ;;
         --port)           GAME_PORT=$2; shift 2 ;;
-        --playit-secret)  PLAYIT_SECRET=$2; shift 2 ;;
         --skip-playit)    SKIP_PLAYIT=1; shift ;;
         --no-start)       START_AFTER=0; shift ;;
         -h|--help)        usage ;;
@@ -277,14 +275,19 @@ pct exec "$CTID" -- rm -f /opt/bsgate/src.tar.gz
 
 # ------------------------------------------------------------- provision
 
-PROVISION_ARGS=(--port "$GAME_PORT")
-[[ -n $PLAYIT_SECRET ]] && PROVISION_ARGS+=(--playit-secret "$PLAYIT_SECRET")
+# --ctid is passed so the provisioning script can print an accurate
+# 'pct enter N' line when it has to defer the playit claim (see below).
+PROVISION_ARGS=(--port "$GAME_PORT" --ctid "$CTID")
 [[ $SKIP_PLAYIT -eq 1 ]] && PROVISION_ARGS+=(--skip-playit)
 
 say "provisioning inside the container (this builds and tests bsgate)"
-if [[ $SKIP_PLAYIT -eq 0 && -z $PLAYIT_SECRET ]]; then
-    say "the playit claim step is interactive — it will print a URL below and"
-    say "wait for you to approve it in a browser"
+if [[ $SKIP_PLAYIT -eq 0 ]]; then
+    # pct exec gives the provisioning script no tty, and `playit setup` is an
+    # interactive poll, so the claim cannot be run from here — it is deferred
+    # and the provisioning script prints the two commands to finish it.
+    say "the playit claim is interactive and cannot run over 'pct exec', so it"
+    say "is deferred — instructions are printed at the end of the provisioning"
+    say "output, and the tunnel stays offline until you run them"
 fi
 pct exec "$CTID" -- bash /opt/bsgate/src/install/container-provision.sh "${PROVISION_ARGS[@]}"
 
@@ -304,9 +307,20 @@ if [[ $SKIP_PLAYIT -eq 1 ]]; then
  run container-provision.sh again inside the container) when you are ready
  to make it reachable from outside."
 else
-    NEXT_STEPS=" 1. Create the tunnel yourself — this is the one step that cannot be
-    scripted. Go to https://playit.gg/ (or the URL container-provision.sh
-    printed during the claim step), open your agent, and add a tunnel:
+    NEXT_STEPS=" 1. Claim the playit agent. This could not be done from here: it is an
+    interactive browser approval and 'pct exec' provides no terminal, and
+    playitd only takes a secret over its own IPC socket so there is no
+    non-interactive path to hand it one. Run, on this host:
+
+        pct enter ${CTID}
+        playit setup          # approve the URL it prints, let it finish
+        playit status         # expect: Secret configured: true
+        exit
+
+    Nothing reaches the game server until that is done.
+
+ 2. Create the tunnel yourself — this is the one step that cannot be
+    scripted. Go to https://playit.gg/, open your agent, and add a tunnel:
 
         protocol   UDP
         type       proxy-protocol-v2   <-- NOT v1. v1 is silently dropped by
@@ -315,7 +329,7 @@ else
         local IP   127.0.0.1
         local port ${GAME_PORT}
 
- 2. The dashboard shows the public address+port the tunnel assigns you
+ 3. The dashboard shows the public address+port the tunnel assigns you
     (something like xyz.joinmc.link:12345). That is what your friends' 3DS
     clients connect to instead of your home IP — playit relays it in, your
     router never opens a port. You can also read it from the agent itself:
@@ -323,11 +337,11 @@ else
         pct exec ${CTID} -- systemctl status playit
         pct exec ${CTID} -- journalctl -u playit -n 50
 
- 3. Get the credentials to bake into the 3DS client build:
+ 4. Get the credentials to bake into the 3DS client build:
 
         pct exec ${CTID} -- bsgate-keys identity
 
- 4. Add each friend's public key (they generate it in the client):
+ 5. Add each friend's public key (they generate it in the client):
 
         pct exec ${CTID} -- bsgate-keys add <their-64-hex-key> <label>
 
