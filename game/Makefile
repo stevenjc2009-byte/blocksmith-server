@@ -17,6 +17,23 @@
 CC     ?= cc
 WORLD  := ../../source
 
+# That client tree only exists when this repo sits inside the Blocksmith
+# checkout. The published server-only repo, the installer's staging tar and the
+# clone `update` makes all have no ../../source, and an unconditional include
+# there is a fatal build error — which is exactly how a fresh Proxmox install
+# and every future `update` turned out to be broken.  So probe, and tell
+# validate.c which world it is being built in.
+#
+# Probing the two headers rather than the directory: a partially-moved tree
+# should fall back to the server's own constants, not die on a missing include.
+# The flag is defined either way (0 or 1) so -Wundef still catches a typo in the
+# macro name instead of silently taking the fallback branch forever.
+ifneq ($(and $(wildcard $(WORLD)/world/block.h),$(wildcard $(WORLD)/world/world.h)),)
+  WORLD_CPPFLAGS := -I$(WORLD) -DBS_HAVE_CLIENT_WORLD_HEADERS=1
+else
+  WORLD_CPPFLAGS := -DBS_HAVE_CLIENT_WORLD_HEADERS=0
+endif
+
 # Same hardening as server/gateway/Makefile and for the same reason: this
 # process parses bytes that reached it via an already-authenticated session,
 # but "authenticated" is not "trusted" (see bsgame.c's header comment) —
@@ -29,7 +46,7 @@ CFLAGS := -std=c11 -O2 -g \
           -fstack-protector-strong -fstack-clash-protection \
           -D_FORTIFY_SOURCE=2 \
           -fPIE \
-          -I.. -I$(WORLD)
+          -I.. $(WORLD_CPPFLAGS)
 
 LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 
