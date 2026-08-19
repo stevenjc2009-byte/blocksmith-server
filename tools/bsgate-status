@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# bsgate-status — plain-text health report for bsgate + bsgame.
+#
+#   bsgate-status
+#
+# No web UI: the container has zero inbound ports by design, so this is a
+# terminal report you run with `pct enter <ctid>` and then this command.
+#
+# Both daemons dump a fresh plain-text snapshot when sent SIGUSR1 — a signal
+# was chosen over a query socket on purpose: a socket is a second thing
+# listening with a second parser on a box whose entire design is one parser
+# and no inbound ports. This tool signals both, waits for each snapshot
+# file's mtime to move past the moment it signalled, and only then reads it.
+# It never presents a file it did not just confirm was refreshed; if a
+# refresh does not land within ~2s it says so for that daemon and reports
+# everything else it can.
+#
+# There is no round-trip time anywhere on the server side — bsgate and
+# bsgame never solicit a reply from a client, so neither can measure
+# latency. The "last heard" column below is only how long since the server
+# received anything from that peer; a player standing still is idle by that
+# measure and perfectly healthy. It is never labelled ping/latency/RTT. A
+# real ping figure only exists on the 3DS client, which measures and shows
+# its own.
+
+set -euo pipefail
+
+die() { echo "bsgate-status: $*" >&2; exit 1; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "must run as root (reads /var/lib/bsgate and /var/lib/bsgame, and signals both daemons)"
+}
+
+usage() {
+    cat <<'EOF'
+usage: bsgate-status
+
+Signals bsgate and bsgame (SIGUSR1) for a fresh status snapshot, waits for
+each to actually refresh, then prints a plain-text report: server/versions,
+the tunnel (playit) and gateway listen address, connected players, world
+activity, and security/health counters. Takes no arguments.
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    :
+elif [[ $# -eq 1 && ( ${1} == "-h" || ${1} == "--help" ) ]]; then
+    usage
+    exit 0
+else
+    usage >&2
+    exit 2
+fi
+
+need_root
+
+# ------------------------------------------------------------ configuration
+
+BSGATE_STATUS_FILE=${BSGATE_STATUS_FILE:-/var/lib/bsgate/status.txt}
+BSGAME_STATUS_FILE=${BSGAME_STATUS_FILE:-/var/lib/bsgame/status.txt}
+
+# pid/unit discovery — overridable so this can be tested off-target, where
+# there is no systemd unit and no guarantee pidof/pgrep finds the right
+# process by name.
+BSGATE_UNIT=${BSGATE_UNIT:-bsgate}
+BSGAME_UNIT=${BSGAME_UNIT:-bsgame}
+BSGATE_PID=${BSGATE_PID:-}
+BSGAME_PID=${BSGAME_PID:-}
+
+VERSION_FILE=/opt/bsgate/VERSION
+
+REFRESH_TIMEOUT_MS=2000
+REFRESH_POLL_MS=50
+
+# ------------------------------------------------------------------- pid resolution
+
+# Prints a pid to stdout and returns 0, or returns 1 with nothing printed.
+# Order: explicit override, then systemctl MainPID, then pidof, then pgrep -x.
+resolve_pid() {
+    local override=$1 unit=$2 procname=$3
+    if [[ -n $override ]]; then
+        if kill -0 "$override" 2>/dev/null; then
+            printf '%s' "$override"
+            return 0
+        fi
+        return 1
+    fi
+
+    local pid=""
+    if command -v systemctl >/dev/null 2>&1; then
+        pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
+        [[ $pid == "0" ]] && pid=""
+    fi
+    if [[ -z $pid ]] && command -v pidof >/dev/null 2>&1; then
+        pid=$(pidof -s "$procname" 2>/dev/null || true)
+    fi
+    if [[ -z $pid ]] && command -v pgrep >/dev/null 2>&1; then
+        pid=$(pgrep -x "$procname" 2>/dev/null | head -n1 || true)
+    fi
+
+    [[ -n $pid ]] || return 1
+    printf '%s' "$pid"
+}
+
+# ------------------------------------------------------------- refresh wait
+
+file_mtime() {
+    local f=$1
+    [[ -e $f ]] || { echo 0; return; }
+    stat -c '%.9Y' "$f" 2>/dev/null || echo 0
+}
+
+# Polls every REFRESH_POLL_MS up to REFRESH_TIMEOUT_MS for $file's mtime to
+# move past $before. Never sleeps-and-hopes, never reports a stale file as
+# current.
+wait_for_refresh() {
+    local file=$1 before=$2
+    local waited=0
+    while (( waited < REFRESH_TIMEOUT_MS )); do
+        if [[ -e $file ]]; then
+            local mtime
+            mtime=$(file_mtime "$file")
+            if awk -v a="$mtime" -v b="$before" 'BEGIN { exit !(a > b) }'; then
+                return 0
+            fi
+        fi
+        sleep "$(awk -v ms="$REFRESH_POLL_MS" 'BEGIN { printf "%.3f", ms / 1000 }')"
+        waited=$((waited + REFRESH_POLL_MS))
+    done
+    return 1
+}
+
+# Signals $procname and waits for $file to refresh. Prints a one-line status
+# message and returns 0 only if a fresh snapshot is confirmed on disk.
+refresh_snapshot() {
+    local file=$1 override_pid=$2 unit=$3 procname=$4
+    local pid before
+
+    if ! pid=$(resolve_pid "$override_pid" "$unit" "$procname"); then
+        echo "not running — no snapshot to refresh"
+        return 1
+    fi
+
+    before=$(file_mtime "$file")
+
+    if ! kill -USR1 "$pid" 2>/dev/null; then
+        echo "running (pid $pid) but SIGUSR1 delivery failed — check permissions"
+        return 1
+    fi
+
+    if wait_for_refresh "$file" "$before"; then
+        echo "ok (pid $pid)"
+        return 0
+    else
+        echo "running (pid $pid) but $file did not refresh within ${REFRESH_TIMEOUT_MS}ms — showing what is known without it"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------------- parsing
+
+declare -A GATE_KV=()
+declare -A GATE_SESSION=()
+declare -a GATE_SESSION_ORDER=()
+
+declare -A GAME_KV=()
+declare -A GAME_PLAYER=()
+declare -a GAME_PLAYER_ORDER=()
+
+parse_gate_file() {
+    local file=$1 line key rest
+    GATE_KV=(); GATE_SESSION=(); GATE_SESSION_ORDER=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line ]] && continue
+        read -r key rest <<< "$line"
+        if [[ $key == session ]]; then
+            local sid label real reply idle
+            read -r sid label real reply idle <<< "$rest"
+            GATE_SESSION[$sid]="${label}|${real}|${reply}|${idle}"
+            GATE_SESSION_ORDER+=("$sid")
+        else
+            GATE_KV[$key]=$rest
+        fi
+    done < "$file"
+}
+
+parse_game_file() {
+    local file=$1 line key rest
+    GAME_KV=(); GAME_PLAYER=(); GAME_PLAYER_ORDER=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line ]] && continue
+        read -r key rest <<< "$line"
+        if [[ $key == player ]]; then
+            local sid label x y z yaw pitch haspos idle
+            read -r sid label x y z yaw pitch haspos idle <<< "$rest"
+            GAME_PLAYER[$sid]="${label}|${x}|${y}|${z}|${yaw}|${pitch}|${haspos}|${idle}"
+            GAME_PLAYER_ORDER+=("$sid")
+        else
+            GAME_KV[$key]=$rest
+        fi
+    done < "$file"
+}
+
+# --------------------------------------------------------------- formatting
+
+human_duration_s() {
+    local s=$1
+    [[ $s =~ ^[0-9]+$ ]] || { echo "n/a"; return; }
+    local d h m sec
+    d=$((s / 86400)); h=$(((s % 86400) / 3600)); m=$(((s % 3600) / 60)); sec=$((s % 60))
+    if (( d > 0 )); then
+        printf '%dd %02dh%02dm' "$d" "$h" "$m"
+    elif (( h > 0 )); then
+        printf '%dh%02dm%02ds' "$h" "$m" "$sec"
+    else
+        printf '%dm%02ds' "$m" "$sec"
+    fi
+}
+
+human_idle_ms() {
+    local ms=$1
+    [[ $ms =~ ^[0-9]+$ ]] || { echo "n/a"; return; }
+    local s=$((ms / 1000))
+    if (( s < 60 )); then
+        printf '%ss' "$s"
+    else
+        human_duration_s "$s"
+    fi
+}
+
+# ============================================================== the report
+
+echo "Blocksmith server status — $(date '+%Y-%m-%d %H:%M:%S %Z')"
+echo
+
+# ---- refresh both snapshots first, so every section below reads the same
+#      moment in time rather than racing later reads against later signals.
+gate_status_msg=$(refresh_snapshot "$BSGATE_STATUS_FILE" "$BSGATE_PID" "$BSGATE_UNIT" bsgate) && gate_ok=1 || gate_ok=0
+game_status_msg=$(refresh_snapshot "$BSGAME_STATUS_FILE" "$BSGAME_PID" "$BSGAME_UNIT" bsgame) && game_ok=1 || game_ok=0
+
+if [[ $gate_ok -eq 1 ]]; then
+    parse_gate_file "$BSGATE_STATUS_FILE"
+fi
+if [[ $game_ok -eq 1 ]]; then
+    parse_game_file "$BSGAME_STATUS_FILE"
+fi
+
+svc_active() {
+    command -v systemctl >/dev/null 2>&1 || { echo "unknown (no systemctl)"; return; }
+    # systemctl is-active always prints the unit's state (active/inactive/
+    # failed/unknown) to stdout, even when it exits non-zero for "not
+    # active" — so its own output IS the answer. A "||" fallback here would
+    # double-print (e.g. two "inactive" lines) rather than add anything.
+    local out
+    out=$(systemctl is-active "$1" 2>/dev/null)
+    [[ -n $out ]] && echo "$out" || echo "unknown"
+}
+
+echo "== Server =="
+if [[ -r $VERSION_FILE ]]; then
+    printf 'version         %s\n' "$(head -n1 "$VERSION_FILE")"
+else
+    printf 'version         unknown (no %s)\n' "$VERSION_FILE"
+fi
+printf 'bsgate service  %-10s  snapshot: %s\n' "$(svc_active bsgate)" "$gate_status_msg"
+printf 'bsgame service  %-10s  snapshot: %s\n' "$(svc_active bsgame)" "$game_status_msg"
+printf 'playit service  %-10s\n' "$(svc_active playit)"
+if [[ $gate_ok -eq 1 ]]; then
+    printf 'bsgate uptime   %s\n' "$(human_duration_s "${GATE_KV[uptime_s]:-}")"
+else
+    echo "bsgate uptime   unavailable (snapshot not refreshed)"
+fi
+if [[ $game_ok -eq 1 ]]; then
+    printf 'bsgame uptime   %s\n' "$(human_duration_s "${GAME_KV[uptime_s]:-}")"
+else
+    echo "bsgame uptime   unavailable (snapshot not refreshed)"
+fi
+echo
+
+echo "== Tunnel / playit =="
+if command -v playit >/dev/null 2>&1; then
+    playit_out=$(playit status 2>&1 || true)
+    if grep -q 'Secret configured: true' <<< "$playit_out"; then
+        echo "claimed:  yes (Secret configured: true)"
+    elif grep -q 'Secret configured: false' <<< "$playit_out"; then
+        echo "claimed:  no — run 'playit setup' to claim it (Secret configured: false)"
+    else
+        echo "claimed:  unknown — 'playit status' did not report a Secret configured line"
+    fi
+    echo "raw 'playit status' output:"
+    while IFS= read -r pl_line; do
+        printf '    %s\n' "$pl_line"
+    done <<< "$playit_out"
+else
+    echo "not installed — LAN only"
+fi
+if [[ $gate_ok -eq 1 ]]; then
+    printf 'gateway listen  %s\n' "${GATE_KV[listen]:-n/a}"
+    if [[ ${GATE_KV[proxy_protocol]:-} == v2 ]]; then
+        printf 'proxy protocol  v2 (trusted %s)\n' "${GATE_KV[trusted_proxy]:-n/a}"
+    else
+        printf 'proxy protocol  %s\n' "${GATE_KV[proxy_protocol]:-n/a}"
+    fi
+else
+    echo "gateway listen  unavailable (bsgate snapshot not refreshed)"
+fi
+echo
+
+echo "== Players =="
+declare -a all_sids=()
+declare -A sid_seen=()
+for sid in "${GATE_SESSION_ORDER[@]}"; do
+    [[ -n ${sid_seen[$sid]:-} ]] && continue
+    all_sids+=("$sid"); sid_seen[$sid]=1
+done
+for sid in "${GAME_PLAYER_ORDER[@]}"; do
+    [[ -n ${sid_seen[$sid]:-} ]] && continue
+    all_sids+=("$sid"); sid_seen[$sid]=1
+done
+
+if [[ $gate_ok -eq 0 && $game_ok -eq 0 ]]; then
+    echo "no data — neither bsgate nor bsgame refreshed its snapshot"
+elif [[ ${#all_sids[@]} -eq 0 ]]; then
+    echo "no players connected"
+else
+    printf '%-12s %-22s %-24s %-14s %s\n' "LABEL" "REAL ADDR" "POSITION (x y z)" "FACING (yaw/pitch)" "LAST HEARD"
+    for sid in "${all_sids[@]}"; do
+        local_label="?"; real_addr="n/a (no bsgate data)"; gate_idle=""
+        pos="n/a (no bsgame data)"; facing="n/a"; game_idle=""
+
+        if [[ -n ${GATE_SESSION[$sid]:-} ]]; then
+            IFS='|' read -r g_label g_real _ g_idle <<< "${GATE_SESSION[$sid]}"
+            local_label=$g_label
+            real_addr=$g_real
+            gate_idle=$g_idle
+        fi
+        if [[ -n ${GAME_PLAYER[$sid]:-} ]]; then
+            IFS='|' read -r p_label p_x p_y p_z p_yaw p_pitch p_haspos p_idle <<< "${GAME_PLAYER[$sid]}"
+            local_label=$p_label
+            game_idle=$p_idle
+            if [[ $p_haspos == 1 ]]; then
+                pos="$p_x $p_y $p_z"
+                facing="$p_yaw / $p_pitch"
+            else
+                pos="no position yet"
+                facing="n/a"
+            fi
+        fi
+
+        # Prefer the gate's idle reading (it is what actually receives the
+        # peer's packets); fall back to the game's if only that side knows
+        # this sid.
+        idle_src=${gate_idle:-$game_idle}
+        last_heard=$(human_idle_ms "$idle_src")
+
+        printf '%-12s %-22s %-24s %-14s %s\n' \
+            "$local_label" "$real_addr" "$pos" "$facing" "$last_heard"
+
+        if [[ -z $gate_idle && -n $game_idle ]]; then
+            printf '             (present in bsgame only — no bsgate session for this sid)\n'
+        elif [[ -n $gate_idle && -z $game_idle ]]; then
+            printf '             (present in bsgate only — bsgame has not reported this sid)\n'
+        fi
+    done
+fi
+echo "(\"last heard\" is time since the server received anything from that"
+echo " peer — it is not a ping/latency/RTT figure; the server never solicits"
+echo " a reply so it cannot measure one. The 3DS client measures and shows"
+echo " its own real ping.)"
+echo
+
+echo "== World activity =="
+if [[ $game_ok -eq 1 ]]; then
+    printf 'block diffs         %s / %s\n' "${GAME_KV[block_diffs]:-n/a}" "${GAME_KV[block_diffs_max]:-n/a}"
+    printf 'joins total         %s\n' "${GAME_KV[joins_total]:-n/a}"
+    printf 'edits accepted      %s\n' "${GAME_KV[edits_accepted]:-n/a}"
+    printf 'edits rejected      range=%s rate=%s full=%s\n' \
+        "${GAME_KV[edits_rejected_range]:-n/a}" "${GAME_KV[edits_rejected_rate]:-n/a}" "${GAME_KV[edits_rejected_full]:-n/a}"
+else
+    echo "unavailable (bsgame snapshot not refreshed)"
+fi
+echo
+
+echo "== Security / health =="
+if [[ $gate_ok -eq 1 ]]; then
+    printf 'allowlist peers     %s\n' "${GATE_KV[allowlist_peers]:-n/a}"
+    printf 'sessions            %s / %s\n' "${GATE_KV[sessions]:-n/a}" "${GATE_KV[sessions_max]:-n/a}"
+    printf 'handshakes in flight %s\n' "${GATE_KV[handshakes_in_flight]:-n/a}"
+    printf 'dropped total       %s (unauthenticated packets, since bsgate started)\n' "${GATE_KV[dropped_total]:-n/a}"
+else
+    echo "unavailable (bsgate snapshot not refreshed)"
+fi

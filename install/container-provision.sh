@@ -239,9 +239,10 @@ say "$(grep -oE '(PASS|FAIL) [0-9]+ checks.*' /tmp/bsgate-test.log | tail -1)"
 make -C "${SRC_DIR}/gateway" install-check >/dev/null \
     || die "the built binary is missing expected hardening (PIE / RELRO / NX)"
 
-install -D -m 0755 -o root -g root "${SRC_DIR}/gateway/bsgate"    /opt/bsgate/bsgate
-install -D -m 0755 -o root -g root "${SRC_DIR}/tools/bsgate-keys" /usr/local/sbin/bsgate-keys
-install -D -m 0644 -o root -g root "${SRC_DIR}/README.md"         /opt/bsgate/README.md
+install -D -m 0755 -o root -g root "${SRC_DIR}/gateway/bsgate"      /opt/bsgate/bsgate
+install -D -m 0755 -o root -g root "${SRC_DIR}/tools/bsgate-keys"   /usr/local/sbin/bsgate-keys
+install -D -m 0755 -o root -g root "${SRC_DIR}/tools/bsgate-status" /usr/local/sbin/bsgate-status
+install -D -m 0644 -o root -g root "${SRC_DIR}/README.md"           /opt/bsgate/README.md
 
 say "building bsgame"
 [[ -d ${SRC_DIR}/game ]] || die "no source at ${SRC_DIR}/game"

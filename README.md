@@ -252,6 +252,48 @@ silently lock everyone out or leave a revoked key working.
 
 ---
 
+## Checking on the server: `bsgate-status`
+
+```bash
+pct enter <ctid>
+bsgate-status
+```
+
+It takes no arguments.
+
+This is a command, not a web page, and that was a deliberate choice, not an
+oversight — a web UI was considered and dropped. The whole security design
+of this box is zero inbound ports (see above), and a web UI is a listener:
+a second parser, a session/auth story, and a reason for something outside
+the container to talk to it. Running a command over `pct enter` adds none
+of that — it stays inside the same "administer from the Proxmox host" model
+as everything else here.
+
+**How it works.** `bsgate-status` sends `SIGUSR1` to `bsgate` and `bsgame`.
+Each daemon writes a plain-text snapshot to `/var/lib/bsgate/status.txt` and
+`/var/lib/bsgame/status.txt` (mode 0640, written to a temp file and
+`rename()`d so a reader never catches a partial file), and the tool waits
+for both to refresh before joining them on the session id and printing a
+report. A signal was chosen over a query socket on purpose: a signal can
+only be sent by root or the process's own uid and adds no attack surface,
+where a socket would be another listener with another parser.
+
+**What it shows:** version and service state for `bsgate`, `bsgame`, and
+`playit`; the playit tunnel and whether the agent is claimed; connected
+players with their real IP, position, and how long since they were last
+heard from; stored block diffs and edit counters (accepted, plus rejections
+split into out-of-range, rate-limited, and store-full); allowlist size,
+sessions used/max, handshakes in flight, and total dropped packets.
+
+**What it does not show, and why.** No ping, no latency, no lag figure —
+the server has no way to measure any of that, because it never solicits a
+reply from a client, so there is no round trip to time. The "last heard"
+column is silence, not latency: a player standing still is silent and
+perfectly healthy. The real ping number is measured and shown by the 3DS
+client itself.
+
+---
+
 ## Updating
 
 Once installed, updates are pulled and applied from inside the container —
@@ -437,6 +479,9 @@ through v1.0.5); if you are running an older tag, don't.
   test suites.
 - `game/diffstore.c`'s full-table and torn-record recovery paths have no
   test coverage.
+- `bsgate-status` has been exercised against a live local daemon pair and
+  against hand-written snapshot files, but **not** on the real Proxmox
+  container and **not** with a real 3DS connected.
 
 If you're standing this up for the first time, the honest summary is: the
 container, the build, the hardening and the two daemons are proven on real

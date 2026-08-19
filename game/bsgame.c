@@ -74,10 +74,32 @@ enum bs_game_msg {
 static volatile sig_atomic_t g_quit = 0;
 static void on_sigterm(int s) { (void)s; g_quit = 1; }
 
+/* Set by SIGUSR1, consumed by the main loop, which calls write_status() —
+ * see that function's header comment for why a signal-triggered snapshot
+ * file is used instead of a query socket. Mirrors gateway/bsgate.c's own
+ * g_status/on_sigusr1. */
+static volatile sig_atomic_t g_status = 0;
+static void on_sigusr1(int s) { (void)s; g_status = 1; }
+
 struct bs_game {
     int  unix_fd;
     char game_sock_path[108];
     char gate_sock_path[108];
+
+    /* Where write_status() drops its snapshot, written only on SIGUSR1 — see
+     * write_status(). Not a unix socket path, so unlike the two above it is
+     * not bound by sun_path's 108-byte cap. */
+    char     status_path[512];
+    uint64_t started_ms;
+
+    /* Lifetime counters, for the status snapshot only — reading them here
+     * changes no behaviour. Incremented at the existing accept/reject sites
+     * in handle_block_edit() and handle_join(). */
+    uint64_t joins_total;
+    uint64_t edits_accepted;
+    uint64_t edits_rejected_range;
+    uint64_t edits_rejected_rate;
+    uint64_t edits_rejected_full;
 
     BsPlayers   players;
     BsDiffStore diffs;
@@ -181,13 +203,26 @@ static void broadcast_block_edit(struct bs_game *g, uint32_t from_sid,
 /* Ships the whole current diff set to one player, right after JOIN, in
  * batches of BS_SYNC_MAX_ENTRIES so each packet stays inside BS_MAX_PAYLOAD
  * (see bs_proto.h). Ordering does not matter: every entry is an independent
- * (x, y, z, block) triple, not a delta against a previous one. */
+ * (x, y, z, block) triple, not a delta against a previous one.
+ *
+ * This must always send at least one packet, even when `total == 0`. The
+ * wire protocol has no separate "you're in" message — the 3DS client
+ * (source/net/bsnet_transport.c, state CSTATE_AWAIT_WELCOME) only leaves its
+ * connecting state on receipt of its first authenticated packet from the
+ * server, and this WORLD_SYNC (here, an empty one: BS_APP_WORLD_SYNC with
+ * count 0) is that packet. A fresh, unedited world has zero diffs, so a
+ * plain `while (sent < total)` sends nothing at all and the client times out
+ * waiting for admission that already happened — proven end to end: an
+ * allowlisted client was accepted by both bsgate and bsgame and still never
+ * left "Handshake completed, but the server never admitted the session".
+ * Do NOT turn this back into a bare `while` loop — that reintroduces the
+ * exact bug this comment describes. */
 static void send_world_sync(struct bs_game *g, uint32_t sid)
 {
     uint32_t total = diffstoreCount(&g->diffs);
     uint32_t sent  = 0;
 
-    while (sent < total) {
+    do {
         uint32_t batch = total - sent;
         if (batch > BS_SYNC_MAX_ENTRIES) batch = BS_SYNC_MAX_ENTRIES;
 
@@ -207,7 +242,7 @@ static void send_world_sync(struct bs_game *g, uint32_t sid)
 
         send_data(g, sid, payload, BS_WORLD_SYNC_BYTES(batch));
         sent += batch;
-    }
+    } while (sent < total);
 }
 
 static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, size_t len,
@@ -245,6 +280,7 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
     }
 
     logf_("game: %s joined (sid %08x)", p->label, sid);
+    g->joins_total++;
     send_world_sync(g, sid);
 }
 
@@ -275,17 +311,21 @@ static void handle_block_edit(struct bs_game *g, BsPlayer *p, const uint8_t *msg
     uint8_t block = msg[13];
 
     if (!bsEditValid(x, y, z, block)) {
+        g->edits_rejected_range++;
         logf_("game: %s: rejected edit (%d,%d,%d)=%u, out of range", p->label, x, y, z, block);
         return;
     }
     if (!playerEditAllow(p, now)) {
+        g->edits_rejected_rate++;
         logf_("game: %s: rejected edit, rate limit", p->label);
         return;
     }
     if (!diffstoreApply(&g->diffs, x, y, z, block)) {
+        g->edits_rejected_full++;
         logf_("game: %s: rejected edit, diff table is full", p->label);
         return;
     }
+    g->edits_accepted++;
 
     broadcast_block_edit(g, p->sid, x, y, z, block);
 }
@@ -388,6 +428,79 @@ static void tick(struct bs_game *g)
     }
 }
 
+/* --------------------------------------------------------------- status */
+
+/* Writes a plain-text snapshot of what this process currently knows, for
+ * tools/bsgate-status to read back. Triggered by SIGUSR1 only — see
+ * gateway/bsgate.c's write_status() for the full reasoning: a socket here
+ * would be a second thing listening with a second parser on a box whose
+ * entire design is zero inbound ports, while a signal costs no attack
+ * surface (only root and this process's own uid may ever send one) and the
+ * reader can never talk back through a plain file.
+ *
+ * Written to a temp path and renamed onto status_path, so a reader never
+ * observes a half-written file, and mode 0640 so the group can read it but
+ * the world cannot. */
+static void write_status(struct bs_game *g, uint64_t t)
+{
+    char tmp[520];
+    if (!path_set(tmp, sizeof tmp, "%s.tmp", g->status_path)) return;
+
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL) {
+        logf_("game: status: %s: %s", tmp, strerror(errno));
+        return;
+    }
+    fchmod(fileno(f), 0640);
+
+    unsigned players = 0;
+    for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
+        if (g->players.p[i].used) players++;
+    }
+
+    fprintf(f, "process bsgame\n");
+    fprintf(f, "uptime_s %llu\n", (unsigned long long)((t - g->started_ms) / 1000u));
+    fprintf(f, "players %u\n", players);
+    fprintf(f, "players_max %u\n", BS_GAME_MAX_PLAYERS);
+    fprintf(f, "tick_ms %u\n", BS_GAME_TICK_MS);
+    fprintf(f, "block_diffs %u\n", diffstoreCount(&g->diffs));
+    fprintf(f, "block_diffs_max %u\n", BS_DIFF_MAX);
+    fprintf(f, "joins_total %llu\n", (unsigned long long)g->joins_total);
+    fprintf(f, "edits_accepted %llu\n", (unsigned long long)g->edits_accepted);
+    fprintf(f, "edits_rejected_range %llu\n", (unsigned long long)g->edits_rejected_range);
+    fprintf(f, "edits_rejected_rate %llu\n", (unsigned long long)g->edits_rejected_rate);
+    fprintf(f, "edits_rejected_full %llu\n", (unsigned long long)g->edits_rejected_full);
+
+    for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
+        const BsPlayer *p = &g->players.p[i];
+        if (!p->used) continue;
+
+        /* label is BS_GAME_LABEL_MAX-sized and arrives verbatim from
+         * bsgate's allowlist (see handle_join()), which never lets a space
+         * into it — safe to place unquoted in this space-separated line. */
+        double x = 0.0, y = 0.0, z = 0.0, yaw = 0.0, pitch = 0.0;
+        if (p->has_pos) {
+            x = (double)p->x; y = (double)p->y; z = (double)p->z;
+            yaw = (double)p->yaw; pitch = (double)p->pitch;
+        }
+
+        /* idle_ms is time since the last message WE heard FROM this player
+         * — it is NOT a round-trip time. This process never solicits a
+         * reply, so it has no RTT to report; tools/bsgate-status must label
+         * this column honestly and must not present it as latency. */
+        fprintf(f, "player %08x %s %.1f %.1f %.1f %.1f %.1f %d %llu\n",
+                p->sid, p->label, x, y, z, yaw, pitch,
+                p->has_pos ? 1 : 0,
+                (unsigned long long)(t - p->last_seen_ms));
+    }
+
+    fclose(f);
+    if (rename(tmp, g->status_path) != 0) {
+        logf_("game: status: rename: %s", strerror(errno));
+        unlink(tmp);
+    }
+}
+
 /* ------------------------------------------------------------------ setup */
 
 static bool unix_bind(struct bs_game *g, const char *path)
@@ -428,7 +541,7 @@ static void usage(void)
         "usage: bsgame --game-socket PATH --gate-socket PATH --state-dir DIR\n"
         "  --game-socket PATH   unix socket this process binds (gate sends JOIN/DATA/LEAVE here)\n"
         "  --gate-socket PATH   unix socket bsgate binds (this process sends DATA/KICK there)\n"
-        "  --state-dir DIR      holds block_diffs.bin\n");
+        "  --state-dir DIR      holds block_diffs.bin and, on SIGUSR1, status.txt\n");
 }
 
 int main(int argc, char **argv)
@@ -449,11 +562,17 @@ int main(int argc, char **argv)
     static struct bs_game g;
     memset(&g, 0, sizeof g);
     g.unix_fd = -1;
+    g.started_ms = now_ms();
 
     if (!path_set(g.game_sock_path, sizeof g.game_sock_path, "%s", game_sock)
         || !path_set(g.gate_sock_path, sizeof g.gate_sock_path, "%s", gate_sock)) {
         logf_("game: a --*-socket path is too long (unix sockets cap at %zu bytes)",
               sizeof g.game_sock_path - 1);
+        return 1;
+    }
+    if (!path_set(g.status_path, sizeof g.status_path, "%s/status.txt", state_dir)) {
+        logf_("game: --state-dir is too long for the status file path (max %zu)",
+              sizeof g.status_path - 1);
         return 1;
     }
 
@@ -476,6 +595,8 @@ int main(int argc, char **argv)
     sa.sa_handler = on_sigterm;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
+    sa.sa_handler = on_sigusr1;
+    sigaction(SIGUSR1, &sa, NULL);
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
 
@@ -498,6 +619,11 @@ int main(int argc, char **argv)
                 if (poll(&probe, 1, 0) <= 0) break;
                 handle_gate_msg(&g);
             }
+        }
+
+        if (g_status) {
+            g_status = 0;
+            write_status(&g, now_ms());
         }
 
         tick(&g);

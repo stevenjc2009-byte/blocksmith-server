@@ -624,6 +624,90 @@ static void test_happy_path(void)
     }
 }
 
+/* The client's only way to measure a round trip is to send an empty DATA and
+ * time the answer, and it will not send the next keepalive until the previous
+ * one comes back. Before the gate answered these, a lone player was silently
+ * evicted after BS_SESSION_IDLE_MS with the ping still reading -1 — so this
+ * checks both halves: something comes back, and it is empty rather than being
+ * pushed at the game logic. */
+static void test_keepalive_echo(void)
+{
+    puts("end-to-end: empty DATA is answered by the gate itself");
+    drain();
+
+    uint8_t pkt[BS_MAX_PACKET];
+    size_t len;
+    client_build_data(&g_alice, "", pkt, &len);
+    udp_send(pkt, len);
+
+    uint8_t rx[2048];
+    ssize_t n = udp_recv(rx, sizeof rx, 1000);
+    check(n > 0 && rx[0] == BS_PKT_DATA, "empty DATA gets a DATA back");
+
+    if (n > 0) {
+        uint64_t mid = bs_get_u64(rx + BS_HDR_BYTES + BS_SID_BYTES);
+        size_t ctlen = (size_t)n - (BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES);
+        uint8_t plain[1024];
+        int ok = hydro_secretbox_decrypt(plain,
+                    rx + BS_HDR_BYTES + BS_SID_BYTES + BS_MSGID_BYTES,
+                    ctlen, mid, BS_CTX_S2C, g_alice.keys.rx);
+        check(ok == 0, "the answer authenticates");
+        check(ctlen == hydro_secretbox_HEADERBYTES, "the answer carries no payload");
+    } else {
+        check(false, "the answer authenticates");
+        check(false, "the answer carries no payload");
+    }
+
+    /* An empty probe is gate business. Handing it to the game logic would make
+     * every idle console look like traffic it has to parse. */
+    uint8_t m[2048];
+    check(game_recv(m, sizeof m, 200) < 0, "game logic is not bothered with it");
+}
+
+/* SIGUSR1 makes the daemon drop a snapshot for bsgate-status to read. The file
+ * is removed first, so a stale snapshot left by an earlier run cannot make
+ * this pass — the same trap that has bitten this project before. */
+static void test_status_snapshot(void)
+{
+    puts("end-to-end: SIGUSR1 status snapshot");
+
+    char path[192];
+    snprintf(path, sizeof path, "%s/status.txt", g_dir);
+    unlink(path);
+    check(access(path, F_OK) != 0, "no stale snapshot before the signal");
+
+    kill(g_daemon, SIGUSR1);
+
+    FILE *f = NULL;
+    for (int i = 0; i < 40 && f == NULL; i++) {   /* up to 2 s */
+        f = fopen(path, "r");
+        if (f == NULL) msleep(50);
+    }
+    check(f != NULL, "snapshot appears after SIGUSR1");
+    if (f == NULL) return;
+
+    struct stat st;
+    check(stat(path, &st) == 0 && (st.st_mode & 07777) == 0640,
+          "snapshot is mode 0640");
+
+    char line[512];
+    bool header = false, sessions_one = false, alice = false, joins = false;
+    while (fgets(line, sizeof line, f)) {
+        unsigned u;
+        char label[64];
+        if (!strncmp(line, "process bsgate", 14))            header = true;
+        else if (sscanf(line, "sessions %u", &u) == 1)       sessions_one = (u == 1);
+        else if (sscanf(line, "joins_total %u", &u) == 1)    joins = (u >= 1);
+        else if (sscanf(line, "session %*x %63s", label) == 1) alice = !strcmp(label, "alice");
+    }
+    fclose(f);
+
+    check(header,       "snapshot identifies the process");
+    check(joins,        "snapshot counts the join");
+    check(sessions_one, "snapshot reports one live session");
+    check(alice,        "snapshot names the connected peer");
+}
+
 static void test_replay_rejected(void)
 {
     puts("end-to-end: replay");
@@ -1093,6 +1177,8 @@ int main(void)
     test_bad_version_silent();
     test_bad_cookie_rejected();
     test_happy_path();
+    test_keepalive_echo();
+    test_status_snapshot();
     test_replay_rejected();
     test_tampered_payload();
     test_wrong_psk_rejected();

@@ -139,6 +139,12 @@ struct bs_gate {
     struct bs_allowlist allow;
     char                allow_path[512];
 
+    /* Where write_status() drops its snapshot. Written only on SIGUSR1, so
+     * this costs nothing while nobody is looking — see write_status(). */
+    char                status_path[512];
+    char                listen_desc[80];   /* --listen host, up to 63, plus ":65535" */
+    char                trusted_desc[32];
+
     struct bs_ratelimit rl;
 
     struct bs_session session[BS_MAX_SESSIONS];
@@ -151,13 +157,21 @@ struct bs_gate {
      * flood must not be able to write the journal full. */
     uint64_t drop_count;
     uint64_t drop_reported_ms;
+
+    /* Lifetime totals, for the status snapshot. drop_count above is reset
+     * every summary interval, so it cannot answer "how many since boot". */
+    uint64_t started_ms;
+    uint64_t drop_total;
+    uint64_t join_total;
 };
 
 static volatile sig_atomic_t g_reload = 0;
 static volatile sig_atomic_t g_quit   = 0;
+static volatile sig_atomic_t g_status = 0;
 
 static void on_sighup(int s)  { (void)s; g_reload = 1; }
 static void on_sigterm(int s) { (void)s; g_quit = 1; }
+static void on_sigusr1(int s) { (void)s; g_status = 1; }
 
 /* ------------------------------------------------------------------- util */
 
@@ -375,6 +389,7 @@ static void drop(struct bs_gate *g, const char *why)
 {
     (void)why;
     g->drop_count++;
+    g->drop_total++;
 }
 
 /* ------------------------------------------------------- packet handlers */
@@ -547,6 +562,8 @@ static void handle_kx3(struct bs_gate *g, const struct bs_peer *peer,
     hydro_memzero(&kp, sizeof kp);
     pending_free(p);
 
+    g->join_total++;
+
     char a[32]; addr_str(&peer->real, a, sizeof a);
     logf_("gate: %s joined (sid %08x) from %s", s->label, s->sid, a);
     game_notify_join(g, s);
@@ -603,6 +620,19 @@ static void handle_data(struct bs_gate *g, const struct bs_peer *peer,
         memcpy(msg + 5, plain, plain_len);
         game_send(g, msg, 5 + plain_len);
         hydro_memzero(msg, sizeof msg);
+    } else {
+        /* A zero-length DATA is the client's round-trip probe: it carries no
+         * application payload, so there is nothing to hand the game server,
+         * and the game server would have nothing to say about it anyway. The
+         * gate answers it itself, in kind.
+         *
+         * This is not politeness. The client only starts a new keepalive once
+         * the previous probe has been answered, so if nothing ever replies the
+         * probe stays outstanding, the client stops sending, and after
+         * BS_SESSION_IDLE_MS the gate drops a player who was sitting there
+         * perfectly happily. Measured before this existed: a lone player was
+         * evicted at 30 s with netPingMs() still reporting -1. */
+        send_encrypted(g, s, BS_PKT_DATA, plain, 0);
     }
 
     hydro_memzero(plain, sizeof plain);
@@ -699,6 +729,89 @@ static void handle_game(struct bs_gate *g)
         break;
     default:
         break;
+    }
+}
+
+/* ----------------------------------------------------------- status dump */
+
+/* The journal masks peer addresses to a /16 (addr_str), because a friend's
+ * home IP sitting in a log that gets pasted into a chat window is a leak
+ * nobody asked for. The status snapshot is different: it is written only when
+ * asked for, read only by root inside the container, and "who is connected,
+ * from where" is the whole reason it exists. So it prints the address in
+ * full — and nothing else does. */
+static void addr_str_full(const struct sockaddr_in *a, char *out, size_t n)
+{
+    char ip[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip) == NULL) {
+        snprintf(out, n, "?");
+        return;
+    }
+    snprintf(out, n, "%s:%u", ip, (unsigned)ntohs(a->sin_port));
+}
+
+/* Writes a plain-text snapshot of what this process currently knows, for
+ * tools/bsgate-status to read back. Triggered by SIGUSR1 only.
+ *
+ * Why a file and a signal, rather than a query socket: a socket is a second
+ * thing listening, with a second parser, reachable by anything that can find
+ * it — on a box whose entire design is "zero inbound, one parser". A signal
+ * costs no attack surface at all (only root and the process's own uid may
+ * send one) and the snapshot is a file the reader cannot talk back through.
+ *
+ * Written to a temp path and renamed, so a reader never sees a half-written
+ * file, and mode 0640 so the group can read it but not the world. */
+static void write_status(struct bs_gate *g, uint64_t t)
+{
+    char tmp[520];
+    if (!path_set(tmp, sizeof tmp, "%s.tmp", g->status_path)) return;
+
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL) {
+        logf_("gate: status: %s: %s", tmp, strerror(errno));
+        return;
+    }
+    fchmod(fileno(f), 0640);
+
+    fprintf(f, "process bsgate\n");
+    fprintf(f, "uptime_s %llu\n", (unsigned long long)((t - g->started_ms) / 1000u));
+    fprintf(f, "listen %s\n", g->listen_desc);
+    fprintf(f, "proxy_protocol %s\n", g->proxy_proto ? "v2" : "off");
+    if (g->proxy_proto) fprintf(f, "trusted_proxy %s\n", g->trusted_desc);
+    fprintf(f, "allowlist_peers %zu\n", g->allow.count);
+    fprintf(f, "sessions_max %u\n", BS_MAX_SESSIONS);
+    fprintf(f, "joins_total %llu\n", (unsigned long long)g->join_total);
+    fprintf(f, "dropped_total %llu\n", (unsigned long long)g->drop_total);
+
+    unsigned pending = 0;
+    for (unsigned i = 0; i < BS_MAX_PENDING; i++) if (g->pending[i].used) pending++;
+    fprintf(f, "handshakes_in_flight %u\n", pending);
+
+    unsigned live = 0;
+    for (unsigned i = 0; i < BS_MAX_SESSIONS; i++) if (g->session[i].used) live++;
+    fprintf(f, "sessions %u\n", live);
+
+    for (unsigned i = 0; i < BS_MAX_SESSIONS; i++) {
+        const struct bs_session *s = &g->session[i];
+        if (!s->used) continue;
+
+        char real[64], reply[64];
+        addr_str_full(&s->peer.real,  real,  sizeof real);
+        addr_str_full(&s->peer.reply, reply, sizeof reply);
+
+        /* idle_ms is how long since anything was heard FROM this player. It
+         * is not a round-trip time and must never be presented as one: the
+         * server never solicits a reply, so it has no RTT to report. See
+         * tools/bsgate-status, which labels this column accordingly. */
+        fprintf(f, "session %08x %s %s %s %llu\n",
+                s->sid, s->label, real, reply,
+                (unsigned long long)(t - s->last_seen_ms));
+    }
+
+    fclose(f);
+    if (rename(tmp, g->status_path) != 0) {
+        logf_("gate: status: rename: %s", strerror(errno));
+        unlink(tmp);
     }
 }
 
@@ -911,7 +1024,8 @@ int main(int argc, char **argv)
                    : path_set(gate_path, sizeof gate_path, "%s/gate.sock", state_dir))
      && (game_sock ? path_set(game_path, sizeof game_path, "%s", game_sock)
                    : path_set(game_path, sizeof game_path, "%s/game.sock", state_dir))
-     && path_set(g.game_sock_path, sizeof g.game_sock_path, "%s", game_path);
+     && path_set(g.game_sock_path, sizeof g.game_sock_path, "%s", game_path)
+     && path_set(g.status_path, sizeof g.status_path, "%s/status.txt", state_dir);
 
     if (!paths_ok) {
         logf_("gate: --state-dir or a --*-socket path is too long "
@@ -988,12 +1102,20 @@ int main(int argc, char **argv)
     hydro_random_buf(g.cookie_key[1], sizeof g.cookie_key[1]);
     g.cookie_rotated_ms = t;
     g.drop_reported_ms  = t;
+    g.started_ms        = t;
+
+    /* Copied rather than kept as pointers into argv: the status snapshot is
+     * written from the poll loop long after argument parsing, and argv is not
+     * something to still be holding by then. */
+    snprintf(g.listen_desc,  sizeof g.listen_desc,  "%s:%ld", ip, port);
+    snprintf(g.trusted_desc, sizeof g.trusted_desc, "%s", trusted_cidr);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_sighup;  sigaction(SIGHUP,  &sa, NULL);
     sa.sa_handler = on_sigterm; sigaction(SIGTERM, &sa, NULL);
                                 sigaction(SIGINT,  &sa, NULL);
+    sa.sa_handler = on_sigusr1; sigaction(SIGUSR1, &sa, NULL);
     sa.sa_handler = SIG_IGN;    sigaction(SIGPIPE, &sa, NULL);
 
     logf_("gate: ready");
@@ -1008,6 +1130,11 @@ int main(int argc, char **argv)
         if (r < 0 && errno != EINTR) {
             logf_("gate: poll: %s", strerror(errno));
             break;
+        }
+
+        if (g_status) {
+            g_status = 0;
+            write_status(&g, now_ms());
         }
 
         if (g_reload) {

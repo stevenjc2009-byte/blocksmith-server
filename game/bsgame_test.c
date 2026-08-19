@@ -224,25 +224,29 @@ static bool wait_ready(unsigned timeout_ms)
 
 static void test_join_and_world_sync_empty(void)
 {
-    puts("end-to-end: join with an empty world");
+    puts("end-to-end: join with an empty world still gets a WORLD_SYNC");
     drain();
 
     send_join(0xA11CE001u, "alice");
 
-    /* An empty diff set is zero WORLD_SYNC batches, not one empty one — so
-     * the honest signal that JOIN was handled is simply no packet arriving,
-     * proven below once alice's own traffic starts flowing. Confirmed here
-     * via a subsequent message that only a live, listening daemon answers. */
-    uint32_t x = 100, y = 50, z = 100;
-    send_block_edit(0xA11CE001u, (int32_t)x, (int32_t)y, (int32_t)z, 3);
-
-    uint8_t out[64];
+    /* The wire protocol has no separate "you're in" message — the 3DS
+     * client's CSTATE_AWAIT_WELCOME (source/net/bsnet_transport.c) leaves
+     * "connecting" only on its first authenticated packet from the server.
+     * On a fresh, unedited world that packet has to be an EMPTY WORLD_SYNC
+     * (count 0), because nothing else is ever sent right after JOIN. This
+     * is the regression test for the bug where `send_world_sync()` sent
+     * nothing at all when the diff store was empty, leaving a lone player
+     * on a fresh world stuck at "Handshake completed, but the server never
+     * admitted the session" — see bsgame.c's send_world_sync() comment. */
+    uint8_t out[16];
     ssize_t n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
-    /* Nobody else has joined yet, so alice's own accepted edit is broadcast
-     * to nobody — the absence of a stray packet here is itself evidence
-     * the daemon is up and processed JOIN + the edit without crashing. */
-    check(n < 0, "no broadcast target yet, and the daemon is still alive");
-    check(kill(g_daemon, 0) == 0, "daemon survives join + first edit");
+    check(n == (ssize_t)BS_WORLD_SYNC_BYTES(0) && out[0] == BS_APP_WORLD_SYNC,
+          "a fresh, zero-diff world still sends one WORLD_SYNC packet");
+    if (n == (ssize_t)BS_WORLD_SYNC_BYTES(0)) {
+        check(bs_get_u16(out + 1) == 0, "the empty sync declares count 0");
+    }
+
+    check(kill(g_daemon, 0) == 0, "daemon survives join with an empty world");
 }
 
 static void test_edit_broadcast_to_other_player_only(void)
@@ -494,6 +498,59 @@ static void test_restart_persists_diffs(void)
     check(saw_edit, "the specific (5,10,-5) edit survived the restart");
 }
 
+/* Runs right after test_restart_persists_diffs, where the daemon has just
+ * restarted and "newcomer" (0xF00D0006) is the only connected player — a
+ * known, simple state to assert `players` and the player line against,
+ * rather than tracking every earlier test's joins/leaves/kicks. */
+static void test_status_snapshot(void)
+{
+    puts("SIGUSR1 status snapshot");
+
+    char status_path[192];
+    snprintf(status_path, sizeof status_path, "%s/status.txt", g_dir);
+    unlink(status_path);   /* a stale file from a previous run must not pass this test */
+
+    if (kill(g_daemon, SIGUSR1) != 0) die("kill SIGUSR1");
+
+    /* write_status() only runs on the daemon's next poll() wakeup, which is
+     * at most one tick away, but give it real headroom rather than exactly
+     * the tick period. */
+    bool appeared = false;
+    struct stat st;
+    for (unsigned waited = 0; waited < 2000; waited += 50) {
+        if (stat(status_path, &st) == 0) { appeared = true; break; }
+        msleep(50);
+    }
+    check(appeared, "status.txt appears after SIGUSR1");
+    if (!appeared) return;
+
+    check((st.st_mode & 0777) == 0640, "status.txt is mode 0640");
+
+    FILE *f = fopen(status_path, "r");
+    check(f != NULL, "status.txt opens");
+    if (f == NULL) return;
+
+    char line[256];
+    check(fgets(line, sizeof line, f) != NULL && !strcmp(line, "process bsgame\n"),
+          "first line identifies the process");
+
+    bool saw_players_line = false, players_match = false, saw_newcomer_line = false;
+    while (fgets(line, sizeof line, f) != NULL) {
+        unsigned n;
+        if (sscanf(line, "players %u", &n) == 1) {
+            saw_players_line = true;
+            players_match = (n == 1);
+        }
+        if (!strncmp(line, "player ", 7) && strstr(line, "newcomer") != NULL) {
+            saw_newcomer_line = true;
+        }
+    }
+    fclose(f);
+
+    check(saw_players_line && players_match, "players count matches the one connected player");
+    check(saw_newcomer_line, "a player line names the connected player's label");
+}
+
 static void test_disk_format(void)
 {
     puts("on-disk format");
@@ -566,6 +623,7 @@ int main(void)
     test_malformed_payload_kicks();
     test_malformed_block_edit_length_kicks();
     test_restart_persists_diffs();
+    test_status_snapshot();
     test_disk_format();
 
     stop_daemon();
