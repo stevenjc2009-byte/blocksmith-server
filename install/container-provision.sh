@@ -122,8 +122,11 @@ if [[ $SKIP_PLAYIT -eq 1 ]]; then
     warn "bsgate is bound to loopback only, so the box is reachable from the LAN only."
 else
     say "adding the playit.gg apt repo"
+    # --yes: this script is meant to be re-runnable (an interrupted claim is the
+    # common case), and without it gpg refuses to overwrite a keyring left by an
+    # earlier run — it prompts on the tty, which under `pct exec` reads as a hang.
     curl -fsSL https://packages.playit.gg/keys/playit.gpg \
-        | gpg --dearmor -o /usr/share/keyrings/playit.gpg
+        | gpg --dearmor --yes -o /usr/share/keyrings/playit.gpg
     chmod 0644 /usr/share/keyrings/playit.gpg
     cat > /etc/apt/sources.list.d/playit.list <<'EOF'
 deb [signed-by=/usr/share/keyrings/playit.gpg] https://packages.playit.gg/data/debian ./

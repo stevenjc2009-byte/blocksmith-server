@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "../proto/bs_proto.h"
+#include "players.h"   /* BS_EDIT_BURST / BS_EDIT_REFILL_MS, for the rate-limit ceiling */
 
 enum bs_game_msg { BS_GAME_JOIN = 1, BS_GAME_DATA = 2, BS_GAME_LEAVE = 3, BS_GAME_KICK = 4 };
 
@@ -57,6 +58,13 @@ static void msleep(unsigned ms)
 {
     struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
+}
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
 /* --------------------------------------------------------------- plumbing */
@@ -304,8 +312,10 @@ static void test_edit_rate_limited(void)
     puts("end-to-end: an edit flood past the burst is rate-limited");
     drain();
 
-    /* BS_EDIT_BURST is 40; send far more, as fast as this process can, and
-     * count how many the other player actually sees broadcast. */
+    /* Send far more than the burst, as fast as this process can, and count how
+     * many the other player actually sees broadcast. */
+    const uint64_t t0 = now_ms();
+
     for (int i = 0; i < 200; i++) {
         send_block_edit(0xA11CE001u, 300 + i, 10, 300, 3);
     }
@@ -317,8 +327,25 @@ static void test_edit_rate_limited(void)
         if (n < 0) break;
         seen++;
     }
-    check(seen > 0 && seen <= 40, "far fewer edits arrive than were sent, capped near the burst");
-    printf("        sent 200, broadcast %u\n", seen);
+
+    /* The ceiling is not a bare BS_EDIT_BURST. The bucket refills one token
+     * every BS_EDIT_REFILL_MS while the flood is still in flight, so a host
+     * that needs longer than one refill interval to push and drain 200 packets
+     * legitimately sees a few more than the burst. Hardcoding 40 encoded the
+     * speed of one particular machine and failed the install on a slower one
+     * that was behaving correctly (it saw 41).
+     *
+     * The 150 ms poll timeout that ends the drain loop above is subtracted:
+     * nothing was being sent during it, so it must not buy the server extra
+     * tokens. The +1 covers the partial interval at either end. An unlimited
+     * server still broadcasts ~200 here, so this stays able to go red. */
+    const uint64_t elapsed = now_ms() - t0;
+    const uint64_t flood   = (elapsed > 150) ? elapsed - 150 : 0;
+    const unsigned ceiling = BS_EDIT_BURST + (unsigned)(flood / BS_EDIT_REFILL_MS) + 1;
+
+    check(seen > 0 && seen <= ceiling, "far fewer edits arrive than were sent, capped near the burst");
+    printf("        sent 200, broadcast %u (ceiling %u for a %llu ms flood)\n",
+           seen, ceiling, (unsigned long long)flood);
 }
 
 static void test_leave_frees_slot_and_stops_broadcasts(void)
