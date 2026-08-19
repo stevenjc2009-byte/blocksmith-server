@@ -273,6 +273,23 @@ install -D -m 0755 -o root -g root "${SRC_DIR}/game/bsgame" /opt/bsgate/bsgame
 install -D -m 0644 -o root -g root "${SRC_DIR}/VERSION"        /opt/bsgate/VERSION
 install -D -m 0755 -o root -g root "${SRC_DIR}/tools/bs-update" /usr/local/bin/update
 
+# `pct enter <ctid>` gives an interactive NON-login shell, which never reads
+# /etc/profile — so PATH is the bare init default and /usr/local is not on it.
+# Measured on CT 105: PATH=/sbin:/bin:/usr/sbin:/usr/bin. Everything above
+# installs into /usr/local, and the README tells him to type the bare command,
+# so `update` and `bsgate-status` both answered "command not found" while
+# sitting installed and executable a directory away. /root/.bashrc IS read by
+# that shell. Idempotent twice over: the marker stops the block being appended
+# again, and the case guard stops PATH growing if something else added it.
+BASHRC_MARKER='# bsgate: put /usr/local on PATH for `pct enter` shells'
+[[ -f /root/.bashrc ]] || touch /root/.bashrc
+if ! grep -qF "$BASHRC_MARKER" /root/.bashrc 2>/dev/null; then
+    printf '\n%s\n%s\n' "$BASHRC_MARKER" \
+        'case ":$PATH:" in *:/usr/local/sbin:*) ;; *) PATH=/usr/local/sbin:/usr/local/bin:$PATH ;; esac' \
+        >> /root/.bashrc
+    say "added /usr/local/{sbin,bin} to root's PATH in /root/.bashrc"
+fi
+
 # ------------------------------------------------------------- state
 
 install -d -m 0700 -o bsgate -g bsgate /var/lib/bsgate

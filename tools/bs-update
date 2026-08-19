@@ -47,6 +47,34 @@ say()  { printf '  \033[1;36m->\033[0m %s\n' "$*"; }
 warn() { printf '  \033[1;33m/!\033[0m %s\n' "$*" >&2; }
 die()  { printf '  \033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
+# --------------------------------------------------------- PATH for root
+
+# `pct enter <ctid>` gives an interactive NON-login shell, which never reads
+# /etc/profile — so PATH is the bare init default and /usr/local is not on it.
+# Measured on CT 105: PATH=/sbin:/bin:/usr/sbin:/usr/bin. Everything this
+# project installs goes into /usr/local/bin or /usr/local/sbin, and both the
+# README and the join guide tell him to type the bare command, so `update` and
+# `bsgate-status` both answered "command not found" while sitting installed and
+# executable a directory away.
+#
+# /root/.bashrc IS read by that shell, so it is the one file that fixes it.
+# Idempotent twice over: the marker stops the block being appended again, and
+# the case guard stops the PATH growing if something else already added it.
+ensure_root_path() {
+    local rc=/root/.bashrc
+    local marker='# bsgate: put /usr/local on PATH for `pct enter` shells'
+
+    [[ -f $rc ]] || touch "$rc"
+    if grep -qF "$marker" "$rc" 2>/dev/null; then
+        return 0
+    fi
+
+    printf '\n%s\n%s\n' "$marker" \
+        'case ":$PATH:" in *:/usr/local/sbin:*) ;; *) PATH=/usr/local/sbin:/usr/local/bin:$PATH ;; esac' \
+        >> "$rc"
+    say "added /usr/local/{sbin,bin} to root's PATH in ${rc} (takes effect on your next 'pct enter')"
+}
+
 # ------------------------------------------------------------------ root
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "update must run as root (it installs system binaries and unit files)"
@@ -149,7 +177,28 @@ ensure_git_checkout
 
 say "installed version: v${CURRENT_VERSION}"
 say "fetching tags from origin"
-git -C "$SRC_DIR" fetch --tags --prune --quiet origin
+
+# --force matters. Without it git refuses to move a tag that already exists
+# locally and exits 1 ("would clobber existing tag"). That happened for real:
+# the v1.0.3 tag was corrected and force-pushed on 2026-08-19, and from then on
+# every already-deployed container's updater died on its next run — fixing a
+# tag upstream permanently bricked the updater downstream. The clone under
+# /opt/bsgate/src is a disposable build tree, not a record of anything, so
+# taking whatever origin currently says a tag points at is always right here.
+#
+# The output is captured instead of --quiet'd so a failure can be shown at all.
+# This script runs under `set -euo pipefail`, so before this the failing fetch
+# killed it with NO message whatsoever: it printed the line above and returned
+# to the prompt, looking exactly like "there is no update". It took `bash -x`
+# on the real box to find it. A fetch that fails must say so.
+FETCH_LOG=$(mktemp "${TMPDIR:-/tmp}/bs-update-fetch.XXXXXX.log")
+if ! git -C "$SRC_DIR" fetch --tags --force --prune origin >"$FETCH_LOG" 2>&1; then
+    warn "git fetch from ${REPO_URL} failed — nothing on this box was changed."
+    cat "$FETCH_LOG" >&2
+    rm -f "$FETCH_LOG"
+    die "could not fetch from origin. Check DNS and outbound reachability, then retry by hand: git -C ${SRC_DIR} fetch --tags --force --prune origin"
+fi
+rm -f "$FETCH_LOG"
 
 # Prefer the newest semver release tag over branch HEAD; fall back to the
 # default branch only when there are no tags at all yet. `sort -V` is
@@ -183,6 +232,27 @@ fi
 # --------------------------------------------------------------- build
 
 PREV_COMMIT=$(git -C "$SRC_DIR" rev-parse HEAD)
+
+# Discard local modifications before switching. proxmox-lxc-install.sh pushes
+# the source as a tarball and untars it OVER /opt/bsgate/src, so re-provisioning
+# a container that has already been converted to a git checkout leaves the tree
+# dirty, and git then refuses to switch:
+#     error: Your local changes to the following files would be overwritten
+# Measured on CT 105 on 2026-08-19: 5 files, 61 insertions, 14 deletions, every
+# one of them just an older copy of a tracked file. ensure_git_checkout() above
+# handles a bare tarball; this handles a tarball dropped over a clone.
+#
+# Safe because this tree holds nothing: all state lives in /var/lib/bsgate,
+# /var/lib/bsgame and /etc/playit (see the header), and the very next line
+# detach-checks-out over it anyway. Printed rather than done silently, because
+# on the day someone IS hand-editing /opt/bsgate/src this is the message that
+# tells them where their work went.
+if ! git -C "$SRC_DIR" diff --quiet HEAD --; then
+    warn "${SRC_DIR} has local modifications — discarding them before switching."
+    warn "(this is normally just a re-provision untarring over the checkout)"
+    git -C "$SRC_DIR" --no-pager diff --stat HEAD -- >&2
+    git -C "$SRC_DIR" reset --hard --quiet HEAD
+fi
 
 say "checking out ${TARGET_DESC} (${TARGET_REF})"
 git -C "$SRC_DIR" -c advice.detachedHead=false checkout -q --detach "$TARGET_REF"
@@ -252,10 +322,34 @@ done
 
 install -D -m 0755 -o root -g root "${SRC_DIR}/gateway/bsgate"         "${INSTALL_ROOT}/bsgate"
 install -D -m 0755 -o root -g root "${SRC_DIR}/game/bsgame"            "${INSTALL_ROOT}/bsgame"
-install -D -m 0755 -o root -g root "${SRC_DIR}/tools/bsgate-keys"      /usr/local/sbin/bsgate-keys
+
+# Every admin tool in tools/, rather than a hardcoded list. The hardcoded list
+# is exactly how bsgate-status shipped in v1.0.7 and then never appeared on the
+# box that updated to v1.0.7 — `bsgate-status: command not found`, with the file
+# sitting right there in ${SRC_DIR}/tools. A release can add a tool; this loop
+# is what makes that tool reach a container that is already deployed.
+#
+# bs-update is the exception, and only in HOW it is written, not whether: it is
+# the script currently executing, and `install` truncates its target in place,
+# which corrupts a running bash script mid-read (bash reads the file lazily).
+# Writing beside it and renaming is atomic — the running process keeps its own
+# now-unlinked inode, and the next run picks up the new file.
+for tool in "${SRC_DIR}"/tools/*; do
+    [[ -f $tool ]] || continue
+    tool_name=$(basename "$tool")
+    if [[ $tool_name == bs-update ]]; then
+        install -m 0755 -o root -g root "$tool" /usr/local/bin/.update.new
+        mv -f /usr/local/bin/.update.new /usr/local/bin/update
+    else
+        install -D -m 0755 -o root -g root "$tool" "/usr/local/sbin/${tool_name}"
+    fi
+done
+
 install -D -m 0644 -o root -g root "${SRC_DIR}/systemd/bsgate.service" "${UNIT_DIR}/bsgate.service"
 install -D -m 0644 -o root -g root "${SRC_DIR}/systemd/bsgame.service" "${UNIT_DIR}/bsgame.service"
 install -D -m 0644 -o root -g root "${SRC_DIR}/README.md"              "${INSTALL_ROOT}/README.md"
+
+ensure_root_path
 
 echo "$TARGET_VERSION" > "$VERSION_FILE"
 
