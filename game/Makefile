@@ -15,7 +15,15 @@
 # validate.c's static asserts for what breaks if they ever drift.
 
 CC     ?= cc
-WORLD  := ../../source
+
+# Three levels, not two. This Makefile is in <blocksmith>/deps/blocksmith-server/game/,
+# so ../.. is deps/ and ../../source is deps/source — a directory that has never existed
+# in any layout. The probe below therefore always took the fallback branch, even inside a
+# full Blocksmith checkout, and the drift static-asserts in validate.c were compiled out
+# everywhere instead of "everywhere that could cause drift". That is not hypothetical: it
+# is how BLOCK_PLANKS shipped as client id 7 while the server still refused every block id
+# >= 7, so the one thing this probe exists to catch went uncaught.
+WORLD  := ../../../source
 
 # That client tree only exists when this repo sits inside the Blocksmith
 # checkout. The published server-only repo, the installer's staging tar and the

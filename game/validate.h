@@ -30,9 +30,17 @@
  * headers whenever the client tree IS present. Drift is still caught at compile
  * time by anyone building inside the Blocksmith checkout — which is everyone
  * who could cause drift, since changing BLOCK_COUNT means editing that tree.
- * A standalone server build cannot detect drift, but it also cannot cause it. */
+ * A standalone server build cannot detect drift, but it also cannot cause it.
+ *
+ * That argument was sound and the guard still did not work, because this
+ * Makefile's WORLD path pointed one directory too shallow and the probe took
+ * the standalone branch even inside the checkout. So BLOCK_PLANKS was appended
+ * as client id 7 and this stayed at 7, and bsEditValid() below silently refused
+ * every planks placement in a server session — the exact drift the asserts were
+ * written to make impossible. The path is fixed; this is the number it was
+ * supposed to have been holding this to all along. */
 #define BS_WORLD_HEIGHT 128
-#define BS_BLOCK_COUNT  7
+#define BS_BLOCK_COUNT  8   /* AIR GRASS DIRT STONE SAND WOOD LEAVES PLANKS */
 
 /* True if (x, y, z, block) is an edit bsgame may apply. */
 bool bsEditValid(int32_t x, int32_t y, int32_t z, uint8_t block);
