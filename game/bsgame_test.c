@@ -222,9 +222,15 @@ static bool wait_ready(unsigned timeout_ms)
 
 /* ---------------------------------------------------------- e2e scenarios */
 
-static void test_join_and_world_sync_empty(void)
+/* The seed this run's daemon minted, as read off the wire by
+ * test_join_sends_world_info_then_sync(). test_restart_persists_diffs()
+ * re-reads it after a restart to prove world_seed.txt is what makes a world
+ * the *same* world across restarts. 0 means "not seen yet". */
+static uint32_t g_seen_seed = 0;
+
+static void test_join_sends_world_info_then_sync(void)
 {
-    puts("end-to-end: join with an empty world still gets a WORLD_SYNC");
+    puts("end-to-end: join gets WORLD_INFO first, then a WORLD_SYNC");
     drain();
 
     send_join(0xA11CE001u, "alice");
@@ -232,14 +238,22 @@ static void test_join_and_world_sync_empty(void)
     /* The wire protocol has no separate "you're in" message — the 3DS
      * client's CSTATE_AWAIT_WELCOME (source/net/bsnet_transport.c) leaves
      * "connecting" only on its first authenticated packet from the server.
-     * On a fresh, unedited world that packet has to be an EMPTY WORLD_SYNC
-     * (count 0), because nothing else is ever sent right after JOIN. This
-     * is the regression test for the bug where `send_world_sync()` sent
-     * nothing at all when the diff store was empty, leaving a lone player
-     * on a fresh world stuck at "Handshake completed, but the server never
-     * admitted the session" — see bsgame.c's send_world_sync() comment. */
+     * That packet is now BS_APP_WORLD_INFO: the client cannot generate any
+     * terrain until it knows which world it joined, so the seed has to
+     * arrive before anything that refers to a block position. The empty
+     * WORLD_SYNC still follows it — that is the regression test for the bug
+     * where `send_world_sync()` sent nothing at all when the diff store was
+     * empty, and it is still what tells a client the sync is complete. */
     uint8_t out[16];
     ssize_t n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "the first packet after JOIN is WORLD_INFO");
+    if (n == (ssize_t)BS_WORLD_INFO_BYTES) {
+        g_seen_seed = bs_get_u32(out + 1);
+        check(g_seen_seed != 0, "WORLD_INFO carries a non-zero world seed");
+    }
+
+    n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_SYNC_BYTES(0) && out[0] == BS_APP_WORLD_SYNC,
           "a fresh, zero-diff world still sends one WORLD_SYNC packet");
     if (n == (ssize_t)BS_WORLD_SYNC_BYTES(0)) {
@@ -478,11 +492,16 @@ static void test_restart_persists_diffs(void)
     send_join(0xF00D0006u, "newcomer");
 
     uint32_t total = 0;
+    uint32_t seed_after_restart = 0;
     bool saw_edit = false;
     for (;;) {
         uint8_t out[2048];
         ssize_t n = recv_app_for(0xF00D0006u, out, sizeof out, 500);
         if (n < 0) break;
+        if (n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO) {
+            seed_after_restart = bs_get_u32(out + 1);
+            continue;
+        }
         if (n < 3 || out[0] != BS_APP_WORLD_SYNC) continue;
         uint16_t count = bs_get_u16(out + 1);
         for (uint16_t i = 0; i < count; i++) {
@@ -496,6 +515,13 @@ static void test_restart_persists_diffs(void)
 
     check(total > 0, "diffs made before the restart are present after it");
     check(saw_edit, "the specific (5,10,-5) edit survived the restart");
+
+    /* The diffs are only meaningful against the terrain they were carved out
+     * of, and that terrain is generated client-side from the seed. A restart
+     * that kept the diffs but re-minted the seed would hand a rejoining
+     * player somebody else's holes in the wrong hillside. */
+    check(seed_after_restart != 0 && seed_after_restart == g_seen_seed,
+          "the world seed is the same one after a restart");
 }
 
 /* Runs right after test_restart_persists_diffs, where the daemon has just
@@ -611,7 +637,7 @@ int main(void)
         return 1;
     }
 
-    test_join_and_world_sync_empty();
+    test_join_sends_world_info_then_sync();
     test_edit_broadcast_to_other_player_only();
     test_invalid_block_id_rejected();
     test_out_of_range_coordinate_rejected();

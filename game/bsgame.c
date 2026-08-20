@@ -101,6 +101,14 @@ struct bs_game {
     uint64_t edits_rejected_rate;
     uint64_t edits_rejected_full;
 
+    /* The terrain seed this server's world generates from, sent to every
+     * client at JOIN as BS_APP_WORLD_INFO. Persisted in --state-dir next to
+     * block_diffs.bin, because the diffs are coordinates into the terrain this
+     * seed produces: change the seed and every stored edit lands somewhere
+     * meaningless. Loaded or minted once at startup, never changed while
+     * running. */
+    uint32_t world_seed;
+
     BsPlayers   players;
     BsDiffStore diffs;
 };
@@ -136,6 +144,84 @@ static bool path_set(char *dst, size_t cap, const char *fmt, ...)
     int n = vsnprintf(dst, cap, fmt, ap);
     va_end(ap);
     return n >= 0 && (size_t)n < cap;
+}
+
+/* ---------------------------------------------------------- world seed */
+
+/* Loads --state-dir/world_seed.txt, or mints and writes one on first run.
+ * `forced` is a --world-seed argument (NULL when not given), which overwrites
+ * whatever is stored: changing a live world's seed strands every diff already
+ * in block_diffs.bin, so it is deliberately an explicit operator act and never
+ * something that happens by itself.
+ *
+ * Plain decimal text rather than four raw bytes so an operator can read it with
+ * cat and set it with echo — this is the one number that decides what the whole
+ * world looks like, and needing a hex editor to see it would be hostile.
+ *
+ * Returns false only on an I/O error the operator needs to know about; a
+ * missing file is the ordinary first-run path, not a failure. */
+static bool world_seed_load(const char *state_dir, const char *forced,
+                            uint32_t *out, char *err, size_t errcap)
+{
+    char path[512];
+    if (!path_set(path, sizeof path, "%s/world_seed.txt", state_dir)) {
+        snprintf(err, errcap, "--state-dir is too long for the world seed path");
+        return false;
+    }
+
+    if (forced == NULL) {
+        FILE *f = fopen(path, "r");
+        if (f != NULL) {
+            unsigned long long v = 0;
+            int got = fscanf(f, "%llu", &v);
+            fclose(f);
+            if (got == 1) {
+                *out = (uint32_t)v;
+                logf_("game: world seed %u (from %s)", *out, path);
+                return true;
+            }
+            /* These messages name the file, not the full path: the caller's
+             * error buffer is 256 bytes and `path` alone can be 512, which the
+             * compiler is right to refuse to let us truncate silently. The
+             * directory is the operator's own --state-dir argument, so naming
+             * the file inside it is enough to find. */
+            snprintf(err, errcap, "world_seed.txt in --state-dir holds no number");
+            return false;
+        }
+        if (errno != ENOENT) {
+            snprintf(err, errcap, "cannot read world_seed.txt in --state-dir: %s",
+                     strerror(errno));
+            return false;
+        }
+    }
+
+    if (forced != NULL) {
+        *out = (uint32_t)strtoul(forced, NULL, 10);
+    } else {
+        /* First run. clock_gettime's nanoseconds mixed with the pid, rather
+         * than time(NULL): two servers first started in the same second on the
+         * same box must not come up with the same world. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        *out = (uint32_t)(ts.tv_nsec * 2654435761u) ^ (uint32_t)getpid();
+    }
+
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        snprintf(err, errcap, "cannot write world_seed.txt in --state-dir: %s",
+                 strerror(errno));
+        return false;
+    }
+    fprintf(f, "%u\n", *out);
+    if (fclose(f) != 0) {
+        snprintf(err, errcap, "short write on world_seed.txt in --state-dir: %s",
+                 strerror(errno));
+        return false;
+    }
+
+    logf_("game: world seed %u (%s, written to %s)", *out,
+          forced ? "forced by --world-seed" : "newly minted", path);
+    return true;
 }
 
 /* ------------------------------------------------------------- gate I/O */
@@ -245,6 +331,18 @@ static void send_world_sync(struct bs_game *g, uint32_t sid)
     } while (sent < total);
 }
 
+/* Tells one player which world they are standing in. Sent before the diffs,
+ * not after: BS_APP_WORLD_SYNC entries are coordinates into the terrain this
+ * seed generates, so a client that applied them first would be writing edits
+ * into whatever world it had already made up. See bs_proto.h. */
+static void send_world_info(struct bs_game *g, uint32_t sid)
+{
+    uint8_t payload[BS_WORLD_INFO_BYTES];
+    payload[0] = BS_APP_WORLD_INFO;
+    bs_put_u32(payload + 1, g->world_seed);
+    send_data(g, sid, payload, sizeof payload);
+}
+
 static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, size_t len,
                         uint64_t now)
 {
@@ -279,8 +377,14 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
         return;
     }
 
-    logf_("game: %s joined (sid %08x)", p->label, sid);
+    logf_("game: %s joined (sid %08x), world seed %u", p->label, sid, g->world_seed);
     g->joins_total++;
+    /* Order matters and is load-bearing — see send_world_info(). This is also
+     * now the packet that admits the client (the 3DS transport leaves
+     * CSTATE_AWAIT_WELCOME on the first authenticated packet of any type,
+     * source/net/bsnet_transport.c), a role send_world_sync() used to hold; it
+     * still sends unconditionally, so that guarantee is unchanged either way. */
+    send_world_info(g, sid);
     send_world_sync(g, sid);
 }
 
@@ -541,17 +645,21 @@ static void usage(void)
         "usage: bsgame --game-socket PATH --gate-socket PATH --state-dir DIR\n"
         "  --game-socket PATH   unix socket this process binds (gate sends JOIN/DATA/LEAVE here)\n"
         "  --gate-socket PATH   unix socket bsgate binds (this process sends DATA/KICK there)\n"
-        "  --state-dir DIR      holds block_diffs.bin and, on SIGUSR1, status.txt\n");
+        "  --state-dir DIR      holds block_diffs.bin, world_seed.txt and, on SIGUSR1, status.txt\n"
+        "  --world-seed N       force this world's terrain seed, overwriting world_seed.txt.\n"
+        "                       Omit it: the stored seed is reused, or minted on first run.\n"
+        "                       Changing it strands every edit already in block_diffs.bin.\n");
 }
 
 int main(int argc, char **argv)
 {
-    const char *game_sock = NULL, *gate_sock = NULL, *state_dir = NULL;
+    const char *game_sock = NULL, *gate_sock = NULL, *state_dir = NULL, *world_seed = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--game-socket") && i + 1 < argc)      game_sock = argv[++i];
         else if (!strcmp(argv[i], "--gate-socket") && i + 1 < argc) gate_sock = argv[++i];
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc)   state_dir = argv[++i];
+        else if (!strcmp(argv[i], "--world-seed") && i + 1 < argc)  world_seed = argv[++i];
         else { usage(); return 2; }
     }
     if (game_sock == NULL || gate_sock == NULL || state_dir == NULL) {
@@ -579,6 +687,12 @@ int main(int argc, char **argv)
     playersInit(&g.players);
 
     char err[256];
+    /* Before the diff store, so a bad seed file stops the server while the
+     * world is still untouched rather than after diffs are already open. */
+    if (!world_seed_load(state_dir, world_seed, &g.world_seed, err, sizeof err)) {
+        logf_("game: %s", err);
+        return 1;
+    }
     if (!diffstoreOpen(&g.diffs, state_dir, err, sizeof err)) {
         logf_("game: %s", err);
         return 1;

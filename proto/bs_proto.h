@@ -219,9 +219,24 @@ enum bs_app_msg {
                                 * BS_APP_WORLD_SYNC.                          */
     BS_APP_POS_UPDATE = 0x02, /* C->S: the sender's own pose.
                                 * S->C: another player's sid + pose.          */
-    BS_APP_WORLD_SYNC = 0x03  /* S->C only: a batch of existing block diffs, */
-};                             /* sent right after JOIN so a new player sees  */
-                                /* the world as everyone else already edited it. */
+    BS_APP_WORLD_SYNC = 0x03, /* S->C only: a batch of existing block diffs,   */
+                               /* sent right after JOIN so a new player sees    */
+                               /* the world as everyone else already edited it. */
+    BS_APP_WORLD_INFO = 0x04  /* S->C only: which world this is — the seed its
+                                * terrain generates from. Sent once per session,
+                                * as the FIRST packet after JOIN, before any
+                                * WORLD_SYNC: the diffs in that sync are
+                                * coordinates into this seed's terrain and mean
+                                * nothing without it.
+                                *
+                                * This is what makes the server the owner of the
+                                * world rather than a shared notepad. Until it
+                                * existed the seed was a constant compiled into
+                                * the client (BS_WORLD_SEED, source/main.c), so
+                                * every server necessarily had the same terrain
+                                * and "which world am I on" was not a question
+                                * the protocol could even ask. */
+};
 
 #define BS_APP_HDR_BYTES 1u
 
@@ -249,5 +264,12 @@ enum bs_app_msg {
 
 #define BS_WORLD_SYNC_BYTES(n) \
     (BS_APP_HDR_BYTES + 2u + (uint32_t)(n) * BS_SYNC_ENTRY_BYTES)
+
+/* WORLD_INFO: the world's terrain seed, one uint32. Deliberately just the seed
+ * and not a struct with room to grow — a client that meets a longer WORLD_INFO
+ * from a newer server must be able to reject it on length alone rather than
+ * silently half-parse it, so widening this later means a new message type, not
+ * a bigger one. */
+#define BS_WORLD_INFO_BYTES (BS_APP_HDR_BYTES + 4u)                   /* 5 */
 
 #endif /* BS_PROTO_H */
