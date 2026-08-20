@@ -15,13 +15,29 @@
 
 /* Bounded so a hostile or buggy client cannot grow this without limit —
  * validate.h's bsEditValid() is what keeps individual coordinates sane, this
- * is the ceiling on how many distinct ones can exist at all. 65536 distinct
- * edited locations is far past what casual building by 2-8 players reaches;
- * at 16 bytes per entry the live table costs 1 MiB, plus 512 KiB for the
- * open-addressing index below — a fixed, known cost rather than something
- * that grows with how long the world has been played. */
-#define BS_DIFF_MAX    65536u
-#define BS_DIFF_SLOTS 131072u   /* power of two, ~0.5 load factor for short probes */
+ * is the ceiling on how many distinct ones can exist at all. A fixed, known
+ * cost rather than something that grows with how long the world has been
+ * played: at 16 bytes per entry the live table costs 2 MiB, plus 1 MiB for
+ * the open-addressing index below.
+ *
+ * This was 65536, and what actually bound it was not memory but the client:
+ * the server replayed its ENTIRE store to every joining client in one burst,
+ * and the client's pending store refused everything past its own cap — losing
+ * the NEWEST edits, because the replay goes oldest-first. Raising this before
+ * that was fixed would only have made a joining player lose more of what had
+ * just been built.
+ *
+ * Per-column subscription (BS_APP_CHUNK_SUB, proto/bs_proto.h) is what removed
+ * that coupling: a client now receives one column's diffs at a time, bounded by
+ * its render distance rather than by how much has ever been built. So this can
+ * be sized for the world instead of for the wire, and 131072 puts it past
+ * 100000 with room to spare.
+ *
+ * Old clients that never send CHUNK_SUB still get the full dump and still lose
+ * whatever exceeds their own cap. That is not a regression — it was already
+ * true at 65536 — but it is a reason to update them. */
+#define BS_DIFF_MAX   131072u
+#define BS_DIFF_SLOTS 262144u   /* power of two, ~0.5 load factor for short probes */
 
 typedef struct {
     int32_t x, y, z;

@@ -71,6 +71,26 @@ enum bs_game_msg {
  * a quiet server spends the time between ticks blocked, not spinning. */
 #define BS_GAME_TICK_MS 100u
 
+/* V127-A: how long bsgame waits, after JOIN, for a player's first CHUNK_SUB
+ * before deciding they are running a pre-V127-A client and falling back to
+ * the old full-dump WORLD_SYNC (see tick() and send_world_sync()). A modern
+ * client already knows where it is the instant it applies WORLD_INFO's seed
+ * and generates terrain locally, so its first CHUNK_SUB is one local
+ * computation plus a single network hop away — a few hundred ms is
+ * generous, not tight, even over 3DS Wi-Fi. A client too old to have any
+ * CHUNK_SUB code at all will obviously never send one, so this window only
+ * ever costs such a client that same short, one-time delay before it
+ * receives exactly what it always did. There is no capability bit in JOIN
+ * to tell old and new clients apart up front (the wire format is fixed —
+ * see bs_proto.h's header comment — and JOIN's body is just pubkey+label),
+ * so this grace window is a heuristic, not a protocol-level guarantee: a
+ * pathological modern client that delays its first CHUNK_SUB past this
+ * window would receive one redundant full WORLD_SYNC before scoping takes
+ * over. That is wasted bandwidth, never a correctness problem — every
+ * later edit is still scoped correctly once chunk_sub_seen is set (see
+ * broadcast_block_edit()). */
+#define BS_CHUNK_LEGACY_GRACE_MS 500u
+
 static volatile sig_atomic_t g_quit = 0;
 static void on_sigterm(int s) { (void)s; g_quit = 1; }
 
@@ -274,22 +294,51 @@ static void broadcast_except(struct bs_game *g, uint32_t exclude_sid,
 
 /* ----------------------------------------------------------- application */
 
+/* V127-A: a live edit is broadcast only to players who can actually place it
+ * — those subscribed to its column, plus (unscoped, as always) any player
+ * still on the pre-V127-A legacy path, who by definition has no subscription
+ * set at all and must keep seeing every edit exactly as before (see
+ * chunk_sub_seen's header comment in players.h and tick()'s grace-window
+ * fallback). The diff store itself is unaffected either way: it already
+ * holds every accepted edit regardless of who was subscribed to what at the
+ * time — diffstoreApply() runs in handle_block_edit() before this is ever
+ * called — so a player who subscribes to a column later still gets its full
+ * history via send_chunk_diffs(), not just edits made after they asked. */
 static void broadcast_block_edit(struct bs_game *g, uint32_t from_sid,
                                  int32_t x, int32_t y, int32_t z, uint8_t block)
 {
+    int32_t cx = bs_col_of(x);
+    int32_t cz = bs_col_of(z);
+
     uint8_t out[BS_BLOCK_EDIT_BYTES];
     out[0] = BS_APP_BLOCK_EDIT;
     bs_put_i32(out + 1, x);
     bs_put_i32(out + 5, y);
     bs_put_i32(out + 9, z);
     out[13] = block;
-    broadcast_except(g, from_sid, out, sizeof out);
+
+    for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
+        BsPlayer *p = &g->players.p[i];
+        if (!p->used || p->sid == from_sid) continue;
+        if (p->chunk_sub_seen && !playerSubHas(p, cx, cz)) continue;
+
+        send_data(g, p->sid, out, sizeof out);
+    }
 }
 
-/* Ships the whole current diff set to one player, right after JOIN, in
- * batches of BS_SYNC_MAX_ENTRIES so each packet stays inside BS_MAX_PAYLOAD
- * (see bs_proto.h). Ordering does not matter: every entry is an independent
+/* Ships the whole current diff set to one player, in batches of
+ * BS_SYNC_MAX_ENTRIES so each packet stays inside BS_MAX_PAYLOAD (see
+ * bs_proto.h). Ordering does not matter: every entry is an independent
  * (x, y, z, block) triple, not a delta against a previous one.
+ *
+ * V127-A: no longer called unconditionally from handle_join(). It is now the
+ * legacy fallback for a player who has not sent a single CHUNK_SUB within
+ * BS_CHUNK_LEGACY_GRACE_MS of joining — see tick() — because a modern client
+ * gets its diffs scoped per column instead (send_chunk_diffs()), which is the
+ * whole point of CHUNK_SUB existing (see bs_proto.h's comment on
+ * BS_APP_CHUNK_SUB). This function's own behaviour is otherwise unchanged, so
+ * every scenario described below still applies to whoever it is now called
+ * for.
  *
  * This must always send at least one packet, even when `total == 0`. The
  * wire protocol has no separate "you're in" message — the 3DS client
@@ -302,7 +351,11 @@ static void broadcast_block_edit(struct bs_game *g, uint32_t from_sid,
  * allowlisted client was accepted by both bsgate and bsgame and still never
  * left "Handshake completed, but the server never admitted the session".
  * Do NOT turn this back into a bare `while` loop — that reintroduces the
- * exact bug this comment describes. */
+ * exact bug this comment describes. (This particular guarantee is now
+ * carried by WORLD_INFO instead — see send_world_info() and handle_join()
+ * below — but the empty-batch behaviour stays exactly as load-bearing for
+ * the legacy path: it is still how such a client learns a fresh world has
+ * zero diffs rather than waiting forever for a sync that will never arrive.) */
 static void send_world_sync(struct bs_game *g, uint32_t sid)
 {
     uint32_t total = diffstoreCount(&g->diffs);
@@ -329,6 +382,62 @@ static void send_world_sync(struct bs_game *g, uint32_t sid)
         send_data(g, sid, payload, BS_WORLD_SYNC_BYTES(batch));
         sent += batch;
     } while (sent < total);
+}
+
+/* V127-A: ships one column's diffs to one player, in batches of
+ * BS_CHUNK_DIFFS_MAX_ENTRIES so each packet stays inside BS_MAX_PAYLOAD, the
+ * same shape send_world_sync() uses for the whole store. The final batch —
+ * BS_CHUNK_DIFFS_LAST set — always goes out, even when it is empty, so the
+ * client can tell "this column has no edits" from "still coming" (see
+ * bs_proto.h's comment on BS_CHUNK_DIFFS_LAST); this mirrors why
+ * send_world_sync() must never become a bare `while` loop.
+ *
+ * Enumeration is a linear scan of the whole diff store, not a per-column
+ * index kept in step with diffstoreApply(): CHUNK_SUB fires when a player's
+ * loaded columns change, which is bounded by player movement, not by
+ * BS_GAME_TICK_MS, so this never runs at anything like tick frequency. Even
+ * scaled up past today's BS_DIFF_MAX (65536) to the ~100,000-diff mark this
+ * feature is reasoned against, one call is on the order of 100k int
+ * comparisons — a fraction of a millisecond, and cheaper than a second data
+ * structure that has to stay correct across every diffstoreApply() call and
+ * any future compaction or eviction of the store. If the store's cap ever
+ * grows by orders of magnitude this trade flips and a real column index
+ * becomes worth its upkeep — not the case at today's BS_DIFF_MAX. */
+static void send_chunk_diffs(struct bs_game *g, uint32_t sid, int32_t cx, int32_t cz)
+{
+    uint32_t total = diffstoreCount(&g->diffs);
+
+    uint8_t payload[BS_CHUNK_DIFFS_BYTES(BS_CHUNK_DIFFS_MAX_ENTRIES)];
+    uint32_t batch = 0;
+
+    for (uint32_t i = 0; i < total; i++) {
+        const BsDiff *d = diffstoreAt(&g->diffs, i);
+        if (bs_col_of(d->x) != cx || bs_col_of(d->z) != cz) continue;
+
+        uint8_t *w = payload + BS_CHUNK_DIFFS_HDR_BYTES + (size_t)batch * BS_SYNC_ENTRY_BYTES;
+        bs_put_i32(w,     d->x);
+        bs_put_i32(w + 4, d->y);
+        bs_put_i32(w + 8, d->z);
+        w[12] = d->block;
+        batch++;
+
+        if (batch == BS_CHUNK_DIFFS_MAX_ENTRIES) {
+            payload[0] = BS_APP_CHUNK_DIFFS;
+            bs_put_i32(payload + 1, cx);
+            bs_put_i32(payload + 5, cz);
+            payload[9] = 0;   /* more batches for this column still to come */
+            bs_put_u16(payload + 10, (uint16_t)batch);
+            send_data(g, sid, payload, BS_CHUNK_DIFFS_BYTES(batch));
+            batch = 0;
+        }
+    }
+
+    payload[0] = BS_APP_CHUNK_DIFFS;
+    bs_put_i32(payload + 1, cx);
+    bs_put_i32(payload + 5, cz);
+    payload[9] = BS_CHUNK_DIFFS_LAST;
+    bs_put_u16(payload + 10, (uint16_t)batch);
+    send_data(g, sid, payload, BS_CHUNK_DIFFS_BYTES(batch));
 }
 
 /* Tells one player which world they are standing in. Sent before the diffs,
@@ -380,12 +489,23 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
     logf_("game: %s joined (sid %08x), world seed %u", p->label, sid, g->world_seed);
     g->joins_total++;
     /* Order matters and is load-bearing — see send_world_info(). This is also
-     * now the packet that admits the client (the 3DS transport leaves
+     * the packet that admits the client (the 3DS transport leaves
      * CSTATE_AWAIT_WELCOME on the first authenticated packet of any type,
-     * source/net/bsnet_transport.c), a role send_world_sync() used to hold; it
-     * still sends unconditionally, so that guarantee is unchanged either way. */
+     * source/net/bsnet_transport.c), a role send_world_sync() used to hold
+     * before V127-A.
+     *
+     * send_world_sync() is deliberately NOT called here anymore. Sending the
+     * whole diff store to every joiner is exactly the problem V127-A exists
+     * to fix (see bs_proto.h's comment above BS_APP_CHUNK_SUB): it overflows
+     * a 3DS client's pending store and wastes bandwidth on columns it will
+     * never render. A modern client instead subscribes to the columns it has
+     * loaded (CHUNK_SUB) and gets only those diffs back (send_chunk_diffs()).
+     * tick() below still falls back to the old full-dump WORLD_SYNC, but only
+     * for a player who never sends a CHUNK_SUB within BS_CHUNK_LEGACY_GRACE_MS
+     * of this JOIN — see BS_CHUNK_LEGACY_GRACE_MS's own comment for why that
+     * is a safe way to tell a pre-V127-A client apart from a modern one
+     * without a capability bit the fixed wire format has no room for. */
     send_world_info(g, sid);
-    send_world_sync(g, sid);
 }
 
 static void handle_leave(struct bs_game *g, uint32_t sid)
@@ -451,6 +571,56 @@ static void handle_pos_update(struct bs_game *g, BsPlayer *p, const uint8_t *msg
     p->pos_dirty = true;
 }
 
+/* V127-A: the client has loaded column (cx, cz) and wants its diffs.
+ * `chunk_sub_seen` is set unconditionally, even if the subscription table
+ * turns out to be full below — this is what tells tick() the player is a
+ * modern client and must never fall back to a legacy full WORLD_SYNC, which
+ * would defeat the entire point of scoping (see BS_CHUNK_LEGACY_GRACE_MS). */
+static void handle_chunk_sub(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
+{
+    if (len != BS_CHUNK_SUB_BYTES) {
+        send_kick(g, p->sid, "malformed CHUNK_SUB");
+        playerFree(p);
+        return;
+    }
+
+    int32_t cx = bs_get_i32(msg + 1);
+    int32_t cz = bs_get_i32(msg + 5);
+
+    p->chunk_sub_seen = true;
+
+    if (!playerSubAdd(p, cx, cz)) {
+        /* Table full: not a protocol violation — a client asking to track
+         * more columns than any legitimate render distance needs is
+         * misbehaving, not lying about its message shape — so this is
+         * dropped rather than kicked, the same stance handle_block_edit()
+         * takes on a well-formed-but-refused edit. */
+        logf_("game: %s: CHUNK_SUB (%d,%d) dropped, subscription table full",
+              p->label, cx, cz);
+        return;
+    }
+
+    send_chunk_diffs(g, p->sid, cx, cz);
+}
+
+/* V127-A: the client has dropped column (cx, cz) and no longer wants its
+ * edits broadcast. Unlike CHUNK_SUB this does not set chunk_sub_seen — an
+ * UNSUB with no prior SUB (e.g. reordered on lossy Wi-Fi) must not be able
+ * to flip a legacy client onto the scoped path with an empty subscription
+ * set, which would silently stop every future edit from ever reaching it. */
+static void handle_chunk_unsub(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
+{
+    if (len != BS_CHUNK_UNSUB_BYTES) {
+        send_kick(g, p->sid, "malformed CHUNK_UNSUB");
+        playerFree(p);
+        return;
+    }
+
+    int32_t cx = bs_get_i32(msg + 1);
+    int32_t cz = bs_get_i32(msg + 5);
+    playerSubRemove(p, cx, cz);
+}
+
 /* One accepted application payload from an already-joined player. Anything
  * structurally wrong here — a type this build does not know, or a length
  * that does not match its type — is treated as a protocol violation from a
@@ -478,6 +648,12 @@ static void handle_app_payload(struct bs_game *g, uint32_t sid, const uint8_t *b
         break;
     case BS_APP_POS_UPDATE:
         handle_pos_update(g, p, body, len);
+        break;
+    case BS_APP_CHUNK_SUB:
+        handle_chunk_sub(g, p, body, len);
+        break;
+    case BS_APP_CHUNK_UNSUB:
+        handle_chunk_unsub(g, p, body, len);
         break;
     default:
         send_kick(g, sid, "unknown application message type");
@@ -514,9 +690,28 @@ static void handle_gate_msg(struct bs_game *g)
 
 static void tick(struct bs_game *g)
 {
+    uint64_t now = now_ms();
+
     for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
         BsPlayer *p = &g->players.p[i];
-        if (!p->used || !p->has_pos || !p->pos_dirty) continue;
+        if (!p->used) continue;
+
+        /* V127-A legacy fallback: a player who still has not sent a single
+         * CHUNK_SUB by BS_CHUNK_LEGACY_GRACE_MS after JOIN is assumed to be
+         * a pre-V127-A client and gets the old full-dump WORLD_SYNC exactly
+         * once — see BS_CHUNK_LEGACY_GRACE_MS and send_world_sync()'s own
+         * comments for why this is safe. legacy_sync_sent makes this a
+         * one-shot: it is set here whether or not chunk_sub_seen ended up
+         * true, so a player who starts subscribing mere moments after the
+         * window closes is not also handed a redundant full dump. */
+        uint64_t since_join = (now > p->joined_ms) ? now - p->joined_ms : 0;
+        if (!p->chunk_sub_seen && !p->legacy_sync_sent
+            && since_join >= BS_CHUNK_LEGACY_GRACE_MS) {
+            send_world_sync(g, p->sid);
+            p->legacy_sync_sent = true;
+        }
+
+        if (!p->has_pos || !p->pos_dirty) continue;
 
         uint8_t out[BS_POS_UPDATE_S_BYTES];
         out[0] = BS_APP_POS_UPDATE;

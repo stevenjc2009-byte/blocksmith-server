@@ -222,7 +222,7 @@ enum bs_app_msg {
     BS_APP_WORLD_SYNC = 0x03, /* S->C only: a batch of existing block diffs,   */
                                /* sent right after JOIN so a new player sees    */
                                /* the world as everyone else already edited it. */
-    BS_APP_WORLD_INFO = 0x04  /* S->C only: which world this is — the seed its
+    BS_APP_WORLD_INFO = 0x04, /* S->C only: which world this is — the seed its
                                 * terrain generates from. Sent once per session,
                                 * as the FIRST packet after JOIN, before any
                                 * WORLD_SYNC: the diffs in that sync are
@@ -236,7 +236,37 @@ enum bs_app_msg {
                                 * every server necessarily had the same terrain
                                 * and "which world am I on" was not a question
                                 * the protocol could even ask. */
+
+    BS_APP_CHUNK_SUB   = 0x05, /* C->S: the client has loaded column (cx, cz)
+                                * and wants the edits belonging to it. The
+                                * server answers with one or more CHUNK_DIFFS
+                                * for that column, the last flagged
+                                * BS_CHUNK_DIFFS_LAST — and it answers even when
+                                * the column has no edits at all, so the client
+                                * can tell "none" from "still coming" and never
+                                * meshes a half-synced column.               */
+    BS_APP_CHUNK_DIFFS = 0x06, /* S->C: the edits for one column, in batches. */
+    BS_APP_CHUNK_UNSUB = 0x07  /* C->S: the client has dropped column (cx, cz)
+                                * and no longer wants edits broadcast for it. */
 };
+
+/* Why CHUNK_SUB exists at all, given WORLD_SYNC already replayed everything.
+ *
+ * WORLD_SYNC ships the entire diff set to every joining client, oldest first.
+ * That forces the client's inbox to be as large as the server's whole store,
+ * which is what capped the server at BS_DIFF_MAX (diffstore.h) — the 3DS cannot
+ * hold millions of edits, so the server was not allowed to keep them either.
+ * Scoping delivery to the column the player is actually standing near breaks
+ * that coupling: the console holds edits for loaded columns only, and the
+ * server's capacity stops being a client-memory question.
+ *
+ * WORLD_SYNC is kept, and still sent once at JOIN with a count of zero. It is
+ * NOT dead weight — see send_world_sync() in game/bsgame.c for the admission
+ * guarantee it carries, and note that a client from before this message set
+ * exists still receives exactly what it always did.
+ *
+ * The wire sizes for these three live below, next to WORLD_SYNC's, because they
+ * are built out of the same per-entry shape. */
 
 #define BS_APP_HDR_BYTES 1u
 
@@ -264,6 +294,46 @@ enum bs_app_msg {
 
 #define BS_WORLD_SYNC_BYTES(n) \
     (BS_APP_HDR_BYTES + 2u + (uint32_t)(n) * BS_SYNC_ENTRY_BYTES)
+
+/* The client's CHUNK_DIM (source/world/chunk.h:50), restated here because
+ * column coordinates are now on the wire and the two ends MUST agree on how a
+ * block coordinate maps to a column. It lives in the protocol header for the
+ * same reason the message sizes do: it is part of what the endpoints promise
+ * each other, not an internal choice either side may revise alone. */
+#define BS_CHUNK_DIM 16
+
+/* Block coordinate to column coordinate. An arithmetic right shift, not a
+ * division: `/ 16` truncates toward zero, so -1 / 16 == 0 and blocks at x = -1
+ * and x = +1 would land in the same column while x = -16 landed in another.
+ * `>> 4` floors, which is what tiles correctly across the origin. This matches
+ * source/net/blockdiff.c on the client exactly — if one side ever changes, edits
+ * near the origin get filed under a column nobody subscribes to and quietly
+ * stop arriving. */
+static inline int32_t bs_col_of(int32_t block_coord) { return block_coord >> 4; }
+
+/* CHUNK_SUB and CHUNK_UNSUB: the column coordinate, two int32. Columns, not
+ * blocks — a column is BS_CHUNK_DIM wide in x and z and spans the full world
+ * height, so one subscription covers every chunk stacked above that footprint. */
+#define BS_CHUNK_SUB_BYTES   (BS_APP_HDR_BYTES + 4u + 4u)             /* 9 */
+#define BS_CHUNK_UNSUB_BYTES BS_CHUNK_SUB_BYTES                       /* 9 */
+
+/* Set on the final CHUNK_DIFFS packet for a column. A column with no edits
+ * still gets one packet, with count 0 and this flag set — the client needs to
+ * hear "that column is empty" as distinctly as it hears "here are its edits". */
+#define BS_CHUNK_DIFFS_LAST  0x01u
+
+/* CHUNK_DIFFS: cx, cz, flags, count, then `count` entries of the same shape
+ * WORLD_SYNC uses. The column coordinate is repeated in every packet rather
+ * than implied by the outstanding request, because UDP gives no ordering
+ * guarantee between two columns subscribed in the same tick — without it a
+ * client that asked for two columns at once cannot tell whose diffs arrived. */
+#define BS_CHUNK_DIFFS_HDR_BYTES (BS_APP_HDR_BYTES + 4u + 4u + 1u + 2u)  /* 12 */
+#define BS_CHUNK_DIFFS_BYTES(n) \
+    (BS_CHUNK_DIFFS_HDR_BYTES + (uint32_t)(n) * BS_SYNC_ENTRY_BYTES)
+
+/* Same reasoning as BS_SYNC_MAX_ENTRIES, one packet's worth: 12 + 64*13 = 844,
+ * inside BS_MAX_PAYLOAD (1024) with the same margin WORLD_SYNC keeps. */
+#define BS_CHUNK_DIFFS_MAX_ENTRIES BS_SYNC_MAX_ENTRIES
 
 /* WORLD_INFO: the world's terrain seed, one uint32. Deliberately just the seed
  * and not a struct with room to grow — a client that meets a longer WORLD_INFO

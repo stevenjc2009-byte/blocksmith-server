@@ -34,6 +34,21 @@
 #define BS_EDIT_BURST     40u   /* edits a player may spend in one burst        */
 #define BS_EDIT_REFILL_MS 50u   /* one token back per this many ms (20/s sustained) */
 
+/* Per-player column subscription set (V127-A). A render-distance-4 client
+ * needs roughly 81 columns (a 9x9 footprint), so this leaves close to 3x
+ * headroom for the window while a client is subscribing to a wider ring
+ * before it has unsubscribed the old one — without a client ever needing to
+ * be trusted to stay under any particular render distance. Fixed-size and
+ * linearly scanned, like BS_GAME_MAX_PLAYERS itself: at this size an array is
+ * both simpler and cheaper than a hash set with a table to maintain, and the
+ * cost is trivial either way — 256 * 8 bytes = 2 KiB per player, 32 KiB for
+ * the whole BS_GAME_MAX_PLAYERS table. */
+#define BS_PLAYER_SUB_MAX 256u
+
+typedef struct {
+    int32_t cx, cz;
+} BsColumn;
+
 typedef struct {
     bool     used;
     uint32_t sid;
@@ -48,6 +63,17 @@ typedef struct {
 
     uint16_t edit_tokens;   /* scaled by BS_EDIT_SCALE */
     uint64_t edit_last_ms;
+
+    /* V127-A per-column diff subscriptions. `joined_ms` is set once, at
+     * JOIN, and never touched again — unlike last_seen_ms it must NOT move
+     * on every message, because bsgame.c's legacy-WORLD_SYNC grace window
+     * (BS_CHUNK_LEGACY_GRACE_MS) is measured from the moment this player
+     * connected, not from their last activity. */
+    BsColumn subs[BS_PLAYER_SUB_MAX];
+    uint16_t sub_count;
+    bool     chunk_sub_seen;    /* this player has sent at least one CHUNK_SUB */
+    bool     legacy_sync_sent;  /* the grace-window full WORLD_SYNC already went out */
+    uint64_t joined_ms;
 } BsPlayer;
 
 typedef struct {
@@ -67,5 +93,23 @@ void playerFree(BsPlayer *p);
 /* Consumes one edit token if the bucket has one. False — and nothing
  * changed — if it is empty, meaning the caller must drop the edit. */
 bool playerEditAllow(BsPlayer *p, uint64_t now_ms);
+
+/* Adds (cx, cz) to `p`'s subscription set. Idempotent — subscribing to a
+ * column already held is a harmless no-op, since the client is free to
+ * re-assert a column it thinks it might have lost (e.g. after a dropped
+ * UNSUB/SUB pair on lossy Wi-Fi). False only when the set is already at
+ * BS_PLAYER_SUB_MAX and `cx, cz` is not already in it — a modified or
+ * confused client asking for more columns than any real render distance
+ * needs, refused the same way diffstoreApply() refuses a full table rather
+ * than growing it. */
+bool playerSubAdd(BsPlayer *p, int32_t cx, int32_t cz);
+
+/* Removes (cx, cz) if present; a no-op if it was never subscribed (the
+ * client may UNSUB a column it never successfully SUBed, e.g. after a
+ * dropped packet — that is not an error). */
+void playerSubRemove(BsPlayer *p, int32_t cx, int32_t cz);
+
+/* True if `p` currently holds a live subscription to (cx, cz). */
+bool playerSubHas(const BsPlayer *p, int32_t cx, int32_t cz);
 
 #endif /* BS_GAME_PLAYERS_H */

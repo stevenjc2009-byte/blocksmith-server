@@ -29,6 +29,10 @@ BsPlayer *playerAlloc(BsPlayers *pl, uint32_t sid, const char *label, uint64_t n
         p->last_seen_ms = now_ms;
         p->edit_tokens  = (uint16_t)(BS_EDIT_BURST * BS_EDIT_SCALE);
         p->edit_last_ms = now_ms;
+        /* subs[]/sub_count/chunk_sub_seen/legacy_sync_sent are already zero
+         * from the memset above; joined_ms is the one field that needs an
+         * explicit value, since "zero" is a real timestamp, not "unset". */
+        p->joined_ms    = now_ms;
         return p;
     }
     return NULL;
@@ -59,4 +63,36 @@ bool playerEditAllow(BsPlayer *p, uint64_t now_ms)
     p->edit_tokens  = (uint16_t)(tokens - BS_EDIT_SCALE);
     p->edit_last_ms = now_ms;
     return true;
+}
+
+bool playerSubAdd(BsPlayer *p, int32_t cx, int32_t cz)
+{
+    if (playerSubHas(p, cx, cz)) return true;
+    if (p->sub_count >= BS_PLAYER_SUB_MAX) return false;
+
+    p->subs[p->sub_count].cx = cx;
+    p->subs[p->sub_count].cz = cz;
+    p->sub_count++;
+    return true;
+}
+
+void playerSubRemove(BsPlayer *p, int32_t cx, int32_t cz)
+{
+    for (uint16_t i = 0; i < p->sub_count; i++) {
+        if (p->subs[i].cx != cx || p->subs[i].cz != cz) continue;
+
+        /* Order doesn't matter to a set, so swap the last entry into this
+         * slot instead of shifting everything after it down by one. */
+        p->subs[i] = p->subs[p->sub_count - 1u];
+        p->sub_count--;
+        return;
+    }
+}
+
+bool playerSubHas(const BsPlayer *p, int32_t cx, int32_t cz)
+{
+    for (uint16_t i = 0; i < p->sub_count; i++) {
+        if (p->subs[i].cx == cx && p->subs[i].cz == cz) return true;
+    }
+    return false;
 }
