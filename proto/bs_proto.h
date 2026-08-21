@@ -246,9 +246,45 @@ enum bs_app_msg {
                                 * can tell "none" from "still coming" and never
                                 * meshes a half-synced column.               */
     BS_APP_CHUNK_DIFFS = 0x06, /* S->C: the edits for one column, in batches. */
-    BS_APP_CHUNK_UNSUB = 0x07  /* C->S: the client has dropped column (cx, cz)
+    BS_APP_CHUNK_UNSUB = 0x07, /* C->S: the client has dropped column (cx, cz)
                                 * and no longer wants edits broadcast for it. */
+
+    BS_APP_INV_STATE  = 0x08, /* S->C only: the whole of this player's
+                               * inventory, authoritative. Sent unprompted once
+                               * at JOIN and again after anything that could
+                               * have changed it. See the note below on why the
+                               * server speaks first.                         */
+    BS_APP_INV_ACTION = 0x09  /* C->S: one requested inventory or crafting
+                               * operation. Never sent until an INV_STATE has
+                               * arrived — that is the capability probe.      */
 };
+
+/* Why INV_STATE is sent unprompted, and why the client must never open with
+ * INV_ACTION.
+ *
+ * The two ends do not treat an unknown message type the same way, and they
+ * cannot. bsgame kicks it (handle_app_payload's default case, game/bsgame.c):
+ * a byte it does not understand arriving from an authenticated-but-untrusted
+ * client is exactly the case that boundary exists to refuse. The client
+ * ignores it (net/networld.c's `default: break;`): a server is trusted, and a
+ * console that dropped its session every time a newer server mentioned a
+ * feature it had not heard of would be unusable the moment the two versions
+ * drifted.
+ *
+ * That asymmetry has a consequence worth stating once, in the header both ends
+ * read: a new CLIENT->SERVER message can only ever be introduced by shipping
+ * the server first. v1.2.7 learned that the hard way — it sends CHUNK_SUB on
+ * its first loaded column, so it is kicked outright by any server older than
+ * v1.3.0, and the release had to be sequenced by hand.
+ *
+ * This message pair is built so that never happens again. The server volunteers
+ * INV_STATE; a client that has not received one keeps its inventory locally,
+ * exactly as it did before this feature existed, and never sends INV_ACTION.
+ * So an old server (which sends no INV_STATE) leaves a new client working, and
+ * an old client simply ignores an INV_STATE it was not expecting. Both
+ * directions are safe and the deployment order stops mattering. The cost is one
+ * unsolicited 50-byte packet per join to clients that will discard it, which is
+ * cheaper than another hand-sequenced release. */
 
 /* Why CHUNK_SUB exists at all, given WORLD_SYNC already replayed everything.
  *
@@ -341,5 +377,103 @@ static inline int32_t bs_col_of(int32_t block_coord) { return block_coord >> 4; 
  * silently half-parse it, so widening this later means a new message type, not
  * a bigger one. */
 #define BS_WORLD_INFO_BYTES (BS_APP_HDR_BYTES + 4u)                   /* 5 */
+
+/* ---- inventory ----------------------------------------------------------
+ *
+ * The client's own inventory shape (source/world/inventory.h), restated here
+ * for the same reason BS_CHUNK_DIM is: the moment a slot index travels on the
+ * wire, how many slots there are stops being either end's private choice.
+ * validate.h static-asserts these against the real headers wherever the client
+ * tree is present, the way it does for BS_BLOCK_COUNT — and that guard is only
+ * worth anything because the path bug that silently disabled it was fixed
+ * first (see game/Makefile's WORLD). */
+#define BS_INV_SLOT_COUNT   24u   /* mirrors INV_SLOT_COUNT   */
+#define BS_INV_HOTBAR_SLOTS  8u   /* mirrors INV_HOTBAR_SLOTS */
+#define BS_INV_STACK_MAX    99u   /* mirrors INV_STACK_MAX    */
+#define BS_RECIPE_COUNT      4u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+
+/* The operations a client may ask for. The first five are deliberately the
+ * same primitives world/inventory.h and world/crafting.h already expose, one
+ * to one, rather than a higher-level "the player dragged from here to there":
+ * the server has to run the exact merge/refuse rules the client's UI was
+ * written against, and the only way to be sure of that is to call the same
+ * functions with the same arguments. Anything the UI composes out of these
+ * stays composed on the UI side, where it already is. These five are also
+ * where this feature's server verification actually lives: MOVE/SWAP/SPLIT
+ * can only rearrange units the inventory already holds (no duplication),
+ * SELECT only changes which slot is in hand, and CRAFT can only succeed if
+ * craftMake() finds the real ingredient count already present — a client
+ * cannot conjure planks it never spent wood for.
+ *
+ * BS_INV_OP_PICKUP and BS_INV_OP_CONSUME, appended below, are a different
+ * kind of op: the client's *report* of what a block break or place just did
+ * to its own held items, taken on trust because the server has nothing to
+ * check it against — see their own comment for why that is permanent, not a
+ * gap. Read BS_INV_STATE_BYTES's own comment with that in mind: it is an
+ * authoritative record of what this server's inventory logic has done with
+ * what it was told, not proof that what it was told was true.
+ *
+ * Appended-only, like the block ids. An op byte the server does not recognise
+ * is refused (and answered with an unchanged INV_STATE), not kicked — unlike an
+ * unknown message *type*, an unknown op inside a known message is a bad
+ * argument, and the answer to a bad argument is "no, and here is the truth". */
+enum bs_inv_op {
+    BS_INV_OP_MOVE    = 0x00, /* a = src slot, b = dst slot, c = units       */
+    BS_INV_OP_SWAP    = 0x01, /* a = slot, b = slot, c unused                */
+    BS_INV_OP_SPLIT   = 0x02, /* a = slot, b = dst slot (must be empty)      */
+    BS_INV_OP_SELECT  = 0x03, /* a = hotbar slot to put in hand              */
+    BS_INV_OP_CRAFT   = 0x04, /* a = recipe index, < BS_RECIPE_COUNT         */
+
+    /* Appended, not inserted, for the same reason block ids are append-only
+     * (world/block.h) — an op byte is on the wire and in front of clients
+     * already running v1.x the day this ships.
+     *
+     * PICKUP and CONSUME are reported by the client, not verified by the
+     * server, and that is a deliberate, permanent property of this feature —
+     * not a gap awaiting a later patch. bsgame has no terrain generator (see
+     * bsgame.c's header comment: "terrain is deterministic... this process
+     * only ever ships the *diffs* players have made") and never will; a
+     * server-side check of "did you actually just mine wood at (x,y,z)" would
+     * require regenerating this world's terrain to know what stood there
+     * before the first diff, which is exactly the machinery that was never
+     * built and is not going to be. So the server cannot confirm a pickup or
+     * a consume against anything it owns, full stop — see the longer version
+     * of this reasoning at the BS_INV_OP_PICKUP/BS_INV_OP_CONSUME case in
+     * bsgame.c's handle_inv_action(), which is where it actually matters. */
+    BS_INV_OP_PICKUP  = 0x05, /* a = item id (< BS_BLOCK_COUNT), b = count
+                                * (1..BS_INV_STACK_MAX), c unused. The client
+                                * reports what a block break just put in its
+                                * hand.                                       */
+    BS_INV_OP_CONSUME = 0x06, /* a = item id (< BS_BLOCK_COUNT), b = count
+                                * (1..BS_INV_STACK_MAX), c unused. The client
+                                * reports what a placement just took out of
+                                * it.                                         */
+    BS_INV_OP_COUNT
+};
+
+/* INV_ACTION: the op, then three generic uint8 parameters. Three bytes rather
+ * than a per-op layout because every parameter any of these five operations
+ * takes is a slot index (0..23), a hotbar index (0..7), a unit count
+ * (0..99) or a recipe index (0..3) — all of which fit a byte with room to
+ * spare, and none of which is a coordinate. A fixed size means the parser
+ * rejects on length before it looks at the op, the same one-line admission
+ * check every other message here gets. Unused parameters MUST be sent as 0 so
+ * that a future op cannot find garbage in them. */
+#define BS_INV_ACTION_BYTES (BS_APP_HDR_BYTES + 1u + 3u)              /* 5 */
+
+/* INV_STATE: the selected hotbar slot, then every slot as (item, count).
+ *
+ * The whole inventory every time, not a delta. 50 bytes is smaller than the
+ * bookkeeping a reliable delta would need on an unordered, unacknowledged
+ * transport: a dropped delta leaves the console showing an inventory that no
+ * longer exists and nothing to notice it by, whereas a dropped snapshot is
+ * corrected by the next one. The same argument WORLD_INFO's comment makes
+ * about growing this later applies — a longer INV_STATE from a newer server
+ * must be rejectable on length alone, so widening it means a new message type.
+ *
+ * count is 0 if and only if item is 0 (BLOCK_AIR / ITEM_NONE); the client is
+ * entitled to treat any other pairing as a malformed packet and drop it. */
+#define BS_INV_STATE_BYTES \
+    (BS_APP_HDR_BYTES + 1u + BS_INV_SLOT_COUNT * 2u)                  /* 50 */
 
 #endif /* BS_PROTO_H */

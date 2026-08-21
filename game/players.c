@@ -33,6 +33,20 @@ BsPlayer *playerAlloc(BsPlayers *pl, uint32_t sid, const char *label, uint64_t n
          * from the memset above; joined_ms is the one field that needs an
          * explicit value, since "zero" is a real timestamp, not "unset". */
         p->joined_ms    = now_ms;
+
+        /* Explicit, even though the memset above already leaves p->inv as
+         * every slot { ITEM_NONE, 0 } and selected_hotbar 0 — which
+         * inventoryInit()'s own header comment confirms is exactly the valid
+         * empty state it produces. Calling it anyway means this file's
+         * correctness does not quietly depend on that fact staying true in a
+         * header three files away: if Inventory ever grows a field whose
+         * valid empty value is not zero, this line is what breaks (loudly, at
+         * the point that matters) instead of every fresh player silently
+         * starting from a struct nothing ever validated. bsgame.c's
+         * load_player_inventory() overwrites this again moments later for a
+         * returning player — this is only what a brand-new player, or one
+         * whose save could not be read, actually keeps. */
+        inventoryInit(&p->inv);
         return p;
     }
     return NULL;

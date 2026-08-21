@@ -176,6 +176,53 @@ static void send_chunk_unsub(uint32_t sid, int32_t cx, int32_t cz)
     send_app(sid, p, sizeof p);
 }
 
+static void send_inv_action(uint32_t sid, uint8_t op, uint8_t a, uint8_t b, uint8_t c)
+{
+    uint8_t p[BS_INV_ACTION_BYTES];
+    p[0] = BS_APP_INV_ACTION;
+    p[1] = op;
+    p[2] = a;
+    p[3] = b;
+    p[4] = c;
+    send_app(sid, p, sizeof p);
+}
+
+/* Reads slot `slot`'s (item, count) straight out of a raw BS_INV_STATE
+ * payload — deliberately hand-parsed from the wire bytes rather than by
+ * pulling in world/inventory.h's Inventory type, the same "this test only
+ * knows the wire format" stance the rest of this file takes toward every
+ * other message (block ids, coordinates, ...). `state` must be a buffer that
+ * has already been confirmed to be BS_INV_STATE_BYTES long with state[0] ==
+ * BS_APP_INV_STATE. */
+static void inv_state_slot(const uint8_t *state, unsigned slot, uint8_t *item, uint8_t *count)
+{
+    *item  = state[2u + slot * 2u];
+    *count = state[2u + slot * 2u + 1u];
+}
+
+/* True if every one of the BS_INV_SLOT_COUNT slots reads back { 0, 0 } —
+ * bs_proto.h's own comment on BS_APP_INV_STATE guarantees count is 0 iff
+ * item is 0, so checking both catches a server that ever violated that. */
+static bool inv_state_is_empty(const uint8_t *state)
+{
+    for (unsigned i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        if (state[2u + i * 2u] != 0 || state[2u + i * 2u + 1u] != 0) return false;
+    }
+    return true;
+}
+
+/* Total units of `item` held across every slot — the INV_STATE equivalent of
+ * world/inventory.h's inventoryCount(), for tests that care about a total
+ * rather than which slot(s) it landed in. */
+static uint32_t inv_state_total(const uint8_t *state, uint8_t item)
+{
+    uint32_t total = 0;
+    for (unsigned i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        if (state[2u + i * 2u] == item) total += state[2u + i * 2u + 1u];
+    }
+    return total;
+}
+
 /* Reads BS_GAME_DATA envelopes off the shared gate socket until one is
  * addressed to `sid`, and unwraps it — or -1 once `ms` has elapsed with no
  * match. Skips, rather than fails on, a DATA envelope for a different sid:
@@ -334,7 +381,7 @@ static void test_join_sends_world_info_then_sync(void)
      * client the sync is complete — that is the regression test for the bug
      * where `send_world_sync()` sent nothing at all when the diff store was
      * empty. */
-    uint8_t out[16];
+    uint8_t out[64];   /* was [16]; BS_INV_STATE_BYTES (50) is now the largest packet caught below */
     ssize_t n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "the first packet after JOIN is WORLD_INFO");
@@ -342,6 +389,22 @@ static void test_join_sends_world_info_then_sync(void)
         g_seen_seed = bs_get_u32(out + 1);
         check(g_seen_seed != 0, "WORLD_INFO carries a non-zero world seed");
     }
+
+    /* Immediately after WORLD_INFO, and still well before the legacy
+     * WORLD_SYNC below (which only fires once BS_CHUNK_LEGACY_GRACE_MS has
+     * passed), handle_join() now also sends an unprompted INV_STATE — the
+     * capability probe bs_proto.h's own comment above BS_APP_INV_STATE
+     * describes. This test predates that feature and only cares about the
+     * WORLD_INFO/WORLD_SYNC ordering, so the INV_STATE in between is read
+     * and given a light shape check here rather than a full one —
+     * test_inv_join_sends_empty_inv_state() is what actually exercises its
+     * contents. Without reading it here, the WORLD_SYNC wait below would
+     * catch this packet instead (recv_app_for filters by sid only, not by
+     * message type) and fail on a type/length mismatch that has nothing to
+     * do with what this test is checking. */
+    n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "JOIN's second packet is the new INV_STATE capability probe");
 
     n = recv_app_for(0xA11CE001u, out, sizeof out, BS_CHUNK_LEGACY_GRACE_MS + 400u);
     check(n == (ssize_t)BS_WORLD_SYNC_BYTES(0) && out[0] == BS_APP_WORLD_SYNC,
@@ -958,6 +1021,218 @@ static void test_malformed_chunk_sub_and_unsub_kick(void)
           "wrong-length CHUNK_UNSUB is KICKed");
 }
 
+/* ------------------------------------------------------------ V127-B: inventory
+ *
+ * Each scenario below joins its own fresh player rather than threading state
+ * through a shared one — inventory ops have no coordinate or column to
+ * collide with, unlike the block-edit tests above, so a self-contained join
+ * per test is simpler than tracking a shared session's running inventory
+ * across scenarios, and it means one failing assertion never leaves a later
+ * test starting from a state it didn't expect. Every sid below is a fresh
+ * one nothing earlier in this file has used. */
+
+static void test_inv_join_sends_empty_inv_state(void)
+{
+    puts("end-to-end: JOIN sends an INV_STATE for a brand-new player, and it is empty");
+    drain();
+
+    send_join(0xF2A50009u, "frank");
+
+    /* Same ordering as test_join_sends_world_info_then_sync: WORLD_INFO
+     * leads, unchanged by this feature. INV_STATE is the very next packet
+     * (handle_join sends it right after WORLD_INFO, before the legacy
+     * WORLD_SYNC, which only fires later from tick()'s grace-window
+     * fallback — see bsgame.c's handle_join). */
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A50009u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "the first packet after JOIN is still WORLD_INFO, unchanged by this feature");
+
+    n = recv_app_for(0xF2A50009u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "the second packet after JOIN is INV_STATE, the capability probe");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(out[1] == 0, "a brand-new player's selected hotbar slot is 0");
+        check(inv_state_is_empty(out), "a brand-new player's inventory is entirely empty slots");
+    }
+}
+
+static void test_inv_craft_without_ingredient_refused(void)
+{
+    puts("end-to-end: CRAFT with no ingredient in the inventory is refused, not applied");
+    drain();
+
+    send_join(0xF2A5000Au, "grace");
+    msleep(100);
+    drain();
+
+    /* Recipe 3 is RECIPE_WOOD_TO_PLANKS (world/crafting.c): 1 wood -> 4
+     * planks. grace has never picked up anything, so craftMake() must find
+     * zero wood and leave the inventory untouched. */
+    send_inv_action(0xF2A5000Au, BS_INV_OP_CRAFT, 3, 0, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A5000Au, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "a refused CRAFT is still answered with an INV_STATE");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_is_empty(out), "CRAFT with no wood produces no planks and changes nothing");
+    }
+}
+
+static void test_inv_pickup_then_craft_spends_wood(void)
+{
+    puts("end-to-end: CRAFT actually spends the ingredient - planks appear AND the wood is gone");
+    drain();
+
+    send_join(0xF2A5000Bu, "henry");
+    msleep(100);
+    drain();
+
+    /* Prime henry with exactly one wood via PICKUP (the client-reported op —
+     * see handle_inv_action's header comment in bsgame.c), not a block edit:
+     * this server has no terrain generator and never grants inventory from
+     * an accepted BLOCK_EDIT, so PICKUP is the only way a test (or a real
+     * client) gets an item into a fresh inventory. */
+    send_inv_action(0xF2A5000Bu, BS_INV_OP_PICKUP, 5 /* BLOCK_WOOD */, 1, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A5000Bu, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE
+          && inv_state_total(out, 5) == 1,
+          "the priming PICKUP credits exactly one wood");
+
+    send_inv_action(0xF2A5000Bu, BS_INV_OP_CRAFT, 3 /* RECIPE_WOOD_TO_PLANKS */, 0, 0);
+    n = recv_app_for(0xF2A5000Bu, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "CRAFT is answered with a fresh INV_STATE");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(out, 7 /* BLOCK_PLANKS */) == 4,
+              "the craft produced exactly 4 planks");
+        check(inv_state_total(out, 5 /* BLOCK_WOOD */) == 0,
+              "the one wood the craft consumed is entirely gone, not just decremented");
+    }
+}
+
+static void test_inv_pickup_credits_item(void)
+{
+    puts("end-to-end: PICKUP credits the reported item and count, landing in the first empty slot");
+    drain();
+
+    send_join(0xF2A5000Cu, "iris");
+    msleep(100);
+    drain();
+
+    send_inv_action(0xF2A5000Cu, BS_INV_OP_PICKUP, 2 /* BLOCK_DIRT */, 3, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A5000Cu, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "PICKUP is answered with a fresh INV_STATE");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        inv_state_slot(out, 0, &item, &count);
+        check(item == 2 && count == 3, "the picked-up item lands in slot 0 with the reported count");
+    }
+}
+
+static void test_inv_pickup_out_of_range_item_refused(void)
+{
+    puts("end-to-end: PICKUP with an item id past BS_BLOCK_COUNT is refused, not kicked");
+    drain();
+
+    send_join(0xF2A5000Du, "jack");
+    msleep(100);
+    drain();
+
+    send_inv_action(0xF2A5000Du, BS_INV_OP_PICKUP, (uint8_t)BS_BLOCK_COUNT, 1, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A5000Du, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "an out-of-range PICKUP still gets an INV_STATE back, not a KICK");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_is_empty(out), "the out-of-range item id was never applied");
+    }
+
+    /* Prove the session is still alive, not just that this one packet wasn't
+     * a KICK envelope: a genuinely refused-not-kicked player must go on
+     * answering ordinary requests afterward. */
+    send_inv_action(0xF2A5000Du, BS_INV_OP_PICKUP, 3 /* BLOCK_STONE */, 1, 0);
+    n = recv_app_for(0xF2A5000Du, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE && inv_state_total(out, 3) == 1,
+          "jack's session still answers a valid PICKUP after the refused one");
+}
+
+static void test_inv_consume_of_unheld_item_removes_nothing(void)
+{
+    puts("end-to-end: CONSUME of an item the player does not hold removes nothing");
+    drain();
+
+    send_join(0xF2A5000Eu, "karen");
+    msleep(100);
+    drain();
+
+    send_inv_action(0xF2A5000Eu, BS_INV_OP_CONSUME, 5 /* BLOCK_WOOD */, 1, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A5000Eu, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "CONSUME is answered with an INV_STATE even when it removes nothing");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_is_empty(out), "an empty inventory stays empty — no slot goes negative or wraps");
+    }
+}
+
+static void test_inv_action_wrong_length_refused_not_kicked(void)
+{
+    puts("end-to-end: a wrong-length INV_ACTION is refused, not KICKed, and the session keeps working");
+    drain();
+
+    send_join(0xF2A5000Fu, "leo");
+    msleep(100);
+    drain();
+
+    uint8_t junk[3] = { BS_APP_INV_ACTION, 0, 0 };   /* far short of BS_INV_ACTION_BYTES */
+    send_app(0xF2A5000Fu, junk, sizeof junk);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A5000Fu, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "a wrong-length INV_ACTION is answered with an unchanged INV_STATE, not a KICK");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_is_empty(out), "the malformed payload changed nothing");
+    }
+
+    send_inv_action(0xF2A5000Fu, BS_INV_OP_PICKUP, 1 /* BLOCK_GRASS */, 2, 0);
+    n = recv_app_for(0xF2A5000Fu, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE && inv_state_total(out, 1) == 2,
+          "leo's session still answers a valid action after the wrong-length one");
+}
+
+static void test_inv_action_out_of_range_slot_refused_not_kicked(void)
+{
+    puts("end-to-end: an out-of-range slot index in MOVE is refused, not KICKed");
+    drain();
+
+    send_join(0xF2A50010u, "mike");
+    msleep(100);
+    drain();
+
+    /* 250 is well past INV_SLOT_COUNT (24) on both ends of the move. */
+    send_inv_action(0xF2A50010u, BS_INV_OP_MOVE, 250, 250, 1);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A50010u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "an out-of-range MOVE is answered with an unchanged INV_STATE, not a KICK");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_is_empty(out), "the out-of-range MOVE changed nothing");
+    }
+
+    check(kill(g_daemon, 0) == 0, "daemon survives an out-of-range INV_ACTION argument");
+}
+
 /* ------------------------------------------------------------------- main */
 
 static void reap_daemon(void)
@@ -1019,6 +1294,15 @@ int main(void)
     test_chunk_edit_broadcast_is_scoped_to_subscribers();
     test_chunk_unsub_stops_future_column_edits();
     test_malformed_chunk_sub_and_unsub_kick();
+
+    test_inv_join_sends_empty_inv_state();
+    test_inv_craft_without_ingredient_refused();
+    test_inv_pickup_then_craft_spends_wood();
+    test_inv_pickup_credits_item();
+    test_inv_pickup_out_of_range_item_refused();
+    test_inv_consume_of_unheld_item_removes_nothing();
+    test_inv_action_wrong_length_refused_not_kicked();
+    test_inv_action_out_of_range_slot_refused_not_kicked();
 
     stop_daemon();
 

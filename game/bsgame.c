@@ -41,6 +41,18 @@
 #include "players.h"
 #include "validate.h"
 
+/* Vendored, byte-identical copies of the client's own <3ds.h>-free
+ * inventory/crafting logic — see game/world/'s vendoring note in
+ * game/Makefile and players.h. Unlike world/block.h and world/world.h (which
+ * validate.c reaches conditionally, via -I$(WORLD), only when the client tree
+ * sits beside this repo — see validate.c), these are always present in this
+ * repo and included unconditionally: bsgame runs inventoryMoveUnits,
+ * craftMake and friends as part of its own authoritative game state, not as
+ * a build-time drift check, so they cannot be optional the way a
+ * compile-time assert is. */
+#include "world/crafting.h"
+#include "world/inventory.h"
+
 /* Gate<->game framing. Not shared via a header because it is not part of
  * the wire protocol proper (see bs_proto.h's own header comment) — it is a
  * local IPC convention between two processes on the same box. Duplicated
@@ -111,6 +123,14 @@ struct bs_game {
      * not bound by sun_path's 108-byte cap. */
     char     status_path[512];
     uint64_t started_ms;
+
+    /* The --state-dir argument itself, kept verbatim (world_seed_load and
+     * diffstoreOpen below are handed it directly as a local and never store
+     * it). player_inv_dir() needs it at arbitrary points after startup — on
+     * every JOIN and after every inventory-changing message — not just once
+     * during setup, so unlike status_path it is kept as the raw directory
+     * rather than a single derived file path. */
+    char state_dir[456];
 
     /* Lifetime counters, for the status snapshot only — reading them here
      * changes no behaviour. Incremented at the existing accept/reject sites
@@ -452,6 +472,126 @@ static void send_world_info(struct bs_game *g, uint32_t sid)
     send_data(g, sid, payload, sizeof payload);
 }
 
+/* --------------------------------------------------------------- inventory
+ *
+ * Per-player inventories persist at <state-dir>/players/<sanitised label>/
+ * inventory.dat, using inventorySave()/inventoryLoad() exactly as they are
+ * (see world/inventory.h's own "Save / load" section) — a directory per
+ * player, the way block_diffs.bin is a file per world, both under the same
+ * operator-controlled --state-dir root.
+ */
+
+/* mkdir() that treats "already exists" as success, not failure — every
+ * caller below calls this on a path that may legitimately already be there
+ * (a returning player, a server that already made players/ for someone
+ * else), and only a *different* kind of failure (no permission, not a
+ * directory, disk full) is worth logging. */
+static bool ensure_dir(const char *path)
+{
+    if (mkdir(path, 0700) == 0) return true;
+    return errno == EEXIST;
+}
+
+/* Resolves to <state-dir>/players/<sanitised label>/, creating both path
+ * components if missing, and writes it into `out`. False only on a path or
+ * mkdir failure, in which case `out` is not meaningfully defined and the
+ * caller must not use it.
+ *
+ * `label` reaches here from bsgate's allowlist via JOIN (handle_join below) —
+ * authenticated (bsgate already checked the session's key against the
+ * allowlist) but not TRUSTED, the same distinction bsgame.c's own header
+ * comment draws for every other byte a session sends. An operator can name an
+ * allowlist entry almost anything up to BS_GAME_LABEL_MAX bytes, and that
+ * string is about to become a directory component on disk. Every byte
+ * outside [A-Za-z0-9_-] is replaced with '_' rather than the join being
+ * refused outright: an ordinary label ("alice", "bob-2") is untouched by this
+ * loop and needs no special case, while a label containing "/", ".." or a
+ * leading "." can now never walk out of players/ or collide with a dotfile,
+ * because none of those bytes can survive into `safe` unescaped. Escaping
+ * instead of rejecting also means a stray or unusual character in an
+ * operator's chosen label degrades to "a slightly different folder name"
+ * rather than "this player can never join". */
+static bool player_inv_dir(const struct bs_game *g, const char *label, char *out, size_t outcap)
+{
+    char safe[BS_GAME_LABEL_MAX];
+    size_t j = 0;
+    for (size_t i = 0; label[i] != '\0' && j + 1 < sizeof safe; i++) {
+        unsigned char c = (unsigned char)label[i];
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        safe[j++] = ok ? (char)c : '_';
+    }
+    safe[j] = '\0';
+    if (j == 0) snprintf(safe, sizeof safe, "_");   /* never an empty path component */
+
+    char players_dir[492];
+    if (!path_set(players_dir, sizeof players_dir, "%s/players", g->state_dir)) return false;
+    if (!ensure_dir(players_dir)) {
+        logf_("game: cannot create %s: %s", players_dir, strerror(errno));
+        return false;
+    }
+
+    if (!path_set(out, outcap, "%s/%s", players_dir, safe)) return false;
+    if (!ensure_dir(out)) {
+        logf_("game: cannot create %s: %s", out, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Loads `p`'s inventory from disk, or leaves it as the empty inventory
+ * playerAlloc()'s inventoryInit() call already left it as — a first-time
+ * join and an unresolvable directory degrade to exactly the same thing
+ * inventoryLoad() itself would do for a missing/corrupt file (see
+ * world/inventory.h), so there is no separate error path to invent here. */
+static void load_player_inventory(struct bs_game *g, BsPlayer *p)
+{
+    char dir[512];
+    if (!player_inv_dir(g, p->label, dir, sizeof dir)) {
+        logf_("game: %s: cannot resolve inventory directory, starting empty", p->label);
+        return;
+    }
+    inventoryLoad(&p->inv, dir);   /* always leaves *inv valid; see world/inventory.h */
+}
+
+/* Saves `p`'s current inventory to disk. Failure is logged, not propagated —
+ * the same stance diffstoreApply() takes on a persist failure: the in-memory
+ * state (and everything already sent to the client about it) stays correct
+ * for the running session regardless of whether the write landed, and a
+ * player is never kicked or refused an action over a disk problem that is
+ * not theirs. */
+static void save_player_inventory(struct bs_game *g, const BsPlayer *p)
+{
+    char dir[512];
+    if (!player_inv_dir(g, p->label, dir, sizeof dir)) {
+        logf_("game: %s: cannot resolve inventory directory, change not persisted", p->label);
+        return;
+    }
+    if (!inventorySave(&p->inv, dir)) {
+        logf_("game: %s: failed to save inventory to %s", p->label, dir);
+    }
+}
+
+/* The whole of `inv`, wire-encoded — see bs_proto.h's BS_APP_INV_STATE
+ * comment for why this is always the full 50 bytes and never a delta. Sent
+ * unprompted once at JOIN (handle_join) and again after every
+ * BS_APP_INV_ACTION this player sends, whether it was applied or refused
+ * (handle_inv_action) — the refused case is what lets a rejected action
+ * resync the client instead of leaving it holding a guess. */
+static void send_inv_state(struct bs_game *g, uint32_t sid, const Inventory *inv)
+{
+    uint8_t payload[BS_INV_STATE_BYTES];
+    payload[0] = BS_APP_INV_STATE;
+    payload[1] = inv->selected_hotbar;
+
+    for (int i = 0; i < INV_SLOT_COUNT; i++) {
+        payload[2 + i * 2]     = inv->slots[i].item;
+        payload[2 + i * 2 + 1] = inv->slots[i].count;
+    }
+
+    send_data(g, sid, payload, sizeof payload);
+}
+
 static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, size_t len,
                         uint64_t now)
 {
@@ -506,6 +646,17 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
      * is a safe way to tell a pre-V127-A client apart from a modern one
      * without a capability bit the fixed wire format has no room for. */
     send_world_info(g, sid);
+
+    /* AFTER send_world_info, not before — WORLD_INFO's own comment above
+     * covers why it must lead. INV_STATE has no such ordering requirement
+     * against WORLD_INFO (an inventory slot is not a coordinate into
+     * anything), but it is still the capability probe bs_proto.h's comment
+     * on BS_APP_INV_STATE describes: an old client that has never heard of
+     * this message type ignores it (net/networld.c's `default: break;`) and
+     * keeps its inventory exactly as local as it always was, while a new
+     * client learns from receiving it that INV_ACTION is safe to send. */
+    load_player_inventory(g, p);
+    send_inv_state(g, sid, &p->inv);
 }
 
 static void handle_leave(struct bs_game *g, uint32_t sid)
@@ -621,6 +772,112 @@ static void handle_chunk_unsub(struct bs_game *g, BsPlayer *p, const uint8_t *ms
     playerSubRemove(p, cx, cz);
 }
 
+/* One requested inventory or crafting operation from an already-joined
+ * player. See proto/bs_proto.h's own comment above enum bs_inv_op for the
+ * trust split this function enforces: MOVE/SWAP/SPLIT/SELECT/CRAFT are
+ * checked against p->inv, the inventory this server actually owns, so none
+ * of them can manufacture units the player did not already have — CRAFT in
+ * particular can only succeed by spending a real, present ingredient count,
+ * because craftMake() attempts the whole recipe on its own scratch copy and
+ * only commits it back if that succeeds (world/crafting.h). PICKUP and
+ * CONSUME are not verified at all: they are the client's own report of what
+ * a block break or a placement just did to its held items, applied here
+ * exactly as told. That is a deliberate, permanent gap, not an oversight —
+ * bsgame has no terrain generator (see this file's header comment: terrain
+ * is deterministic, and this process only ever ships the diffs players have
+ * made) and never will, so it has no way to know what block actually stood
+ * at the coordinate a break or place just touched, and therefore no way to
+ * check a PICKUP/CONSUME report against anything but itself. This grants a
+ * modified client nothing handle_block_edit() did not already grant it —
+ * that function is untouched by this feature and exactly as
+ * client-authoritative as it always was — just in inventory-count form
+ * instead of world-block form. So an INV_STATE this server sends back is an
+ * honest record of what its own inventory logic did with what it was told,
+ * never a claim that what it was told was itself true; nobody downstream
+ * should read it as more than that.
+ *
+ * A malformed payload (wrong length) or a bad argument (unknown op, an
+ * out-of-range slot/hotbar/recipe/item index, a count outside
+ * 1..BS_INV_STACK_MAX, or a "must be zero" parameter that is not) is
+ * refused, not kicked: unlike handle_app_payload's own dispatch (which kicks
+ * on a message *type* it does not recognise, because that is a client not
+ * speaking the protocol it claims to), a bad argument inside a message type
+ * the server does understand is an ordinary wrong answer — bs_proto.h's own
+ * comment above enum bs_inv_op states this stance for an unrecognised op
+ * specifically; it is extended here to every other way this payload can be
+ * malformed, so a single momentary desync (a dropped ACK, a stale UI still
+ * showing an old op table) costs the player a resync, never a session. */
+static void handle_inv_action(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
+{
+    if (len != BS_INV_ACTION_BYTES) {
+        send_inv_state(g, p->sid, &p->inv);
+        return;
+    }
+
+    uint8_t op = msg[1];
+    uint8_t a  = msg[2];
+    uint8_t b  = msg[3];
+    uint8_t c  = msg[4];
+    bool changed = false;
+
+    switch (op) {
+    case BS_INV_OP_MOVE:
+        if (a < INV_SLOT_COUNT && b < INV_SLOT_COUNT) {
+            changed = inventoryMoveUnits(&p->inv, a, b, c) > 0;
+        }
+        break;
+
+    case BS_INV_OP_SWAP:
+        if (a < INV_SLOT_COUNT && b < INV_SLOT_COUNT) {
+            inventorySwapSlots(&p->inv, a, b);
+            changed = true;
+        }
+        break;
+
+    case BS_INV_OP_SPLIT:
+        if (a < INV_SLOT_COUNT && b < INV_SLOT_COUNT) {
+            changed = inventorySplitStack(&p->inv, a, b);
+        }
+        break;
+
+    case BS_INV_OP_SELECT:
+        if (a < INV_HOTBAR_SLOTS) {
+            inventorySelectHotbar(&p->inv, a);
+            changed = true;
+        }
+        break;
+
+    case BS_INV_OP_CRAFT:
+        if (a < RECIPE_COUNT) {
+            changed = craftMake(&p->inv, a);
+        }
+        break;
+
+    /* Taken on trust — see this function's header comment. */
+    case BS_INV_OP_PICKUP:
+        if (a < BS_BLOCK_COUNT && b >= 1 && b <= BS_INV_STACK_MAX && c == 0) {
+            changed = inventoryAdd(&p->inv, a, b, NULL) != INV_ADD_REFUSED;
+        }
+        break;
+
+    case BS_INV_OP_CONSUME:
+        if (a < BS_BLOCK_COUNT && b >= 1 && b <= BS_INV_STACK_MAX && c == 0) {
+            changed = inventoryRemove(&p->inv, a, b) > 0;
+        }
+        break;
+
+    default:
+        /* Unknown op: refused, answered with an unchanged INV_STATE, not
+         * kicked — see bs_proto.h's comment above enum bs_inv_op. */
+        break;
+    }
+
+    if (changed) {
+        save_player_inventory(g, p);
+    }
+    send_inv_state(g, p->sid, &p->inv);
+}
+
 /* One accepted application payload from an already-joined player. Anything
  * structurally wrong here — a type this build does not know, or a length
  * that does not match its type — is treated as a protocol violation from a
@@ -654,6 +911,9 @@ static void handle_app_payload(struct bs_game *g, uint32_t sid, const uint8_t *b
         break;
     case BS_APP_CHUNK_UNSUB:
         handle_chunk_unsub(g, p, body, len);
+        break;
+    case BS_APP_INV_ACTION:
+        handle_inv_action(g, p, body, len);
         break;
     default:
         send_kick(g, sid, "unknown application message type");
@@ -876,6 +1136,10 @@ int main(int argc, char **argv)
     if (!path_set(g.status_path, sizeof g.status_path, "%s/status.txt", state_dir)) {
         logf_("game: --state-dir is too long for the status file path (max %zu)",
               sizeof g.status_path - 1);
+        return 1;
+    }
+    if (!path_set(g.state_dir, sizeof g.state_dir, "%s", state_dir)) {
+        logf_("game: --state-dir is too long (max %zu)", sizeof g.state_dir - 1);
         return 1;
     }
 

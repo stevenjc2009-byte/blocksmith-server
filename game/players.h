@@ -13,6 +13,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Vendored, byte-identical copy of the client's own <3ds.h>-free inventory
+ * struct — see game/world/'s header comment and game/Makefile's drift guard.
+ * BsPlayer holds a whole Inventory (not a pointer) for the same reason it
+ * already holds x/y/z/yaw/pitch by value: a fixed-size table of
+ * BS_GAME_MAX_PLAYERS players with no per-player allocation to manage. */
+#include "world/inventory.h"
+
 /* Mirrors bsgate's BS_MAX_SESSIONS (server/gateway/bsgate.c). Duplicated
  * rather than shared because it isn't part of the wire protocol — it is
  * just the largest number of concurrent sids the gate can ever hand us, and
@@ -63,6 +70,13 @@ typedef struct {
 
     uint16_t edit_tokens;   /* scaled by BS_EDIT_SCALE */
     uint64_t edit_last_ms;
+
+    /* This player's authoritative inventory — see proto/bs_proto.h's
+     * BS_APP_INV_STATE/BS_APP_INV_ACTION comment for what "authoritative"
+     * does and does not mean here. Loaded from <state-dir>/players/<label>/
+     * at JOIN and saved back after anything that changes it; see bsgame.c's
+     * load_player_inventory()/save_player_inventory(). */
+    Inventory inv;
 
     /* V127-A per-column diff subscriptions. `joined_ms` is set once, at
      * JOIN, and never touched again — unlike last_seen_ms it must NOT move

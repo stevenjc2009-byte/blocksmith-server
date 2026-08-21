@@ -14,3 +14,14 @@ Makefile    text eol=lf
 *.service   text eol=lf
 tools/*     text eol=lf
 VERSION     text eol=lf
+
+# Exception, and it has to come last so it wins over the *.c / *.h rules above:
+# game/world/ is a verbatim copy of the client's source/world/ (see game/Makefile's
+# header), and game/Makefile's drift guard compares the two trees with `cmp -s` —
+# bytes, not lines. The client repo pins `* -text`, so source/world/block.h is stored
+# with CRLF endings; normalising the copy here to LF would make `cmp -s` disagree on
+# every byte of every line ending the moment either repo is freshly checked out, and
+# the guard would fail a build that has no actual drift in it. Storing these verbatim
+# is what keeps the guard measuring the thing it is meant to measure. Nothing in this
+# directory is executed as a script, so no shebang can be broken by a CR.
+game/world/** -text
