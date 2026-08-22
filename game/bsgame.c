@@ -38,6 +38,7 @@
 
 #include "../proto/bs_proto.h"
 #include "diffstore.h"
+#include "playerstate.h"
 #include "players.h"
 #include "validate.h"
 
@@ -592,6 +593,93 @@ static void send_inv_state(struct bs_game *g, uint32_t sid, const Inventory *inv
     send_data(g, sid, payload, sizeof payload);
 }
 
+/* ----------------------------------------------------------- player state
+ *
+ * Per-player state beyond the inventory — pose, armour, XP and meters —
+ * persists at <state-dir>/players/<sanitised label>/player.dat, a sibling
+ * of inventory.dat in the very same per-player directory (player_inv_dir()
+ * below is reused verbatim, label sanitisation included). Persistence is
+ * write-through on every state-changing event, the same policy the two
+ * stores beside it already use: block_diffs.bin appends+fsyncs inside
+ * diffstoreApply() the moment an edit is accepted, and inventory.dat is
+ * rewritten by save_player_inventory() after every changed INV_ACTION.
+ * There is no periodic flusher for either, so there is none here either:
+ * a PLAYER_REPORT saves immediately, and LEAVE performs one final save
+ * merging the live pose in. Pose-only movement never writes by itself —
+ * POS_UPDATE arrives at wire frequency and would turn into disk churn —
+ * so a hard crash can lose pose deltas since the last persist point,
+ * exactly the class of bounded loss diffstore already tolerates with its
+ * torn-tail discard. */
+
+/* Loads `p`'s saved state from player.dat. `p->state` ends up valid either
+ * way; what distinguishes "restored" from "fresh spawn" is both the return
+ * value and `state_dirty`, which doubles as that record: a valid load sets
+ * it so the leave-save below rewrites the file (merging whatever fresher
+ * pose this session produced) instead of leaving it frozen mid-session. */
+static bool load_player_state(struct bs_game *g, BsPlayer *p)
+{
+    char dir[512];
+    if (!player_inv_dir(g, p->label, dir, sizeof dir)) {
+        logf_("game: %s: cannot resolve player directory, starting fresh", p->label);
+        return false;
+    }
+    bool found = playerStateLoad(&p->state, dir);
+    if (found) {
+        logf_("game: %s: restored player state from %s", p->label, dir);
+    }
+    p->state_dirty = found;
+    return found;
+}
+
+/* Saves `p`'s current state to disk, merging the live pose in at write time
+ * rather than keeping a second pose channel in sync: x/y/z/yaw/pitch keep
+ * arriving via POS_UPDATE exactly as they always did, and only a real
+ * persist event copies them across. Failure is logged, not propagated —
+ * the same stance save_player_inventory() takes, for the same reason: a
+ * disk problem that is not the player's doing must not cost them their
+ * session. */
+static void save_player_state(struct bs_game *g, const BsPlayer *p)
+{
+    BsPlayerState snapshot = p->state;
+    if (p->has_pos) {
+        snapshot.x     = p->x;
+        snapshot.y     = p->y;
+        snapshot.z     = p->z;
+        snapshot.yaw   = p->yaw;
+        snapshot.pitch = p->pitch;
+        snapshot.has_pose = true;
+    }
+
+    char dir[512];
+    if (!player_inv_dir(g, p->label, dir, sizeof dir)) {
+        logf_("game: %s: cannot resolve player directory, change not persisted", p->label);
+        return;
+    }
+    if (!playerStateSave(&snapshot, dir)) {
+        logf_("game: %s: failed to save player state to %s", p->label, dir);
+    }
+}
+
+/* The whole of the player's state, wire-encoded — see bs_proto.h's
+ * BS_APP_PLAYER_STATE comment for why this is volunteered once at JOIN even
+ * when nothing is saved: the all-zero flags=0 packet is how the client
+ * tells "fresh spawn" apart from packet loss. `ext_valid` is true exactly
+ * when a usable player.dat was loaded for this join; the pose flag follows
+ * the loaded state itself. */
+static void send_player_state(struct bs_game *g, uint32_t sid,
+                              const BsPlayer *p, bool ext_valid)
+{
+    unsigned flags = 0;
+    if (p->state.has_pose) flags |= BS_PLAYER_STATE_FLAG_POSE;
+    if (ext_valid)         flags |= BS_PLAYER_STATE_FLAG_EXT;
+
+    uint8_t payload[BS_PLAYER_STATE_BYTES];
+    payload[0] = BS_APP_PLAYER_STATE;
+    playerStateEncodeBody(payload + 1, &p->state, flags);
+
+    send_data(g, sid, payload, sizeof payload);
+}
+
 static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, size_t len,
                         uint64_t now)
 {
@@ -657,6 +745,16 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
      * client learns from receiving it that INV_ACTION is safe to send. */
     load_player_inventory(g, p);
     send_inv_state(g, sid, &p->inv);
+
+    /* PLAYER_STATE rides right behind INV_STATE and works the same way:
+     * volunteered once per join (bs_proto.h's BS_APP_PLAYER_STATE comment),
+     * ignored harmlessly by any client that predates it, and the gate that
+     * tells a new client PLAYER_REPORT is safe to send. It always goes out
+     * even when nothing is saved — a zeroed flags=0 packet is the fresh-
+     * spawn marker, deliberately distinguishable from a packet that was
+     * simply lost. */
+    bool state_restored = load_player_state(g, p);
+    send_player_state(g, sid, p, state_restored);
 }
 
 static void handle_leave(struct bs_game *g, uint32_t sid)
@@ -664,6 +762,14 @@ static void handle_leave(struct bs_game *g, uint32_t sid)
     BsPlayer *p = playerBySid(&g->players, sid);
     if (p == NULL) return;
     logf_("game: %s left (sid %08x)", p->label, sid);
+
+    /* Final persist before the slot is wiped — this is what carries a
+     * session's pose home for a player whose last PLAYER_REPORT predates
+     * their latest movement. Only ever reached for a clean LEAVE; a crash
+     * or a hard kill skips it, which is precisely why the write-through on
+     * every report exists beside it (see the player-state section above). */
+    if (p->state_dirty) save_player_state(g, p);
+
     playerFree(p);
 }
 
@@ -878,6 +984,35 @@ static void handle_inv_action(struct bs_game *g, BsPlayer *p, const uint8_t *msg
     send_inv_state(g, p->sid, &p->inv);
 }
 
+/* The client's report of its own armour, XP and meters (BS_APP_PLAYER_REPORT,
+ * proto/bs_proto.h). Taken on trust for the same reason and in the same
+ * terms as INV_ACTION's PICKUP/CONSUME ops above: this server has no
+ * simulation of hunger, damage or experience to check a report against — it
+ * is the store, not the referee, and the values only ever flow back to the
+ * same client at its next join. playerStateApplyMeters() still sanitises
+ * every field into its documented range, so a hostile or buggy reporter can
+ * corrupt nothing but its own record.
+ *
+ * A wrong-length payload is KICKed, matching what every other known-type
+ * wrong length gets here except INV_ACTION: BLOCK_EDIT, POS_UPDATE,
+ * CHUNK_SUB and CHUNK_UNSUB all treat "right type, wrong length" as a
+ * protocol violation from a client not speaking the format it claims to.
+ * INV_ACTION alone refuses-and-resyncs because an INV_STATE reply is its
+ * built-in correction; PLAYER_REPORT has no reply message, so there is
+ * nothing to resync with and the majority rule applies. */
+static void handle_player_report(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
+{
+    if (len != BS_PLAYER_REPORT_BYTES) {
+        send_kick(g, p->sid, "malformed PLAYER_REPORT");
+        playerFree(p);
+        return;
+    }
+
+    playerStateApplyMeters(&p->state, msg + 1);
+    p->state_dirty = true;
+    save_player_state(g, p);   /* write-through now — see the section comment */
+}
+
 /* One accepted application payload from an already-joined player. Anything
  * structurally wrong here — a type this build does not know, or a length
  * that does not match its type — is treated as a protocol violation from a
@@ -914,6 +1049,9 @@ static void handle_app_payload(struct bs_game *g, uint32_t sid, const uint8_t *b
         break;
     case BS_APP_INV_ACTION:
         handle_inv_action(g, p, body, len);
+        break;
+    case BS_APP_PLAYER_REPORT:
+        handle_player_report(g, p, body, len);
         break;
     default:
         send_kick(g, sid, "unknown application message type");

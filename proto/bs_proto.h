@@ -254,9 +254,24 @@ enum bs_app_msg {
                                * at JOIN and again after anything that could
                                * have changed it. See the note below on why the
                                * server speaks first.                         */
-    BS_APP_INV_ACTION = 0x09  /* C->S: one requested inventory or crafting
+    BS_APP_INV_ACTION = 0x09, /* C->S: one requested inventory or crafting
                                * operation. Never sent until an INV_STATE has
                                * arrived — that is the capability probe.      */
+
+    BS_APP_PLAYER_STATE  = 0x0A, /* S->C only: the whole of this player's saved
+                                  * state beyond the inventory — pose, armour,
+                                  * XP and meters. Sent unprompted once, right
+                                  * after JOIN's INV_STATE, for the same reason
+                                  * INV_STATE is volunteered (see its comment
+                                  * and the sizes section below).               */
+    BS_APP_PLAYER_REPORT = 0x0B  /* C->S: the client's report of its own armour,
+                                  * XP and meters. Never sent until a
+                                  * PLAYER_STATE has arrived — same capability
+                                  * probe pattern as INV_ACTION. A server that
+                                  * never speaks PLAYER_STATE therefore never
+                                  * hears PLAYER_REPORT, which is what makes
+                                  * this pair deployment-order-safe like the
+                                  * inventory one above.                        */
 };
 
 /* Why INV_STATE is sent unprompted, and why the client must never open with
@@ -475,5 +490,84 @@ enum bs_inv_op {
  * entitled to treat any other pairing as a malformed packet and drop it. */
 #define BS_INV_STATE_BYTES \
     (BS_APP_HDR_BYTES + 1u + BS_INV_SLOT_COUNT * 2u)                  /* 50 */
+
+/* ---- player state -------------------------------------------------------
+ *
+ * PLAYER_STATE/PLAYER_REPORT carry everything worth persisting about a
+ * player beyond the inventory: where they stood (pose), what they were
+ * wearing (armour) and their meters (XP level/progress, health, hunger).
+ *
+ * The same deployment-order argument bs_proto.h makes for INV_STATE/
+ * INV_ACTION applies here unchanged, and for the same reason: bsgame kicks
+ * an unknown C->S message type while the client merely ignores an unknown
+ * S->C one, so a new client->server message must be gated on first seeing
+ * its server->client counterpart. The server volunteers PLAYER_STATE at
+ * JOIN — always, even for a brand-new player with nothing saved (a
+ * well-formed all-zero packet with no valid-state flags, so "fresh spawn"
+ * is distinguishable from a lost packet); a client that has not received
+ * one never sends PLAYER_REPORT; an old client ignores PLAYER_STATE
+ * entirely. Old server/new client and new server/old client are both safe,
+ * exactly as for the inventory pair.
+ *
+ * The server does NOT answer a PLAYER_REPORT — it is fire-and-forget, like
+ * every other C->S message on this unordered transport, and self-corrects
+ * at the next join's PLAYER_STATE snapshot rather than needing an ack.
+ * A peer that never sends reports is tolerated without ceremony: the
+ * server just keeps whatever it last had on disk.
+ *
+ * Widening either message later means a NEW type, not a bigger one — same
+ * rule as WORLD_INFO above: a client that meets a longer state message
+ * from a newer peer must be able to reject it on length alone rather than
+ * silently half-parse it.
+ */
+
+/* Flags carried in PLAYER_STATE's second byte. Zero means "nothing saved
+ * for this player yet" — the fresh-spawn marker. */
+#define BS_PLAYER_STATE_FLAG_POSE 0x01u   /* pose fields are meaningful     */
+#define BS_PLAYER_STATE_FLAG_EXT  0x02u   /* armour/meters are meaningful   */
+
+/* Armour slot order everywhere below: head, chest, legs, feet. Each slot is
+ * an { item id, count } pair, items drawn from the same id space as the
+ * inventory's (a block id — see bs_proto.h's inventory section). */
+#define BS_ARMOR_SLOTS 4u
+
+/* PLAYER_STATE: flags, then pose (5 x f32), then the armour+meters block.
+ *
+ *   u8  type (0x0A)
+ *   u8  flags                          BS_PLAYER_STATE_FLAG_*
+ *   f32 x, y, z, yaw, pitch            (20 bytes)
+ *   u8  armor[4][2]                    head/chest/legs/feet, {item, count}
+ *   u32 xp_level
+ *   f32 xp_progress                    0..1 through the current level
+ *   f32 health                         0..20
+ *   f32 hunger                         0..20
+ */
+#define BS_PLAYER_STATE_BYTES \
+    (BS_APP_HDR_BYTES + 1u + 4u * 5u + BS_ARMOR_SLOTS * 2u \
+     + 4u + 4u + 4u + 4u)                                             /* 46 */
+
+/* PLAYER_REPORT: the client's own armour+meters, the exact same block
+ * PLAYER_STATE carries after its pose — same field order, same encodings,
+ * so one decoder serves both messages.
+ *
+ *   u8  type (0x0B)
+ *   u8  armor[4][2]
+ *   u32 xp_level
+ *   f32 xp_progress
+ *   f32 health
+ *   f32 hunger
+ *   u8  reserved[5]                    MUST be sent as zero; ignored on receipt
+ *
+ * The five reserved tail bytes keep this message a fixed 30 bytes as
+ * specified, the same way BS_BLOCK_EDIT's disk record reserves trailing
+ * zero bytes (game/diffstore.c): room to grow without ever redefining what
+ * an existing peer may send, since any future use of them would still have
+ * to arrive as a new message type under the widening rule above. A report
+ * whose length is not exactly BS_PLAYER_REPORT_BYTES is malformed and is
+ * treated like any other known-type wrong-length payload.
+ */
+#define BS_PLAYER_METERS_BYTES (BS_ARMOR_SLOTS * 2u + 4u + 4u + 4u + 4u)  /* 24 */
+#define BS_PLAYER_REPORT_BYTES \
+    (BS_APP_HDR_BYTES + BS_PLAYER_METERS_BYTES + 5u)                  /* 30 */
 
 #endif /* BS_PROTO_H */

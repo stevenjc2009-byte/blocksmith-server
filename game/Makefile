@@ -79,7 +79,7 @@ LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 # guard covers it even though it never becomes an object file.
 WORLD_OBJS := world/inventory.o world/crafting.o world/crc32.o
 
-OBJS := bsgame.o diffstore.o players.o validate.o $(WORLD_OBJS)
+OBJS := bsgame.o diffstore.o playerstate.o players.o validate.o $(WORLD_OBJS)
 
 .PHONY: all test clean install-check check-world-drift
 
@@ -91,7 +91,7 @@ all: check-world-drift bsgame
 bsgame: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
-bsgame_test: bsgame_test.o diffstore.o players.o validate.o $(WORLD_OBJS)
+bsgame_test: bsgame_test.o diffstore.o playerstate.o players.o validate.o $(WORLD_OBJS)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 test: check-world-drift all bsgame_test

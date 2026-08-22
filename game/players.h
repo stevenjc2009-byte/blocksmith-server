@@ -20,6 +20,8 @@
  * BS_GAME_MAX_PLAYERS players with no per-player allocation to manage. */
 #include "world/inventory.h"
 
+#include "playerstate.h"
+
 /* Mirrors bsgate's BS_MAX_SESSIONS (server/gateway/bsgate.c). Duplicated
  * rather than shared because it isn't part of the wire protocol — it is
  * just the largest number of concurrent sids the gate can ever hand us, and
@@ -77,6 +79,22 @@ typedef struct {
      * at JOIN and saved back after anything that changes it; see bsgame.c's
      * load_player_inventory()/save_player_inventory(). */
     Inventory inv;
+
+    /* Persistent state beyond the inventory (pose, armour, XP, meters) —
+     * the in-memory mirror of what player.dat holds, loaded at JOIN beside
+     * the inventory and written back by the same persistence events; see
+     * playerstate.h and bsgame.c's load_player_state()/save_player_state().
+     * The pose fields here are NOT the live pose: x/y/z/yaw/pitch above stay
+     * the live ones POS_UPDATE feeds, merged into `state` only when a save
+     * actually happens. */
+    BsPlayerState state;
+
+    /* True while disk is behind memory for `state`: set when JOIN loaded a
+     * valid save (so a later leave can merge fresher pose back over it) and
+     * set again by every PLAYER_REPORT. Only this flag ever triggers a
+     * write — a player with nothing saved who never reports must not get a
+     * file created merely for showing up. */
+    bool state_dirty;
 
     /* V127-A per-column diff subscriptions. `joined_ms` is set once, at
      * JOIN, and never touched again — unlike last_seen_ms it must NOT move

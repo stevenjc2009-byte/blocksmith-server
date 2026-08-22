@@ -406,6 +406,18 @@ static void test_join_sends_world_info_then_sync(void)
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
           "JOIN's second packet is the new INV_STATE capability probe");
 
+    /* And now PLAYER_STATE rides third, right behind INV_STATE — volunteered
+     * once per join exactly as its proto comment describes. As with the
+     * INV_STATE above, this test only cares that the packet is there and
+     * does not disturb the ordering it predates; the fresh-spawn contents
+     * get their own dedicated scenario further down
+     * (test_ps_join_fresh_sends_zeroed_state). Without consuming it here the
+     * legacy-WORLD_SYNC wait below would catch it instead and fail on a
+     * type mismatch unrelated to what this test checks. */
+    n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
+          "JOIN's third packet is the PLAYER_STATE capability probe");
+
     n = recv_app_for(0xA11CE001u, out, sizeof out, BS_CHUNK_LEGACY_GRACE_MS + 400u);
     check(n == (ssize_t)BS_WORLD_SYNC_BYTES(0) && out[0] == BS_APP_WORLD_SYNC,
           "a fresh, zero-diff world still sends one legacy-path WORLD_SYNC packet");
@@ -1233,6 +1245,294 @@ static void test_inv_action_out_of_range_slot_refused_not_kicked(void)
     check(kill(g_daemon, 0) == 0, "daemon survives an out-of-range INV_ACTION argument");
 }
 
+/* --------------------------------------------------- player state persistence
+ *
+ * Same self-contained-join discipline as the inventory section above: every
+ * scenario uses a fresh sid and label nothing earlier touches, so one
+ * failing assertion cannot leave later tests standing on a state they did
+ * not expect. Labels below are all already-sanitised shapes ([a-z0-9]), so
+ * the on-disk path players/<label>/player.dat can be built directly.
+ *
+ * The daemon is restarted mid-suite here (SIGTERM + relaunch on the same
+ * --state-dir), exactly like test_restart_persists_diffs does for the diff
+ * store — that is the whole point being tested: state survives it. */
+
+/* Joins and consumes the full three-packet welcome sequence — WORLD_INFO,
+ * INV_STATE, PLAYER_STATE — asserting the PLAYER_STATE carries the fresh-
+ * spawn marker: flags byte 0 and an entirely zeroed body. */
+static void join_expect_fresh_player_state(uint32_t sid, const char *label)
+{
+    send_join(sid, label);
+
+    uint8_t out[128];
+    ssize_t n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "WORLD_INFO still leads the join sequence");
+    n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "INV_STATE still comes second in the join sequence");
+
+    n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
+          "PLAYER_STATE arrives third, well-formed");
+    if (n != (ssize_t)BS_PLAYER_STATE_BYTES) return;
+
+    check(out[1] == 0, "fresh-spawn PLAYER_STATE carries flags 0");
+    bool all_zero = true;
+    for (unsigned i = 1; i < BS_PLAYER_STATE_BYTES; i++) {
+        if (out[i] != 0) all_zero = false;
+    }
+    check(all_zero, "fresh-spawn PLAYER_STATE body is entirely zeroed");
+}
+
+static bool player_dat_exists(const char *label)
+{
+    char path[256];
+    snprintf(path, sizeof path, "%s/players/%s/player.dat", g_dir, label);
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* True if a KICK envelope addressed to `sid` arrives within `ms`, skipping
+ * DATA envelopes for anyone. Used as a negative assertion: a tolerated peer
+ * must never draw one. */
+static bool kicked_within(uint32_t sid, unsigned ms)
+{
+    uint64_t deadline = now_ms() + ms;
+    for (;;) {
+        uint64_t now = now_ms();
+        if (now >= deadline) return false;
+
+        uint8_t buf[2048];
+        ssize_t n = gate_recv(buf, sizeof buf, (unsigned)(deadline - now));
+        if (n < 5) return false;   /* timeout elapsed */
+        if (buf[0] == BS_GAME_KICK && bs_get_u32(buf + 1) == sid) return true;
+        /* anything else: keep waiting out the window */
+    }
+}
+
+static void send_player_report(uint32_t sid, const uint8_t armor[8],
+                               uint32_t xp_level, float xp_progress,
+                               float health, float hunger)
+{
+    uint8_t p[BS_PLAYER_REPORT_BYTES];
+    memset(p, 0, sizeof p);   /* reserved tail MUST be zero — bs_proto.h */
+    p[0] = BS_APP_PLAYER_REPORT;
+    memcpy(p + 1, armor, 8);
+    bs_put_u32(p + 9, xp_level);
+    bs_put_f32(p + 13, xp_progress);
+    bs_put_f32(p + 17, health);
+    bs_put_f32(p + 21, hunger);
+    send_app(sid, p, sizeof p);
+}
+
+/* Reads a PLAYER_STATE addressed to `sid` and returns its decoded fields
+ * through the out-params; false if none arrives in time or the packet is
+ * not the right shape. Deliberately hand-parsed from raw wire bytes like
+ * every other message in this file. */
+static bool recv_player_state_fields(uint32_t sid, unsigned ms,
+                                     uint8_t *flags_out,
+                                     float *x_out, float *y_out, float *z_out,
+                                     float *yaw_out, float *pitch_out,
+                                     uint8_t armor_out[8],
+                                     uint32_t *xp_level_out,
+                                     float *xp_progress_out,
+                                     float *health_out, float *hunger_out)
+{
+    uint8_t out[128];
+    ssize_t n = recv_app_for(sid, out, sizeof out, ms);
+    if (n != (ssize_t)BS_PLAYER_STATE_BYTES || out[0] != BS_APP_PLAYER_STATE) return false;
+
+    *flags_out      = out[1];
+    *x_out          = bs_get_f32(out + 2);
+    *y_out          = bs_get_f32(out + 6);
+    *z_out          = bs_get_f32(out + 10);
+    *yaw_out        = bs_get_f32(out + 14);
+    *pitch_out      = bs_get_f32(out + 18);
+    memcpy(armor_out, out + 22, 8);
+    *xp_level_out   = bs_get_u32(out + 30);
+    *xp_progress_out= bs_get_f32(out + 34);
+    *health_out     = bs_get_f32(out + 38);
+    *hunger_out     = bs_get_f32(out + 42);
+    return true;
+}
+
+static void test_ps_join_fresh_sends_zeroed_state(void)
+{
+    puts("end-to-end: JOIN for a brand-new label sends PLAYER_STATE flags=0 and writes no file");
+    drain();
+
+    join_expect_fresh_player_state(0x50A00001u, "psa");
+
+    check(!player_dat_exists("psa"),
+          "JOIN alone never creates player.dat — only a report or a prior save does");
+}
+
+static void test_ps_report_persists_across_sigterm_restart(void)
+{
+    puts("end-to-end: pose merged at save time plus PLAYER_REPORT values survive SIGTERM restart");
+    drain();
+
+    /* First join: prove this label starts fresh, then feed the server both
+     * halves of what a save should hold — live pose via POS_UPDATE (the
+     * existing channel) and meters via PLAYER_REPORT. The save happens
+     * write-through inside the report handler, so the SIGTERM below needs
+     * no clean shutdown flush to be honest. */
+    join_expect_fresh_player_state(0x50A00002u, "psb");
+
+    send_pos_update(0x50A00002u, 11.5f, 64.0f, -7.25f, 135.0f, -35.0f);
+    const uint8_t armor[8] = { 5, 1, 0, 0, 0, 0, 0, 0 };   /* head {item 5 x1} */
+    send_player_report(0x50A00002u, armor, 7u, 0.25f, 13.5f, 8.25f);
+    msleep(150);   /* let the daemon process both datagrams */
+
+    stop_daemon();
+    start_daemon();
+    if (!wait_ready(5000)) { fprintf(stderr, "test: restarted daemon never became ready\n"); exit(1); }
+    drain();
+
+    send_join(0x50A00003u, "psb");   /* same label, brand-new session */
+
+    uint8_t out[128];
+    ssize_t n = recv_app_for(0x50A00003u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "restarted daemon still opens with WORLD_INFO");
+    n = recv_app_for(0x50A00003u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "INV_STATE unchanged by player-state restore");
+
+    uint8_t flags = 0xff, armor_back[8];
+    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, prog = 0, hp = 0, hunger = 0;
+    uint32_t xp_level = 0;
+    bool got = recv_player_state_fields(0x50A00003u, 500, &flags,
+                                        &x, &y, &z, &yaw, &pitch, armor_back,
+                                        &xp_level, &prog, &hp, &hunger);
+    check(got, "rejoin after restart gets a well-formed PLAYER_STATE");
+    if (!got) return;
+
+    check(flags == (BS_PLAYER_STATE_FLAG_POSE | BS_PLAYER_STATE_FLAG_EXT),
+          "restored snapshot sets both valid flags, not just one");
+    check(x == 11.5f && y == 64.0f && z == -7.25f,
+          "pose persisted from POS_UPDATE, exact coordinates back");
+    check(yaw == 135.0f && pitch == -35.0f,
+          "yaw/pitch survive the round trip — rotation is really restored");
+    check(armor_back[0] == 5 && armor_back[1] == 1
+          && armor_back[2] == 0 && armor_back[3] == 0
+          && armor_back[4] == 0 && armor_back[5] == 0
+          && armor_back[6] == 0 && armor_back[7] == 0,
+          "armour slots come back exactly as reported");
+    check(xp_level == 7u, "xp level survives");
+    check(prog == 0.25f && hp == 13.5f && hunger == 8.25f,
+          "xp progress, health and hunger come back exact");
+}
+
+static void test_ps_corrupt_and_truncated_dat_degrade_to_fresh_spawn(void)
+{
+    puts("on-disk format: corrupt or truncated player.dat degrades to fresh spawn, never fatal");
+
+    char dir[256], path[512];
+    snprintf(dir, sizeof dir, "%s/players/psc", g_dir);
+    mkdir(dir, 0700);   /* EEXIST fine — mirrors ensure_dir()'s tolerance */
+    snprintf(path, sizeof path, "%s/player.dat", dir);
+
+    /* Case 1: right length, wrong everything else. */
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) die("write garbage player.dat");
+    for (unsigned i = 0; i < 65; i++) fputc('X', f);
+    fclose(f);
+
+    drain();
+    join_expect_fresh_player_state(0x50A00004u, "psc");
+    send_leave(0x50A00004u);
+    msleep(100);
+
+    /* Case 2: plausible header prefix but cut off mid-payload — the shape a
+     * torn write would leave if the tmp-promotion recovery ever lost. The
+     * leave above must NOT have rewritten the file (nothing was loaded), so
+     * this truncation lands on top of case 1's garbage deliberately. */
+    f = fopen(path, "wb");
+    if (f == NULL) die("write truncated player.dat");
+    uint8_t buf[30];   /* 20-byte header + half the payload */
+    memset(buf, 0, sizeof buf);
+    bs_put_u32(buf + 0, 0x31505342u /* 'BSP1' */);
+    bs_put_u32(buf + 4, 1u);
+    bs_put_u32(buf + 8, BS_PLAYER_STATE_BODY_BYTES);
+    bool wrote = fwrite(buf, 1, sizeof buf, f) == sizeof buf;
+    fclose(f);
+    if (!wrote) die("short write on truncated player.dat");
+
+    join_expect_fresh_player_state(0x50A00005u, "psc");
+    send_leave(0x50A00005u);
+    msleep(100);
+
+    check(player_dat_exists("psc"), "the corrupt file is left in place, not deleted speculatively");
+    struct stat st;
+    check(stat(path, &st) == 0 && st.st_size == (off_t)sizeof buf,
+          "and it was not silently replaced by a fresh save either");
+}
+
+static void test_ps_old_client_never_reports_writes_no_file(void)
+{
+    puts("end-to-end: an old-style client joins, moves, leaves — never kicked, no file written");
+    drain();
+
+    /* An old client predating this feature ignores PLAYER_STATE entirely and
+     * never sends PLAYER_REPORT. It still moves via POS_UPDATE, which today
+     * updates only the live pose — none of it may spill into a file for a
+     * label that has never had one. */
+    join_expect_fresh_player_state(0x50A00006u, "psd");
+
+    send_pos_update(0x50A00006u, 3.0f, 70.0f, 4.0f, 90.0f, 0.0f);
+    msleep(150);
+    check(!kicked_within(0x50A00006u, 300),
+          "moving without ever reporting draws no KICK");
+
+    send_leave(0x50A00006u);
+    msleep(150);
+    check(!kicked_within(0x50A00006u, 300),
+          "leaving without ever reporting draws no KICK");
+    check(!player_dat_exists("psd"),
+          "no player.dat appears for a session that never saved anything");
+}
+
+static void test_ps_report_wrong_length_kicks(void)
+{
+    puts("end-to-end: wrong-length PLAYER_REPORT (31 B / 45 B) gets KICKed, not just dropped");
+    drain();
+
+    /* Known type, wrong length — the same protocol-violation treatment
+     * BLOCK_EDIT/POS_UPDATE/CHUNK_SUB get for it (see handle_player_report's
+     * header comment for why INV_ACTION's refuse-and-resync exception does
+     * not extend here). Both near-miss lengths are tried: one over and one
+     * well past BS_PLAYER_REPORT_BYTES (30). */
+    send_join(0x50A00007u, "pse");
+    msleep(100);
+    drain();
+
+    uint8_t junk[31];
+    memset(junk, 2, sizeof junk);
+    junk[0] = BS_APP_PLAYER_REPORT;
+    send_app(0x50A00007u, junk, sizeof junk);
+
+    uint8_t kbuf[64];
+    ssize_t n = gate_recv(kbuf, sizeof kbuf, 500);
+    check(n == 5 && kbuf[0] == BS_GAME_KICK && bs_get_u32(kbuf + 1) == 0x50A00007u,
+          "a 31-byte PLAYER_REPORT is KICKed");
+
+    send_join(0x50A00008u, "pes");
+    msleep(100);
+    drain();
+
+    uint8_t junk45[45];
+    memset(junk45, 3, sizeof junk45);
+    junk45[0] = BS_APP_PLAYER_REPORT;
+    send_app(0x50A00008u, junk45, sizeof junk45);
+
+    n = gate_recv(kbuf, sizeof kbuf, 500);
+    check(n == 5 && kbuf[0] == BS_GAME_KICK && bs_get_u32(kbuf + 1) == 0x50A00008u,
+          "a 45-byte PLAYER_REPORT is KICKed too");
+    check(kill(g_daemon, 0) == 0, "daemon survives both wrong-length reports");
+}
+
 /* ------------------------------------------------------------------- main */
 
 static void reap_daemon(void)
@@ -1303,6 +1603,12 @@ int main(void)
     test_inv_consume_of_unheld_item_removes_nothing();
     test_inv_action_wrong_length_refused_not_kicked();
     test_inv_action_out_of_range_slot_refused_not_kicked();
+
+    test_ps_join_fresh_sends_zeroed_state();
+    test_ps_report_persists_across_sigterm_restart();
+    test_ps_corrupt_and_truncated_dat_degrade_to_fresh_spawn();
+    test_ps_old_client_never_reports_writes_no_file();
+    test_ps_report_wrong_length_kicks();
 
     stop_daemon();
 
