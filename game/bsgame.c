@@ -41,6 +41,7 @@
 #include "playerstate.h"
 #include "players.h"
 #include "validate.h"
+#include "world/registry.h"
 
 /* Vendored, byte-identical copies of the client's own <3ds.h>-free
  * inventory/crafting logic — see game/world/'s vendoring note in
@@ -473,6 +474,76 @@ static void send_world_info(struct bs_game *g, uint32_t sid)
     send_data(g, sid, payload, sizeof payload);
 }
 
+/* Tells one player the fingerprint of this server's block registry: layout
+ * revision, defined-row count and the CRC-16 over the canonical table stream.
+ * Sent immediately after WORLD_INFO at join (handle_join below) — a client
+ * whose compiled-in table hashes identically is done on the spot, and one
+ * that does not match answers with REGISTRY_FETCH, which only ever arrives
+ * because this packet was seen (bs_proto.h's capability-probe note). */
+static void send_registry_info(struct bs_game *g, uint32_t sid)
+{
+    uint8_t payload[BS_APP_REGISTRY_INFO_BYTES];
+    payload[0] = BS_APP_REGISTRY_INFO;
+    payload[1] = REGISTRY_REV;
+    payload[2] = registryCount();
+    bs_put_u16(payload + 3, registryCrc16());
+    send_data(g, sid, payload, sizeof payload);
+}
+
+/* Answers one REGISTRY_FETCH with every dynamic def from `first` up, in
+ * consecutive DEFS batches that each fit one BS_MAX_PAYLOAD packet
+ * (BS_APP_REGISTRY_DEFS_MAX_N records), last=1 on the final batch. An empty
+ * final batch is still sent when there is nothing to say — it is what tells
+ * the client the fetch terminated rather than stalled.
+ *
+ * Both ends derive dynamic ids the same way (lowest free first), so the
+ * client validates each batch against its own next-free slot; this side just
+ * streams its table id-ascending and lets that check catch any disagreement. */
+static void handle_registry_fetch(struct bs_game *g, BsPlayer *p,
+                                  const uint8_t *msg, size_t len)
+{
+    if (len != BS_APP_REGISTRY_FETCH_BYTES) {
+        send_kick(g, p->sid, "malformed REGISTRY_FETCH");
+        playerFree(p);
+        return;
+    }
+
+    const uint8_t first = msg[1];
+    if (first < REG_ID_DYN_LO || first > REG_ID_DYN_HI) {
+        send_kick(g, p->sid, "REGISTRY_FETCH out of range");
+        playerFree(p);
+        return;
+    }
+
+    uint8_t pkt[BS_APP_HDR_BYTES + 3u +
+                BS_APP_REGISTRY_DEFS_MAX_N * REGISTRY_WIRE_RECORD_BYTES];
+    size_t      n = 0;
+    uint8_t     batch_first = first;
+
+    for (int id = first; id <= REG_ID_DYN_HI; id++) {
+        if (!registryIsDefined((BlockId)id)) continue;
+        if (n == 0) batch_first = (uint8_t)id;
+        registryDefPack(pkt + BS_APP_HDR_BYTES + 3u +
+                            (size_t)n * REGISTRY_WIRE_RECORD_BYTES,
+                        (BlockId)id, registryGet((BlockId)id));
+        n++;
+        if (n < BS_APP_REGISTRY_DEFS_MAX_N) continue;
+        pkt[0] = BS_APP_REGISTRY_DEFS;
+        pkt[1] = batch_first;
+        pkt[2] = (uint8_t)n;
+        pkt[3] = 0;   /* more batches follow */
+        send_data(g, p->sid, pkt, BS_APP_REGISTRY_DEFS_BYTES(n));
+        n = 0;
+    }
+
+    /* The terminating batch, empty or not. */
+    pkt[0] = BS_APP_REGISTRY_DEFS;
+    pkt[1] = batch_first;
+    pkt[2] = (uint8_t)n;
+    pkt[3] = 1;       /* last */
+    send_data(g, p->sid, pkt, BS_APP_REGISTRY_DEFS_BYTES(n));
+}
+
 /* --------------------------------------------------------------- inventory
  *
  * Per-player inventories persist at <state-dir>/players/<sanitised label>/
@@ -734,6 +805,16 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
      * is a safe way to tell a pre-V127-A client apart from a modern one
      * without a capability bit the fixed wire format has no room for. */
     send_world_info(g, sid);
+
+    /* REGISTRY_INFO rides right behind WORLD_INFO and before anything that
+     * could put a block id on the wire — the join order world_info ->
+     * registry_info -> inv_state -> player_state is load-bearing (v1.6.0
+     * Phase A): a client must be able to apply registry definitions before
+     * it generates or meshes a single server column, and this is the same
+     * ordering slot WORLD_INFO already owns. Volunteered, never requested:
+     * an old client ignores it harmlessly, and only a client that has seen
+     * it may answer with REGISTRY_FETCH. */
+    send_registry_info(g, sid);
 
     /* AFTER send_world_info, not before — WORLD_INFO's own comment above
      * covers why it must lead. INV_STATE has no such ordering requirement
@@ -1053,6 +1134,9 @@ static void handle_app_payload(struct bs_game *g, uint32_t sid, const uint8_t *b
     case BS_APP_PLAYER_REPORT:
         handle_player_report(g, p, body, len);
         break;
+    case BS_APP_REGISTRY_FETCH:
+        handle_registry_fetch(g, p, body, len);
+        break;
     default:
         send_kick(g, sid, "unknown application message type");
         playerFree(p);
@@ -1295,6 +1379,34 @@ int main(int argc, char **argv)
         return 1;
     }
     logf_("game: %u block diff(s) loaded from %s", diffstoreCount(&g.diffs), state_dir);
+
+    /* v1.6.0 Phase A: the block registry is canonical server state — core
+     * rows compiled in, dynamic rows restored from <state-dir>/registry.bin
+     * — and it must be settled BEFORE any join can be accepted, because the
+     * INFO a joining client compares against goes out within milliseconds of
+     * its first packet. A false load means "no file yet" (a fresh state dir)
+     * or an unreadable one; either way the table stays core-only, which is
+     * exactly what an empty file would have said. Frozen immediately after:
+     * nothing registers at runtime in this phase, and post-freeze reads need
+     * no locks. */
+    registryInitCore();
+    char reg_path[512];
+    if (path_set(reg_path, sizeof reg_path, "%s/registry.bin", state_dir)) {
+        if (registrySidecarLoad(reg_path)) {
+            /* registryCount() counts every defined row (air + core + dyn);
+             * the dynamic share is whatever sits in the dyn id range. */
+            unsigned total = registryCount();
+            unsigned dyn   = 0;
+            for (unsigned id = (unsigned)REG_ID_DYN_LO;
+                 id <= (unsigned)REG_ID_DYN_HI; id++) {
+                if (registryIsDefined((BlockId)id)) dyn++;
+            }
+            logf_("game: %u block def(s) loaded (%u dynamic) from %s",
+                  total, dyn, reg_path);
+        } else
+            logf_("game: no registry.bin loaded from %s (core table only)", state_dir);
+    }
+    registryFreeze();
 
     if (!unix_bind(&g, g.game_sock_path)) {
         diffstoreClose(&g.diffs);

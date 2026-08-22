@@ -29,6 +29,7 @@
 #include "../proto/bs_proto.h"
 #include "players.h"   /* BS_EDIT_BURST / BS_EDIT_REFILL_MS, for the rate-limit ceiling */
 #include "validate.h"  /* BS_BLOCK_COUNT, for the highest-legal-block-id boundary test */
+#include "world/registry.h" /* v1.6.0: mirror the daemon's table in-process */
 
 enum bs_game_msg { BS_GAME_JOIN = 1, BS_GAME_DATA = 2, BS_GAME_LEAVE = 3, BS_GAME_KICK = 4 };
 
@@ -359,6 +360,28 @@ static bool wait_ready(unsigned timeout_ms)
  * the *same* world across restarts. 0 means "not seen yet". */
 static uint32_t g_seen_seed = 0;
 
+/* Reads one BS_APP_REGISTRY_INFO packet addressed to `sid` and shape-checks
+ * it against THIS process's own registry (daemon and test binary link the
+ * same world/registry.c, so rev/count/crc16 must agree exactly — which also
+ * makes every comparison here a cross-process crc-stability proof). Tests
+ * that load extra dynamic defs into this process (see the FETCH batching
+ * scenario below) must mirror them locally first or these checks go red. */
+static bool recv_registry_info(uint32_t sid, unsigned ms)
+{
+    uint8_t out[64];
+    ssize_t n = recv_app_for(sid, out, sizeof out, ms);
+    if (n != (ssize_t)BS_APP_REGISTRY_INFO_BYTES || out[0] != BS_APP_REGISTRY_INFO) {
+        return false;
+    }
+    check(out[1] == REGISTRY_REV,
+          "REGISTRY_INFO carries the current table revision");
+    check(out[2] == registryCount(),
+          "REGISTRY_INFO count matches the linked-in table");
+    check(bs_get_u16(out + 3) == registryCrc16(),
+          "REGISTRY_INFO crc16 matches the linked-in table");
+    return true;
+}
+
 static void test_join_sends_world_info_then_sync(void)
 {
     puts("end-to-end: join gets WORLD_INFO first, then a WORLD_SYNC");
@@ -390,9 +413,16 @@ static void test_join_sends_world_info_then_sync(void)
         check(g_seen_seed != 0, "WORLD_INFO carries a non-zero world seed");
     }
 
-    /* Immediately after WORLD_INFO, and still well before the legacy
+    /* Immediately after WORLD_INFO comes REGISTRY_INFO (v1.6.0 Phase A):
+     * handle_join sends it before anything else that refers to block ids so
+     * the client can reconcile its table before terrain arrives. The helper
+     * validates rev/count/crc16 against this process's own table. */
+    bool got_reg = recv_registry_info(0xA11CE001u, 500);
+    check(got_reg, "REGISTRY_INFO arrives second, between WORLD_INFO and INV_STATE");
+
+    /* Right behind REGISTRY_INFO, and still well before the legacy
      * WORLD_SYNC below (which only fires once BS_CHUNK_LEGACY_GRACE_MS has
-     * passed), handle_join() now also sends an unprompted INV_STATE — the
+     * passed), handle_join() also sends an unprompted INV_STATE — the
      * capability probe bs_proto.h's own comment above BS_APP_INV_STATE
      * describes. This test predates that feature and only cares about the
      * WORLD_INFO/WORLD_SYNC ordering, so the INV_STATE in between is read
@@ -404,9 +434,9 @@ static void test_join_sends_world_info_then_sync(void)
      * do with what this test is checking. */
     n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
-          "JOIN's second packet is the new INV_STATE capability probe");
+          "JOIN's third packet is the INV_STATE capability probe");
 
-    /* And now PLAYER_STATE rides third, right behind INV_STATE — volunteered
+    /* And now PLAYER_STATE rides fourth, right behind INV_STATE — volunteered
      * once per join exactly as its proto comment describes. As with the
      * INV_STATE above, this test only cares that the packet is there and
      * does not disturb the ordering it predates; the fresh-spawn contents
@@ -416,7 +446,7 @@ static void test_join_sends_world_info_then_sync(void)
      * type mismatch unrelated to what this test checks. */
     n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
     check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
-          "JOIN's third packet is the PLAYER_STATE capability probe");
+          "JOIN's fourth packet is the PLAYER_STATE capability probe");
 
     n = recv_app_for(0xA11CE001u, out, sizeof out, BS_CHUNK_LEGACY_GRACE_MS + 400u);
     check(n == (ssize_t)BS_WORLD_SYNC_BYTES(0) && out[0] == BS_APP_WORLD_SYNC,
@@ -1051,18 +1081,21 @@ static void test_inv_join_sends_empty_inv_state(void)
     send_join(0xF2A50009u, "frank");
 
     /* Same ordering as test_join_sends_world_info_then_sync: WORLD_INFO
-     * leads, unchanged by this feature. INV_STATE is the very next packet
-     * (handle_join sends it right after WORLD_INFO, before the legacy
-     * WORLD_SYNC, which only fires later from tick()'s grace-window
-     * fallback — see bsgame.c's handle_join). */
+     * leads, unchanged by this feature. REGISTRY_INFO follows it (v1.6.0),
+     * and INV_STATE comes right after that — handle_join sends it before
+     * the legacy WORLD_SYNC, which only fires later from tick()'s
+     * grace-window fallback (see bsgame.c's handle_join). */
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A50009u, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "the first packet after JOIN is still WORLD_INFO, unchanged by this feature");
 
+    bool got_reg = recv_registry_info(0xF2A50009u, 500);
+    check(got_reg, "REGISTRY_INFO arrives second, between WORLD_INFO and INV_STATE");
+
     n = recv_app_for(0xF2A50009u, out, sizeof out, 500);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
-          "the second packet after JOIN is INV_STATE, the capability probe");
+          "the third packet after JOIN is INV_STATE, the capability probe");
     if (n == (ssize_t)BS_INV_STATE_BYTES) {
         check(out[1] == 0, "a brand-new player's selected hotbar slot is 0");
         check(inv_state_is_empty(out), "a brand-new player's inventory is entirely empty slots");
@@ -1257,9 +1290,9 @@ static void test_inv_action_out_of_range_slot_refused_not_kicked(void)
  * --state-dir), exactly like test_restart_persists_diffs does for the diff
  * store — that is the whole point being tested: state survives it. */
 
-/* Joins and consumes the full three-packet welcome sequence — WORLD_INFO,
- * INV_STATE, PLAYER_STATE — asserting the PLAYER_STATE carries the fresh-
- * spawn marker: flags byte 0 and an entirely zeroed body. */
+/* Joins and consumes the full four-packet welcome sequence — WORLD_INFO,
+ * REGISTRY_INFO, INV_STATE, PLAYER_STATE — asserting the PLAYER_STATE
+ * carries the fresh-spawn marker: flags byte 0 and an entirely zeroed body. */
 static void join_expect_fresh_player_state(uint32_t sid, const char *label)
 {
     send_join(sid, label);
@@ -1268,13 +1301,16 @@ static void join_expect_fresh_player_state(uint32_t sid, const char *label)
     ssize_t n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "WORLD_INFO still leads the join sequence");
+    bool got_reg = recv_registry_info(sid, 500);
+    check(got_reg, "REGISTRY_INFO arrives second, between WORLD_INFO and INV_STATE");
+
     n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
-          "INV_STATE still comes second in the join sequence");
+          "INV_STATE still comes third in the join sequence");
 
     n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
-          "PLAYER_STATE arrives third, well-formed");
+          "PLAYER_STATE arrives fourth, well-formed");
     if (n != (ssize_t)BS_PLAYER_STATE_BYTES) return;
 
     check(out[1] == 0, "fresh-spawn PLAYER_STATE carries flags 0");
@@ -1396,6 +1432,8 @@ static void test_ps_report_persists_across_sigterm_restart(void)
     ssize_t n = recv_app_for(0x50A00003u, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "restarted daemon still opens with WORLD_INFO");
+    bool got_reg = recv_registry_info(0x50A00003u, 500);
+    check(got_reg, "REGISTRY_INFO still arrives second after a restart");
     n = recv_app_for(0x50A00003u, out, sizeof out, 500);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
           "INV_STATE unchanged by player-state restore");
@@ -1533,6 +1571,156 @@ static void test_ps_report_wrong_length_kicks(void)
     check(kill(g_daemon, 0) == 0, "daemon survives both wrong-length reports");
 }
 
+/* ------------------------------------------------- registry sync (v1.6.0 Phase A)
+ *
+ * Placed last on purpose: the batching scenario below rewrites
+ * <state_dir>/registry.bin and restarts the daemon on it, which would change
+ * what every later join's REGISTRY_INFO advertises. Everything above this
+ * point therefore runs against the core-only table. */
+
+static void send_registry_fetch(uint32_t sid, uint8_t first_index)
+{
+    uint8_t p[BS_APP_REGISTRY_FETCH_BYTES];
+    p[0] = BS_APP_REGISTRY_FETCH;
+    p[1] = first_index;
+    send_app(sid, p, sizeof p);
+}
+
+/* Consumes the four-packet welcome sequence for a fresh sid, asserting the
+ * v1.6.0 order WORLD_INFO -> REGISTRY_INFO -> INV_STATE -> PLAYER_STATE with
+ * the INFO fully validated by recv_registry_info(). */
+static void join_expect_registry_sequence(uint32_t sid, const char *label)
+{
+    send_join(sid, label);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "registry probe: WORLD_INFO leads");
+    bool got_reg = recv_registry_info(sid, 500);
+    check(got_reg, "registry probe: REGISTRY_INFO arrives second");
+    n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "registry probe: INV_STATE third");
+    n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
+          "registry probe: PLAYER_STATE fourth");
+}
+
+/* FETCH is a C->S message no client has ever sent before this suite — the
+ * capability-probe discipline says an old server would KICK for it, so this
+ * also proves the new type is really wired into the dispatch, not just
+ * defined in bs_proto.h. On a core-only table the honest answer is exactly
+ * one empty batch flagged LAST. */
+static void test_registry_fetch_empty_reply(void)
+{
+    puts("end-to-end: FETCH over a core-only table answers one empty LAST-flagged DEFS");
+    drain();
+
+    join_expect_registry_sequence(0x9E670001u, "reggie");
+
+    send_registry_fetch(0x9E670001u, REG_ID_DYN_LO);
+
+    uint8_t defs[BS_APP_REGISTRY_DEFS_BYTES(BS_APP_REGISTRY_DEFS_MAX_N)];
+    ssize_t n = recv_app_for(0x9E670001u, defs, sizeof defs, 500);
+    check(n == (ssize_t)BS_APP_REGISTRY_DEFS_BYTES(0)
+          && defs[0] == BS_APP_REGISTRY_DEFS
+          && defs[1] == REG_ID_DYN_LO && defs[2] == 0 && defs[3] == 1,
+          "FETCH over a core-only table answers exactly one empty LAST-flagged DEFS");
+}
+
+/* Writes <state_dir>/registry.bin holding 40 dummy dynamic rows, restarts the
+ * daemon so it boots from that bin, then walks the whole FETCH exchange:
+ * 40 rows must come back as two DEFS packets (36 + 4) with the LAST flag only
+ * on the second. This is simultaneously the cross-process crc proof — the
+ * daemon computes its crc16 inside its own process from the bin it loaded,
+ * while this process rebuilds the identical table through world/registry.c
+ * and recv_registry_info() compares the two byte-for-byte. */
+static void test_registry_fetch_batches_over_36_defs(void)
+{
+    puts("end-to-end: 40 dynamic defs round-trip as two DEFS batches with matching crc16");
+
+    /* Build the exact table the daemon will boot with, here first. */
+    registryInitCore();
+    static uint8_t recs[40][REGISTRY_WIRE_RECORD_BYTES];
+    for (unsigned i = 0; i < 40; i++) {
+        BlockDef d;
+        memset(&d, 0, sizeof d);
+        snprintf(d.name, sizeof d.name, "dummy%02u", i);
+        memset(d.tex, 3 /* BTEX_STONE */, BLOCK_FACES);
+        d.flags       = REG_FLAG_SOLID;
+        d.hardness    = 1;
+        d.variant_of  = 0;   /* bases carry their own id at apply time */
+        d.fluid_class = REG_FLUID_NONE;
+        registryDefPack(recs[i], (BlockId)(REG_ID_DYN_LO + i), &d);
+    }
+    check(registryRemoteApply(REG_ID_DYN_LO, &recs[0][0], 40) == 40,
+          "this process's mirror of the 40-row table applies cleanly");
+
+    /* Persist it where the daemon boots from, then restart on it. */
+    stop_daemon();
+    char path[512];
+    snprintf(path, sizeof path, "%s/registry.bin", g_dir);
+    FILE *f = fopen(path, "wb");
+    check(f != NULL, "registry.bin opens for writing");
+    if (f == NULL) return;
+    uint8_t hdr[2] = { 40, 0 };   /* u16 count LE */
+    bool ok = fwrite(hdr, 1, 2, f) == 2;
+    for (unsigned i = 0; ok && i < 40; i++) {
+        ok = fwrite(recs[i], 1, REGISTRY_WIRE_RECORD_BYTES, f) == REGISTRY_WIRE_RECORD_BYTES;
+    }
+    ok = fclose(f) == 0 && ok;
+    check(ok, "registry.bin written: count 40 + 40 id-ascending records");
+
+    start_daemon();
+    if (!wait_ready(5000)) { fprintf(stderr, "test: restarted daemon never became ready\n"); exit(1); }
+    drain();
+
+    join_expect_registry_sequence(0x9E670002u, "reggie2");
+
+    send_registry_fetch(0x9E670002u, REG_ID_DYN_LO);
+
+    /* Batch 1: full 36 rows, not flagged LAST. */
+    uint8_t defs[BS_APP_REGISTRY_DEFS_BYTES(BS_APP_REGISTRY_DEFS_MAX_N)];
+    ssize_t n = recv_app_for(0x9E670002u, defs, sizeof defs, 500);
+    check(n == (ssize_t)BS_APP_REGISTRY_DEFS_BYTES(36)
+          && defs[0] == BS_APP_REGISTRY_DEFS
+          && defs[1] == REG_ID_DYN_LO && defs[2] == 36 && defs[3] == 0,
+          "the first DEFS batch carries 36 rows starting at 0x80, LAST clear");
+    bool ids_ok = true, names_ok = true;
+    if (n == (ssize_t)BS_APP_REGISTRY_DEFS_BYTES(36)) {
+        for (unsigned i = 0; i < 36; i++) {
+            const uint8_t *rec = defs + 4 + i * REGISTRY_WIRE_RECORD_BYTES;
+            if (rec[0] != (uint8_t)(REG_ID_DYN_LO + i)) ids_ok = false;
+            char want[REGISTRY_NAME_MAX];
+            snprintf(want, sizeof want, "dummy%02u", i);
+            if (strcmp((const char *)rec + 1, want) != 0) names_ok = false;
+        }
+    }
+    check(ids_ok, "batch 1 record ids ascend 0x80..0xA3 exactly");
+    check(names_ok, "batch 1 record names match what registry.bin held");
+
+    /* Batch 2: the remaining 4 rows, flagged LAST. */
+    n = recv_app_for(0x9E670002u, defs, sizeof defs, 500);
+    check(n == (ssize_t)BS_APP_REGISTRY_DEFS_BYTES(4)
+          && defs[0] == BS_APP_REGISTRY_DEFS
+          && defs[1] == REG_ID_DYN_LO + 36 && defs[2] == 4 && defs[3] == 1,
+          "the final DEFS batch carries the last 4 rows with LAST set");
+    ids_ok = true;
+    if (n == (ssize_t)BS_APP_REGISTRY_DEFS_BYTES(4)) {
+        for (unsigned i = 0; i < 4; i++) {
+            const uint8_t *rec = defs + 4 + i * REGISTRY_WIRE_RECORD_BYTES;
+            if (rec[0] != (uint8_t)(REG_ID_DYN_LO + 36 + i)) ids_ok = false;
+        }
+    }
+    check(ids_ok, "batch 2 record ids are 0xA4..0xA7 exactly");
+
+    /* And nothing further arrives: two batches was the whole answer. */
+    uint8_t extra[16];
+    n = recv_app_for(0x9E670002u, extra, sizeof extra, 300);
+    check(n < 0, "no third DEFS batch follows the LAST-flagged one");
+}
+
 /* ------------------------------------------------------------------- main */
 
 static void reap_daemon(void)
@@ -1609,6 +1797,12 @@ int main(void)
     test_ps_corrupt_and_truncated_dat_degrade_to_fresh_spawn();
     test_ps_old_client_never_reports_writes_no_file();
     test_ps_report_wrong_length_kicks();
+
+    /* Registry sync runs last: its batching scenario rewrites registry.bin
+     * and restarts the daemon, which would change what any later join's
+     * REGISTRY_INFO advertises. */
+    test_registry_fetch_empty_reply();
+    test_registry_fetch_batches_over_36_defs();
 
     stop_daemon();
 

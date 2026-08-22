@@ -264,7 +264,7 @@ enum bs_app_msg {
                                   * after JOIN's INV_STATE, for the same reason
                                   * INV_STATE is volunteered (see its comment
                                   * and the sizes section below).               */
-    BS_APP_PLAYER_REPORT = 0x0B  /* C->S: the client's report of its own armour,
+    BS_APP_PLAYER_REPORT = 0x0B, /* C->S: the client's report of its own armour,
                                   * XP and meters. Never sent until a
                                   * PLAYER_STATE has arrived — same capability
                                   * probe pattern as INV_ACTION. A server that
@@ -272,6 +272,32 @@ enum bs_app_msg {
                                   * hears PLAYER_REPORT, which is what makes
                                   * this pair deployment-order-safe like the
                                   * inventory one above.                        */
+
+    /* v1.6.0 Phase A: the master block registry over the wire.
+     *
+     * REGISTRY_INFO is volunteered by the server right after WORLD_INFO at
+     * join, before INV_STATE — the join order (world_info -> registry_info ->
+     * inv_state -> player_state) is load-bearing: registry definitions must be
+     * applied before any server column can generate or mesh, and the client's
+     * FETCH is only ever sent after an INFO has been seen, which keeps the
+     * capability-probe discipline (an old server sends no INFO, so a new
+     * client never sends FETCH at it and is never kicked).
+     *
+     * INFO carries the registry layout revision, the defined-row count and a
+     * CRC-16/CCITT-FALSE over the canonical table stream. A client whose
+     * compiled-in table hashes identically is done — the common case costs
+     * zero extra traffic. On mismatch it asks for the dynamic rows only:
+     * core rows are compiled into every binary of the same protocol era. */
+    BS_APP_REGISTRY_INFO  = 0x0C, /* S->C only: {rev u8, count u8, crc16 u16 LE}. */
+    BS_APP_REGISTRY_FETCH = 0x0D, /* C->S: {first_index u8}. Only sent after an
+                                   * INFO has arrived; asks for dynamic defs
+                                   * from first_index up, in DEFS batches.       */
+    BS_APP_REGISTRY_DEFS  = 0x0E  /* S->C only: {first u8, n u8, last u8,
+                                   * n x 28B records}. last is 1 on the final
+                                   * batch of a fetch. The 28-byte record is
+                                   * {id, name[16], tex[6], flags, luminance,
+                                   * hardness, variant_of, fluid_class} — all
+                                   * single bytes, so no endianness inside it.   */
 };
 
 /* Why INV_STATE is sent unprompted, and why the client must never open with
@@ -569,5 +595,38 @@ enum bs_inv_op {
 #define BS_PLAYER_METERS_BYTES (BS_ARMOR_SLOTS * 2u + 4u + 4u + 4u + 4u)  /* 24 */
 #define BS_PLAYER_REPORT_BYTES \
     (BS_APP_HDR_BYTES + BS_PLAYER_METERS_BYTES + 5u)                  /* 30 */
+
+/* REGISTRY_INFO: the whole registry's fingerprint in 5 bytes.
+ *
+ *   u8  type (0x0C)
+ *   u8  rev                              REGISTRY_REV, layout generation
+ *   u8  count                            defined rows, air included (<=254)
+ *   u16 crc16                            LE; CCITT-FALSE over the canonical
+ *                                        table stream (see world/registry.c)
+ */
+#define BS_APP_REGISTRY_INFO_BYTES (BS_APP_HDR_BYTES + 1u + 1u + 2u)      /* 5 */
+
+/* REGISTRY_FETCH: "send me your dynamic defs from here up".
+ *
+ *   u8  type (0x0D)
+ *   u8  first_index                      always REG_ID_DYN_LO today
+ */
+#define BS_APP_REGISTRY_FETCH_BYTES (BS_APP_HDR_BYTES + 1u)               /* 2 */
+
+/* REGISTRY_DEFS: one batch of consecutive dynamic defs.
+ *
+ *   u8  type (0x0E)
+ *   u8  first                            id of the first record
+ *   u8  n                                record count, 1..36
+ *   u8  last                             1 on the final batch of a fetch
+ *   ..  records                         n x 28 bytes, id-ascending
+ *
+ * The batch capacity is what fits one BS_MAX_PAYLOAD packet:
+ * (1024 - 4) / 28 = 36 records.
+ */
+#define BS_APP_REGISTRY_DEFS_MAX_N \
+    ((BS_MAX_PAYLOAD - BS_APP_HDR_BYTES - 3u) / 28u)                  /* 36 */
+#define BS_APP_REGISTRY_DEFS_BYTES(n) \
+    (BS_APP_HDR_BYTES + 3u + (uint32_t)(n) * 28u)
 
 #endif /* BS_PROTO_H */
