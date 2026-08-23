@@ -42,6 +42,17 @@
 #define BS_WORLD_HEIGHT 128
 #define BS_BLOCK_COUNT  8   /* AIR GRASS DIRT STONE SAND WOOD LEAVES PLANKS */
 
+/* As of v1.6.0 BS_BLOCK_COUNT is no longer what bsEditValid() checks a block id
+ * against — the master block registry made ids up to REG_ID_DYN_HI (0x80..0xFD)
+ * legal on the wire, so validate.c reads that ceiling straight out of the
+ * vendored world/registry.h instead. BS_BLOCK_COUNT stays, and stays asserted
+ * against the client's BLOCK_COUNT, because it is still the bound for the ids
+ * that are NOT block placements: the ITEM ids in INV_OP_PICKUP/INV_OP_CONSUME
+ * (bsgame.c) and in the armour slots (playerstate.c), both of which index
+ * client-side tables sized BLOCK_COUNT and would read out of bounds on the 3DS
+ * if a dyn id were let through. Two different ceilings because they guard two
+ * different things; do not collapse them. */
+
 /* True if (x, y, z, block) is an edit bsgame may apply. */
 bool bsEditValid(int32_t x, int32_t y, int32_t z, uint8_t block);
 

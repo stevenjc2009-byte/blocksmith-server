@@ -5,6 +5,18 @@
  * world/crafting.h against. */
 #include "../proto/bs_proto.h"
 
+/* v1.6.0: REG_ID_DYN_HI, the top of the block id space bsEditValid() accepts.
+ *
+ * Unconditional, unlike world/block.h and world/world.h below: world/registry.h
+ * is VENDORED into game/world/ (game/Makefile's VENDORED_WORLD_FILES) and
+ * world/registry.c is compiled into every build of this daemon, standalone
+ * clone included — so there is no configuration in which this include can fail,
+ * and no reason to restate 0xFD here as a second copy that could drift. The id
+ * ceiling is read from the same header the registry itself partitions its id
+ * space with, which is why there is no BS_* mirror of it beside BS_BLOCK_COUNT
+ * and no _Static_assert needed to keep the two honest: there is only one. */
+#include "world/registry.h"
+
 /* Pure, <3ds.h>-free headers (see source/world/block.h's own header comment).
  * Reading them here keeps BS_WORLD_HEIGHT and BS_BLOCK_COUNT honest instead of
  * letting them drift from the client's real world model. Nothing here links
@@ -63,6 +75,21 @@ bool bsEditValid(int32_t x, int32_t y, int32_t z, uint8_t block)
     if (x < -BS_WORLD_XZ_LIMIT || x > BS_WORLD_XZ_LIMIT) return false;
     if (z < -BS_WORLD_XZ_LIMIT || z > BS_WORLD_XZ_LIMIT) return false;
     if (y < 0 || y >= BS_WORLD_HEIGHT)                    return false;
-    if (block >= BS_BLOCK_COUNT)                          return false;
+    /* v1.6.0: the whole defined id space is legal, not just the core rows —
+     * the master block registry lets a server define dynamic blocks in
+     * REG_ID_DYN_LO..REG_ID_DYN_HI (0x80..0xFD) and a client may legitimately
+     * place one, so a ceiling of BS_BLOCK_COUNT (8) refused every one of them.
+     * Only the two ids above the dyn range (0xFE/0xFF, reserved so a u8 row
+     * count can never overflow) are refused. This mirrors editValid() in the
+     * client's source/net/networld.c, which tests the same REG_ID_DYN_HI.
+     *
+     * Deliberately NOT a registryIsDefined() check: bsgame accepts an edit
+     * naming an id the table does not hold yet for the same reason the client
+     * does — a dyn id is meaningful the moment either end registers it, and
+     * gating the edit on this process's current table would drop legitimate
+     * placements during the window before a registry sync lands. Undefined ids
+     * read back as air (registryGet()'s never-NULL contract), so the worst case
+     * is a hole, not a crash or a corrupt diff. */
+    if (block > REG_ID_DYN_HI)                            return false;
     return true;
 }

@@ -30,7 +30,7 @@
 #include "../proto/bs_proto.h"
 #include "players.h"   /* BS_EDIT_BURST / BS_EDIT_REFILL_MS, for the rate-limit ceiling */
 #include "playerstate.h"  /* BS_PLAYER_STATE_BODY_BYTES, for the player.dat fixtures */
-#include "validate.h"  /* BS_BLOCK_COUNT, for the highest-legal-block-id boundary test */
+#include "validate.h"  /* BS_BLOCK_COUNT, for the highest-legal-core-block-id boundary test */
 #include "world/crc32.h"    /* the checksum a hand-built player.dat has to carry */
 #include "world/registry.h" /* v1.6.0: mirror the daemon's table in-process */
 
@@ -499,27 +499,41 @@ static void test_invalid_block_id_rejected(void)
     puts("end-to-end: invalid block id is rejected, not applied or broadcast");
     drain();
 
-    send_block_edit(0xA11CE001u, 1, 1, 1, 200 /* far past BLOCK_COUNT */);
+    /* 0xFF, not 200. Until v1.6.0 this sent 200, which was "far past
+     * BLOCK_COUNT" when the ceiling was BS_BLOCK_COUNT — but 200 is 0xC8, well
+     * inside the master registry's dynamic id space, and is a perfectly legal
+     * block id now that bsEditValid() accepts up to REG_ID_DYN_HI. Only the two
+     * ids above the dyn range are still invalid, so this uses the top one. */
+    send_block_edit(0xA11CE001u, 1, 1, 1, 0xFF /* above REG_ID_DYN_HI */);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
     check(n < 0, "no broadcast for an invalid block id");
 }
 
-/* The boundary, not a wild value. test_invalid_block_id_rejected() above uses 200,
- * which every version of BS_BLOCK_COUNT this server has ever had would refuse — so it
- * passed happily while the server was refusing BLOCK_PLANKS as well. The two ids that
- * actually distinguish a correct BS_BLOCK_COUNT from a stale one are the highest legal
- * block and the one just past it, so those are the two this checks. Goes red on
- * BS_BLOCK_COUNT 7 (planks silently dropped) and on 9 (a nonexistent block accepted). */
+/* The core-block boundary, not a wild value. test_invalid_block_id_rejected()
+ * above uses an id no version of this server has ever accepted — so it passed
+ * happily while the server was refusing BLOCK_PLANKS as well. The id that
+ * actually distinguishes a correct BS_BLOCK_COUNT from a stale one is the
+ * highest core block, so that is what this places. Goes red on BS_BLOCK_COUNT 7
+ * (planks silently dropped).
+ *
+ * The other half of this test used to be "and BS_BLOCK_COUNT itself is
+ * dropped". That check is gone, because as of v1.6.0 it asserts the opposite of
+ * the truth: bsEditValid() no longer tests block ids against BS_BLOCK_COUNT at
+ * all (see validate.c), so id 8 is legal — the dyn-range ceiling is what draws
+ * the line now, and test_dyn_range_block_ids_accepted() below is where it is
+ * checked. BS_BLOCK_COUNT's own "one past the end is refused" boundary did not
+ * go untested with it: it moved to the path that still enforces it, the ITEM id
+ * in test_inv_pickup_out_of_range_item_refused(). */
 static void test_highest_block_id_is_accepted(void)
 {
-    puts("end-to-end: the highest legal block id is accepted and the next one is not");
+    puts("end-to-end: the highest legal core block id is accepted");
     drain();
 
-    /* Column (312, 312), which nothing else in this file touches. Both edits below
-     * land in the authoritative diff store and stay there for the rest of the run, so
-     * putting them anywhere near the origin makes the later CHUNK_SUB tests — which
+    /* Column (312, 312), which nothing else in this file touches. The edit below
+     * lands in the authoritative diff store and stays there for the rest of the run, so
+     * putting it anywhere near the origin makes the later CHUNK_SUB tests — which
      * assert an exact diff count for their column — fail for a reason that has nothing
      * to do with what they are testing. */
     send_block_edit(0xA11CE001u, 5000, 12, 5000, BS_BLOCK_COUNT - 1 /* BLOCK_PLANKS */);
@@ -528,12 +542,65 @@ static void test_highest_block_id_is_accepted(void)
     ssize_t n = recv_app_for(0xB0B00002u, out, sizeof out, 500);
     check(n == (ssize_t)BS_BLOCK_EDIT_BYTES && out[0] == BS_APP_BLOCK_EDIT
           && out[13] == (uint8_t)(BS_BLOCK_COUNT - 1),
-          "an edit placing the highest legal block id is broadcast");
+          "an edit placing the highest legal core block id is broadcast");
+}
+
+/* v1.6.0: the master block registry's dynamic id space is legal on the wire.
+ *
+ * The client (source/net/networld.c, editValid) accepts any id up to
+ * REG_ID_DYN_HI, because a server may define dynamic blocks at 0x80..0xFD and a
+ * player may place one. bsEditValid() capped at BS_BLOCK_COUNT (8) and refused
+ * every single one of them, so a legal placement was dropped server-side and
+ * never reached the other players or the diff store — silently, the same shape
+ * of bug BLOCK_PLANKS hit (see validate.h).
+ *
+ * Both ends of the dyn range are checked, not just one: a ceiling raised to the
+ * wrong constant (REG_ID_CORE_HI, say) would still accept 0x80 while refusing
+ * 0xFD, and a check on the low end alone could not tell those apart.
+ *
+ * Deliberately no registry sync first — these ids are NOT defined in the
+ * daemon's table when this runs. That is the point: bsEditValid() is a range
+ * check on the id space, not a lookup in whatever the table happens to hold at
+ * this instant, so an edit naming an id the server has not been told about yet
+ * must still be accepted (an undefined id reads back as air until it resolves).
+ *
+ * Column (437,437) upward, chosen the same way and for the same reason as
+ * test_highest_block_id_is_accepted's (312,312): nothing else in this file
+ * subscribes to or counts diffs in these columns. */
+static void test_dyn_range_block_ids_accepted(void)
+{
+    puts("end-to-end: the registry's dynamic block id range is accepted, the reserved ids above it are not");
+    drain();
+
+    uint8_t out[64];
+    ssize_t n;
+
+    send_block_edit(0xA11CE001u, 7000, 12, 7000, (uint8_t)REG_ID_DYN_LO);
+    n = recv_app_for(0xB0B00002u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_BLOCK_EDIT_BYTES && out[0] == BS_APP_BLOCK_EDIT
+          && out[13] == (uint8_t)REG_ID_DYN_LO,
+          "an edit placing the lowest dynamic block id (0x80) is broadcast");
 
     drain();
-    send_block_edit(0xA11CE001u, 5001, 12, 5001, BS_BLOCK_COUNT /* one past the end */);
+    send_block_edit(0xA11CE001u, 7100, 12, 7100, (uint8_t)REG_ID_DYN_HI);
+    n = recv_app_for(0xB0B00002u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_BLOCK_EDIT_BYTES && out[0] == BS_APP_BLOCK_EDIT
+          && out[13] == (uint8_t)REG_ID_DYN_HI,
+          "an edit placing the highest dynamic block id (0xFD) is broadcast");
+
+    /* The ceiling is a ceiling, not a removed check: 0xFE and 0xFF are reserved
+     * so a u8 row count can never overflow (world/registry.h), and neither is a
+     * placeable block. If these two ever start passing, bsEditValid() has lost
+     * its block-id test rather than had it raised. */
+    drain();
+    send_block_edit(0xA11CE001u, 7200, 12, 7200, (uint8_t)(REG_ID_DYN_HI + 1) /* 0xFE */);
     n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
-    check(n < 0, "an edit one past the highest legal block id is dropped");
+    check(n < 0, "an edit one past the highest dynamic block id (0xFE) is dropped");
+
+    drain();
+    send_block_edit(0xA11CE001u, 7300, 12, 7300, 0xFF);
+    n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
+    check(n < 0, "an edit placing the top reserved id (0xFF) is dropped");
 }
 
 static void test_out_of_range_coordinate_rejected(void)
@@ -2081,6 +2148,7 @@ int main(void)
     test_edit_broadcast_to_other_player_only();
     test_invalid_block_id_rejected();
     test_highest_block_id_is_accepted();
+    test_dyn_range_block_ids_accepted();
     test_out_of_range_coordinate_rejected();
     test_out_of_range_y_rejected();
     test_edit_rate_limited();
