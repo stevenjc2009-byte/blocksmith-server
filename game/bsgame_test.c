@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -28,7 +29,9 @@
 
 #include "../proto/bs_proto.h"
 #include "players.h"   /* BS_EDIT_BURST / BS_EDIT_REFILL_MS, for the rate-limit ceiling */
+#include "playerstate.h"  /* BS_PLAYER_STATE_BODY_BYTES, for the player.dat fixtures */
 #include "validate.h"  /* BS_BLOCK_COUNT, for the highest-legal-block-id boundary test */
+#include "world/crc32.h"    /* the checksum a hand-built player.dat has to carry */
 #include "world/registry.h" /* v1.6.0: mirror the daemon's table in-process */
 
 enum bs_game_msg { BS_GAME_JOIN = 1, BS_GAME_DATA = 2, BS_GAME_LEAVE = 3, BS_GAME_KICK = 4 };
@@ -1571,6 +1574,319 @@ static void test_ps_report_wrong_length_kicks(void)
     check(kill(g_daemon, 0) == 0, "daemon survives both wrong-length reports");
 }
 
+/* ----------------------------------------- player.dat fixtures and probes
+ *
+ * The scenarios below need a player.dat the daemon must ACCEPT — the two
+ * corruption tests above only ever needed one it must reject, which is why
+ * they could get away with 65 'X' bytes and a 30-byte stub. Building a
+ * valid one takes a real header and a real checksum, hence this helper.
+ *
+ * The 45-byte body is laid out straight from bs_proto.h's PLAYER_STATE wire
+ * spec rather than by calling playerStateEncodeBody(): a fixture that shares
+ * its encoder with the code under test can only ever agree with that code,
+ * which is exactly the property a fixture must not have. The header is
+ * likewise spelled out (magic 'BSP1', version 1, body size, payload CRC)
+ * instead of pulled from playerstate.c's private #defines.
+ *
+ * `crc_fudge` is XORed into the stored checksum. Zero writes a file every
+ * check accepts; anything else writes the one shape no earlier test reaches
+ * — right length, right magic, right version, right size, wrong checksum —
+ * which is playerstate.c's `stored != computed` branch and nothing else. */
+static void write_player_dat(const char *path,
+                             float x, float y, float z, float yaw, float pitch,
+                             const uint8_t armor[8], uint32_t xp_level,
+                             float xp_progress, float health, float hunger,
+                             uint32_t crc_fudge)
+{
+    uint8_t file[20u + BS_PLAYER_STATE_BODY_BYTES];
+    memset(file, 0, sizeof file);
+
+    uint8_t *body = file + 20;
+    body[0] = (uint8_t)(BS_PLAYER_STATE_FLAG_POSE | BS_PLAYER_STATE_FLAG_EXT);
+    bs_put_f32(body + 1,  x);
+    bs_put_f32(body + 5,  y);
+    bs_put_f32(body + 9,  z);
+    bs_put_f32(body + 13, yaw);
+    bs_put_f32(body + 17, pitch);
+    memcpy(body + 21, armor, 8);
+    bs_put_u32(body + 29, xp_level);
+    bs_put_f32(body + 33, xp_progress);
+    bs_put_f32(body + 37, health);
+    bs_put_f32(body + 41, hunger);
+
+    bs_put_u32(file + 0,  0x31505342u /* 'BSP1' */);
+    bs_put_u32(file + 4,  1u);
+    bs_put_u32(file + 8,  BS_PLAYER_STATE_BODY_BYTES);
+    bs_put_u32(file + 12, crc32(body, BS_PLAYER_STATE_BODY_BYTES) ^ crc_fudge);
+
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) die("open player.dat fixture");
+    bool ok = fwrite(file, 1, sizeof file, f) == sizeof file;
+    if (fclose(f) != 0 || !ok) die("write player.dat fixture");
+}
+
+/* players/<label>/, created the way ensure_dir() would have. */
+static void make_player_dir(const char *label, char *out, size_t cap)
+{
+    char players[256];
+    snprintf(players, sizeof players, "%s/players", g_dir);
+    if (mkdir(players, 0700) != 0 && errno != EEXIST) die("mkdir players dir");
+    snprintf(out, cap, "%s/%s", players, label);
+    if (mkdir(out, 0700) != 0 && errno != EEXIST) die("mkdir player dir");
+}
+
+/* Joins and swallows the three welcome packets that precede PLAYER_STATE
+ * without re-asserting their order — join_expect_fresh_player_state() above
+ * already owns that assertion, and everything below is about what the
+ * fourth packet SAYS, not where it sits. */
+static void join_skip_welcome(uint32_t sid, const char *label)
+{
+    send_join(sid, label);
+    uint8_t out[128];
+    for (unsigned i = 0; i < 3; i++) (void)recv_app_for(sid, out, sizeof out, 500);
+}
+
+static bool file_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* player_state_recover(), promotion arm. A save cut off after the temp file
+ * was written but before it was renamed leaves player.dat.tmp with no
+ * player.dat beside it — the whole crash-safety claim of the module is that
+ * this is indistinguishable from a completed save, and until now nothing
+ * tested it in either direction. */
+static void test_ps_recover_promotes_orphaned_tmp(void)
+{
+    puts("crash safety: an orphaned player.dat.tmp with no player.dat is promoted, not dropped");
+
+    char dir[320], path[512], tmp[544];
+    make_player_dir("psf", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/player.dat", dir);
+    snprintf(tmp,  sizeof tmp,  "%s/player.dat.tmp", dir);
+    remove(path);
+
+    const uint8_t armor[8] = { 3, 9, 0, 0, 0, 0, 0, 0 };
+    write_player_dat(tmp, 1.5f, 65.0f, 2.5f, 45.0f, -10.0f,
+                     armor, 3u, 0.5f, 17.0f, 4.0f, 0);
+
+    drain();
+    join_skip_welcome(0x50A00010u, "psf");
+
+    uint8_t flags = 0xff, armor_back[8];
+    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, prog = 0, hp = 0, hunger = 0;
+    uint32_t xp_level = 0;
+    bool got = recv_player_state_fields(0x50A00010u, 500, &flags,
+                                        &x, &y, &z, &yaw, &pitch, armor_back,
+                                        &xp_level, &prog, &hp, &hunger);
+    check(got, "a join over an orphaned tmp still gets a well-formed PLAYER_STATE");
+    if (got) {
+        check(flags == (BS_PLAYER_STATE_FLAG_POSE | BS_PLAYER_STATE_FLAG_EXT),
+              "the promoted tmp is restored, not treated as a fresh spawn");
+        check(x == 1.5f && y == 65.0f && z == 2.5f && yaw == 45.0f && pitch == -10.0f,
+              "the promoted tmp's pose comes back exact");
+        check(armor_back[0] == 3 && armor_back[1] == 9 && xp_level == 3u
+              && prog == 0.5f && hp == 17.0f && hunger == 4.0f,
+              "the promoted tmp's armour and meters come back exact");
+    }
+
+    check(file_exists(path), "the tmp really was renamed into place, not merely read");
+    check(!file_exists(tmp), "and nothing is left behind for the next load to redo");
+
+    send_leave(0x50A00010u);
+    msleep(100);
+}
+
+/* player_state_recover(), discard arm — and the one that matters most once
+ * the save stops removing the real file first: from then on a crash between
+ * write and rename ALWAYS leaves both files, and the real one is the older,
+ * complete save that must win. A tmp promoted over it would be a rename
+ * that never happened being applied anyway. */
+static void test_ps_recover_discards_tmp_when_real_file_present(void)
+{
+    puts("crash safety: a tmp beside an intact player.dat is discarded, the real file wins");
+
+    char dir[320], path[512], tmp[544];
+    make_player_dir("psg", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/player.dat", dir);
+    snprintf(tmp,  sizeof tmp,  "%s/player.dat.tmp", dir);
+
+    const uint8_t armor_real[8] = { 4, 1, 0, 0, 0, 0, 0, 0 };
+    const uint8_t armor_tmp[8]  = { 6, 2, 0, 0, 0, 0, 0, 0 };
+    write_player_dat(path, 10.0f, 70.0f, 10.0f, 0.0f, 0.0f,
+                     armor_real, 1u, 0.125f, 20.0f, 20.0f, 0);
+    write_player_dat(tmp, -99.0f, -99.0f, -99.0f, -99.0f, -99.0f,
+                     armor_tmp, 99u, 1.0f, 1.0f, 1.0f, 0);
+
+    drain();
+    join_skip_welcome(0x50A00011u, "psg");
+
+    uint8_t flags = 0xff, armor_back[8];
+    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, prog = 0, hp = 0, hunger = 0;
+    uint32_t xp_level = 0;
+    bool got = recv_player_state_fields(0x50A00011u, 500, &flags,
+                                        &x, &y, &z, &yaw, &pitch, armor_back,
+                                        &xp_level, &prog, &hp, &hunger);
+    check(got, "a join with both files present gets a well-formed PLAYER_STATE");
+    if (got) {
+        check(x == 10.0f && y == 70.0f && z == 10.0f,
+              "the intact player.dat is what gets restored, not the leftover tmp");
+        check(armor_back[0] == 4 && armor_back[1] == 1 && xp_level == 1u,
+              "and its armour/XP too — the tmp's values appear nowhere");
+    }
+    check(!file_exists(tmp), "the superseded tmp is cleaned up rather than left to rot");
+
+    send_leave(0x50A00011u);
+    msleep(100);
+}
+
+/* The checksum branch, which no earlier test could reach: the corruption
+ * test above fails at the magic check (65 'X' bytes) and at the short-read
+ * check (30 bytes), so `stored != computed` had never once executed. This
+ * file is correct in every other respect — right size, right magic, right
+ * version, right body size, decodable payload — and must still be refused,
+ * because a plausible torn write is the only thing a checksum exists to
+ * catch. */
+static void test_ps_bad_checksum_dat_degrades_to_fresh_spawn(void)
+{
+    puts("on-disk format: a well-formed player.dat with a bad payload CRC is refused");
+
+    char dir[320], path[512], tmp[544];
+    make_player_dir("psh", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/player.dat", dir);
+    snprintf(tmp,  sizeof tmp,  "%s/player.dat.tmp", dir);
+    remove(tmp);
+
+    const uint8_t armor[8] = { 2, 5, 0, 0, 0, 0, 0, 0 };
+    write_player_dat(path, 42.0f, 80.0f, 42.0f, 12.0f, 3.0f,
+                     armor, 9u, 0.75f, 15.0f, 12.0f, 0x00000001u /* flip one CRC bit */);
+
+    drain();
+    join_expect_fresh_player_state(0x50A00012u, "psh");
+
+    send_leave(0x50A00012u);
+    msleep(100);
+
+    struct stat st;
+    check(stat(path, &st) == 0 && st.st_size == (off_t)(20u + BS_PLAYER_STATE_BODY_BYTES),
+          "the bad-checksum file is left in place untouched, not deleted or overwritten");
+}
+
+/* S4: armour ids and counts are validated on exactly the terms the
+ * inventory path validates PICKUP/CONSUME on (`a < BS_BLOCK_COUNT`,
+ * `b >= 1 && b <= BS_INV_STACK_MAX`, bsgame.c) — same id space, so an
+ * armour slot may not hold an id the inventory would have refused. The
+ * policy is playerstate.h's documented per-field one: the offending SLOT is
+ * dropped to empty, exactly as a broken item/count pairing already is,
+ * while every well-formed slot beside it survives. */
+static void test_ps_report_out_of_range_armour_is_dropped(void)
+{
+    puts("end-to-end: out-of-range armour ids and counts are dropped per-slot, neighbours kept");
+    drain();
+
+    join_expect_fresh_player_state(0x50A00013u, "psi");
+
+    /* head: id 200, far past BS_BLOCK_COUNT — the out-of-bounds index the
+     * 3DS client would later use to look up a block.
+     * chest: legal id, count 200, past BS_INV_STACK_MAX.
+     * legs: entirely legal, the control that proves this is validation and
+     *       not a blanket wipe.
+     * feet: the exact boundary pair — highest legal id, highest legal count
+     *       — which must be kept, or the bound is off by one. */
+    const uint8_t armor[8] = {
+        200, 1,
+        5,   200,
+        5,   3,
+        (uint8_t)(BS_BLOCK_COUNT - 1), (uint8_t)BS_INV_STACK_MAX,
+    };
+    send_player_report(0x50A00013u, armor, 2u, 0.5f, 10.0f, 9.0f);
+    msleep(150);
+    send_leave(0x50A00013u);
+    msleep(150);
+
+    join_skip_welcome(0x50A00014u, "psi");
+
+    uint8_t flags = 0xff, back[8];
+    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, prog = 0, hp = 0, hunger = 0;
+    uint32_t xp_level = 0;
+    bool got = recv_player_state_fields(0x50A00014u, 500, &flags,
+                                        &x, &y, &z, &yaw, &pitch, back,
+                                        &xp_level, &prog, &hp, &hunger);
+    check(got, "the report with bad armour is stored and served back, not rejected wholesale");
+    if (!got) return;
+
+    check(back[0] == 0 && back[1] == 0,
+          "an armour id past BS_BLOCK_COUNT is dropped to an empty slot");
+    check(back[2] == 0 && back[3] == 0,
+          "an armour count past BS_INV_STACK_MAX is dropped to an empty slot");
+    check(back[4] == 5 && back[5] == 3,
+          "the legal slot beside them is untouched — this is validation, not a wipe");
+    check(back[6] == (uint8_t)(BS_BLOCK_COUNT - 1) && back[7] == (uint8_t)BS_INV_STACK_MAX,
+          "the highest legal id/count pair is kept — the bound is not off by one");
+    check(xp_level == 2u && prog == 0.5f && hp == 10.0f && hunger == 9.0f,
+          "and the meters in the same report are unaffected by the armour fix-ups");
+
+    send_leave(0x50A00014u);
+    msleep(100);
+}
+
+/* S3: PLAYER_REPORT is unthrottled and has no token bucket, so "save on
+ * every report" is "rewrite this file as fast as a peer can send", two
+ * mkdir syscalls included. A report that changes nothing must therefore
+ * change nothing on disk either — the same `if (changed)` gate
+ * save_player_inventory() has sat behind since it was written. */
+static void test_ps_identical_report_does_not_rewrite_file(void)
+{
+    puts("end-to-end: a byte-identical PLAYER_REPORT does not rewrite player.dat");
+    drain();
+
+    join_expect_fresh_player_state(0x50A00015u, "psj");
+
+    const uint8_t armor[8] = { 5, 2, 0, 0, 0, 0, 0, 0 };
+    send_player_report(0x50A00015u, armor, 4u, 0.75f, 11.0f, 6.0f);
+    msleep(150);
+
+    char path[512];
+    snprintf(path, sizeof path, "%s/players/psj/player.dat", g_dir);
+
+    struct stat before;
+    check(stat(path, &before) == 0, "the first report really did write player.dat");
+
+    /* Stamping a distinctive mtime is what lets the negative assertion below
+     * go red at all. A rewrite lands through rename(), so the replacement
+     * carries both a fresh mtime and a fresh inode; either one moving off
+     * these values is a write this test says must not have happened.
+     * Comparing sizes would prove nothing — the file is a fixed 65 bytes
+     * whether it was rewritten or not. */
+    struct timeval stamp[2] = { { 1000000000, 0 }, { 1000000000, 0 } };
+    if (utimes(path, stamp) != 0) die("stamp player.dat mtime");
+
+    send_player_report(0x50A00015u, armor, 4u, 0.75f, 11.0f, 6.0f);   /* identical */
+    msleep(200);
+
+    struct stat same;
+    check(stat(path, &same) == 0, "player.dat still exists after the repeat report");
+    check(same.st_mtime == (time_t)1000000000,
+          "an identical report leaves player.dat's mtime untouched — no rewrite");
+    check(same.st_ino == before.st_ino,
+          "and its inode untouched — no rename happened either");
+
+    /* Control, without which the two checks above would pass just as well
+     * against a save path that had stopped working altogether: the very same
+     * report with ONE field moved must still hit the disk. */
+    send_player_report(0x50A00015u, armor, 4u, 0.75f, 11.0f, 5.0f);   /* hunger differs */
+    msleep(200);
+
+    struct stat after;
+    check(stat(path, &after) == 0, "player.dat still exists after the changed report");
+    check(after.st_mtime != (time_t)1000000000,
+          "a report differing by one field DOES rewrite the file");
+
+    send_leave(0x50A00015u);
+    msleep(100);
+}
+
 /* ------------------------------------------------- registry sync (v1.6.0 Phase A)
  *
  * Placed last on purpose: the batching scenario below rewrites
@@ -1797,6 +2113,11 @@ int main(void)
     test_ps_corrupt_and_truncated_dat_degrade_to_fresh_spawn();
     test_ps_old_client_never_reports_writes_no_file();
     test_ps_report_wrong_length_kicks();
+    test_ps_recover_promotes_orphaned_tmp();
+    test_ps_recover_discards_tmp_when_real_file_present();
+    test_ps_bad_checksum_dat_degrades_to_fresh_spawn();
+    test_ps_report_out_of_range_armour_is_dropped();
+    test_ps_identical_report_does_not_rewrite_file();
 
     /* Registry sync runs last: its batching scenario rewrites registry.bin
      * and restarts the daemon, which would change what any later join's

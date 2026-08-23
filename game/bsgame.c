@@ -675,8 +675,10 @@ static void send_inv_state(struct bs_game *g, uint32_t sid, const Inventory *inv
  * diffstoreApply() the moment an edit is accepted, and inventory.dat is
  * rewritten by save_player_inventory() after every changed INV_ACTION.
  * There is no periodic flusher for either, so there is none here either:
- * a PLAYER_REPORT saves immediately, and LEAVE performs one final save
- * merging the live pose in. Pose-only movement never writes by itself —
+ * a PLAYER_REPORT that actually changes something saves immediately (one
+ * that does not is skipped — see handle_player_report), and LEAVE performs
+ * one final save merging the live pose in. Pose-only movement never writes
+ * by itself —
  * POS_UPDATE arrives at wire frequency and would turn into disk churn —
  * so a hard crash can lose pose deltas since the last persist point,
  * exactly the class of bounded loss diffstore already tolerates with its
@@ -694,9 +696,19 @@ static bool load_player_state(struct bs_game *g, BsPlayer *p)
         logf_("game: %s: cannot resolve player directory, starting fresh", p->label);
         return false;
     }
-    bool found = playerStateLoad(&p->state, dir);
+    BsPlayerStateLoadResult why = BS_PSTATE_LOAD_OK;
+    bool found = playerStateLoad(&p->state, dir, &why);
     if (found) {
         logf_("game: %s: restored player state from %s", p->label, dir);
+    } else if (why != BS_PSTATE_LOAD_NO_FILE) {
+        /* A rejected player.dat and a first-ever join produce the identical
+         * fresh spawn, so without this the one case an operator would want
+         * to hear about — a save that exists and was thrown away — is the
+         * one case that looked exactly like nothing happening. NO_FILE is
+         * excluded because it is the ordinary path every new player takes;
+         * logging it would bury the rest. */
+        logf_("game: %s: player.dat in %s rejected (%s), starting fresh",
+              p->label, dir, playerStateLoadResultName(why));
     }
     p->state_dirty = found;
     return found;
@@ -1089,9 +1101,31 @@ static void handle_player_report(struct bs_game *g, BsPlayer *p, const uint8_t *
         return;
     }
 
-    playerStateApplyMeters(&p->state, msg + 1);
+    const bool changed = playerStateApplyMeters(&p->state, msg + 1);
+
+    /* Dirty regardless of `changed`: this flag is not "the file is stale",
+     * it is "this session has extended state worth one final write at
+     * LEAVE" (handle_leave), and that write is what carries the live pose
+     * home. A player standing still and re-reporting the same meters while
+     * walking around would otherwise lose their position. */
     p->state_dirty = true;
-    save_player_state(g, p);   /* write-through now — see the section comment */
+
+    /* PLAYER_REPORT has no token bucket — unlike BLOCK_EDIT it is not rate
+     * limited at all — so "save on every report" is "rewrite player.dat as
+     * fast as an allowlisted peer can send", two mkdir syscalls per write
+     * included (player_inv_dir). Gating on a real change is the same
+     * `if (changed)` guard save_player_inventory() has always sat behind
+     * (handle_inv_action), and it is sufficient here because a report that
+     * changes nothing produces a file byte-identical to the one already on
+     * disk: skipping it loses nothing, and the LEAVE save above still
+     * catches any pose that moved underneath it.
+     *
+     * Rejected: a time-based throttle. It would bound the churn without
+     * removing it, and would additionally delay a real change — worse on
+     * both counts than not writing what does not need writing. */
+    if (changed) {
+        save_player_state(g, p);   /* write-through — see the section comment */
+    }
 }
 
 /* One accepted application payload from an already-joined player. Anything

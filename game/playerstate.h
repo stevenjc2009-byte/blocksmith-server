@@ -77,9 +77,37 @@ bool playerStateDecodeBody(BsPlayerState *st,
  * the exact layout both PLAYER_STATE's body and PLAYER_REPORT carry after
  * their type byte). Values are sanitised with the same rules
  * playerStateDecodeBody() uses: an untrusted client's report gets no more
- * benefit of the doubt than a hand-edited file. */
-void playerStateApplyMeters(BsPlayerState *st,
+ * benefit of the doubt than a hand-edited file.
+ *
+ * Returns true when the SANITISED result differs from what `st` already
+ * held — i.e. whether this block was worth persisting. It is deliberately
+ * the post-sanitisation comparison: two reports that differ only in bytes
+ * this function throws away are the same state, and re-writing player.dat
+ * for them would be pure disk churn. The knowledge of which fields this
+ * block owns stays here rather than being re-derived by the caller, where
+ * it would silently rot the next time a field is added. */
+bool playerStateApplyMeters(BsPlayerState *st,
                             const uint8_t blk[BS_PLAYER_METERS_BYTES]);
+
+/* Which check a playerStateLoad() call stopped at. Exists so the operator
+ * can be told WHY a player came back as a fresh spawn: every failure below
+ * degrades to the same silent, identical-looking outcome for the player, so
+ * without this a corrupt save and a first-ever join are indistinguishable in
+ * the log — and the corrupt one is the one somebody needs to know about. The
+ * enum is returned rather than a message string because this module has no
+ * logging dependency and is not about to grow one; naming the failure is
+ * bsgame.c's job, detecting it is this module's. */
+typedef enum {
+    BS_PSTATE_LOAD_OK = 0,      /* a valid save was found and applied       */
+    BS_PSTATE_LOAD_NO_FILE,     /* no player.dat: first join, not an error  */
+    BS_PSTATE_LOAD_BAD_PATH,    /* dir too long to hold player.dat          */
+    BS_PSTATE_LOAD_SHORT_FILE,  /* truncated — fewer bytes than the format  */
+    BS_PSTATE_LOAD_BAD_MAGIC,
+    BS_PSTATE_LOAD_BAD_VERSION,
+    BS_PSTATE_LOAD_BAD_SIZE,    /* header's body size is not this build's   */
+    BS_PSTATE_LOAD_BAD_CRC,     /* payload checksum mismatch: torn write    */
+    BS_PSTATE_LOAD_BAD_BODY,    /* flags byte carries bits we never wrote   */
+} BsPlayerStateLoadResult;
 
 /* Loads dir/player.dat into `st`. True only when a valid save was found
  * and applied — unlike inventoryLoad(), whose caller needs no distinction,
@@ -88,14 +116,25 @@ void playerStateApplyMeters(BsPlayerState *st,
  * corrupt file must be reported as the latter. Always leaves `st` fully
  * valid either way, so "false" simply means "keep what init gave you".
  * A leftover player.dat.tmp from an interrupted save is promoted or
- * discarded before reading, exactly as inventoryLoad() does. */
-bool playerStateLoad(BsPlayerState *st, const char *dir);
+ * discarded before reading, exactly as inventoryLoad() does.
+ *
+ * `why`, when not NULL, receives the check that stopped the load — see
+ * BsPlayerStateLoadResult. It is always written, including on success. */
+bool playerStateLoad(BsPlayerState *st, const char *dir,
+                     BsPlayerStateLoadResult *why);
+
+/* A short, stable, human-readable name for `r`, for logging. Never NULL. */
+const char *playerStateLoadResultName(BsPlayerStateLoadResult r);
 
 /* Saves `st` to dir/player.dat. False on any IO failure, in which case the
  * previous save (if any) is untouched — nothing touches the real path until
  * the replacement is known-good and closed. The extended-state flag is
  * always set on disk (a file exists, therefore there is something to
- * restore); the pose flag follows `st->has_pose`. */
+ * restore); the pose flag follows `st->has_pose`.
+ *
+ * True means durable, not merely written: the payload is fsync'd before the
+ * rename and the directory entry after it, so a host power cut immediately
+ * on return cannot resurrect the previous save or an all-zero file. */
 bool playerStateSave(const BsPlayerState *st, const char *dir);
 
 #endif /* BS_GAME_PLAYERSTATE_H */
