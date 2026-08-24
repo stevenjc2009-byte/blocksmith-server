@@ -4,9 +4,14 @@
 #include <stdio.h>
 #include <string.h>
 
-// The compiled-in core rows, ids 0x00..0x07. These are the old kBlocks[] table
+// The compiled-in core rows, ids 0x00..0x09. These are the old kBlocks[] table
 // recast as BlockDefs; the ids and textures are frozen forever because every
 // saved region file and every replay encodes them by number.
+//
+// 0x00..0x07 are also the ITEM ids (world/block.h's BLOCK_COUNT and the server's
+// BS_BLOCK_COUNT). 0x08 and 0x09 — water and tall grass, roadmap tasks 17 and 19 —
+// are core rows that are deliberately NOT items; world/block.h explains why that
+// distinction exists and why BLOCK_COUNT stayed at 8 rather than following them.
 static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	[REG_ID_AIR] = {
 		.name  = "air",
@@ -53,6 +58,80 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		           BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS },
 		.flags = REG_FLAG_SOLID,
 	},
+	// Roadmap task 17. A full cube, drawn, NOT solid, and a liquid.
+	//
+	// Every one of those is load-bearing, so one at a time:
+	//
+	//   not SOLID       world/physics.c collides on blockIsSolid() alone, so the player
+	//                   box walks and falls straight through. There is no swimming today
+	//                   and none is half-built here: standing in water is standing in air
+	//                   that happens to be blue, and a head inside a water cell does
+	//                   nothing at all — no drowning, no drag, no screen tint. Flow,
+	//                   spread and drainage are roadmap task 22.
+	//                   It also means water never occludes, because mesher.c's s_occludes
+	//                   is `solid && !transparent && cube`: the seabed's faces under an
+	//                   ocean are still built and still drawn, behind opaque water. That
+	//                   cost is accepted rather than fixed here — the only way to make
+	//                   water occlude is to make it solid, and a solid sea is a wall.
+	//   TRANSPARENT     this is what buys the self-culling. mesher.c applies its
+	//                   same-material rule (`deferred && s_cell_draw[ni] &&
+	//                   blocks[ni] == id`) only inside the deferred pass, and s_deferred
+	//                   is `drawn && (transparent || !cube)`. Without this flag a body of
+	//                   water would mesh every internal face it has — thousands of quads
+	//                   for an ocean, not one of them ever visible. With it, only the
+	//                   shell is built. It also states the flag's plain meaning: water
+	//                   does not hide what is behind it.
+	//   LIQUID          blockIsTargetable() is `drawn && !liquid`, so the crosshair passes
+	//                   through water: it cannot be aimed at, mined, or placed against.
+	//                   That is the whole reason REG_FLAG_LIQUID exists.
+	//   FULL_CUBE       implicit (shape 0). A body of water is cells of water; a surface
+	//                   cell is not a special half-height block and will not need to be
+	//                   until task 22 gives water levels.
+	//
+	// The ART is opaque — see tools/make_atlas.py's tile_water for why one bit of alpha
+	// cannot make a translucent sea and why a dither of holes is worse than a solid
+	// surface at 16x16 on a 240px screen.
+	[8] = { // water
+		.name  = "water",
+		.tex   = { BTEX_WATER, BTEX_WATER, BTEX_WATER,
+		           BTEX_WATER, BTEX_WATER, BTEX_WATER },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID,
+	},
+	// Roadmap task 19, and the first block in the game to use BLOCK_SHAPE_CROSS — the
+	// non-cube geometry path v1.6.0 task 13 built into world/mesher.c and that nothing
+	// has exercised since.
+	//
+	//   CROSS           two quads on the cell's diagonals, emitted four times so both
+	//                   windings exist (mesher.c's emitCross). All six tex entries carry
+	//                   the same tile because emitCross takes FACE_EAST's rect for the
+	//                   whole shape.
+	//   not SOLID       walked through freely, exactly like water: physics.c asks
+	//                   blockIsSolid() and nothing else. planBuild() also refuses to let
+	//                   a non-cube be solid for AO or occlusion whatever this flag says
+	//                   (its `&& cube` terms), so an X can never darken a neighbour's
+	//                   corners or cull its faces.
+	//   TRANSPARENT     its plain meaning: it does not hide what is behind it. The
+	//                   deferred alpha-test pass it needs is already forced by the SHAPE
+	//                   (s_deferred's `|| !cube`), so this flag is not what puts it
+	//                   there — it is set because it is true, and because the one block
+	//                   in the registry whose art is mostly alpha 0 should not be
+	//                   claiming otherwise.
+	//   not LIQUID      so blockIsTargetable() is true. v1.6.0's raycast rule is that
+	//                   what stops a ray is "can this be removed", not "is this solid":
+	//                   scenery that can never be targeted is scenery that can never be
+	//                   cleared. The whole cell is the target, not the two quads inside
+	//                   it — world/raycast.c says so in as many words.
+	//
+	// Breaking it does nothing today: BLOCK_TALL_GRASS is past BLOCK_COUNT, so
+	// inventoryCanHold() refuses it and scene/interact.c counts the press as refused
+	// instead of deleting a block the bag cannot receive. That is the right end state
+	// until the survival rung gives it a drop; see world/block.h.
+	[9] = { // tall grass
+		.name  = "tall_grass",
+		.tex   = { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
+		           BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+	},
 };
 
 // The table itself. s_defs holds the authoritative bytes; s_view is the derived
@@ -92,6 +171,17 @@ static void refreshView(BlockId id)
 	v->solid       = (d->flags & REG_FLAG_SOLID) != 0;
 	v->transparent = (d->flags & REG_FLAG_TRANSPARENT) != 0;
 	v->liquid      = (d->flags & REG_FLAG_LIQUID) != 0;
+
+	// Three bits can name eight shapes and only two exist, so a def from a newer or a
+	// tampered peer can carry a value this build has no geometry for. It reads back as
+	// a full cube rather than as an out-of-range shape id: every consumer of
+	// BlockInfo.shape switches on it, and a hole in that switch is a block that draws
+	// nothing at all. Refusing the record instead would be the stricter answer, but it
+	// belongs in registryDefUnpack() with the rest of the wire validation, and nothing
+	// on the wire can produce a non-zero value yet.
+	v->shape = regShapeOf(d->flags);
+	if (v->shape >= BLOCK_SHAPE_COUNT) v->shape = BLOCK_SHAPE_FULL_CUBE;
+
 	for (int f = 0; f < BLOCK_FACES; f++)
 		v->tex[f] = d->tex[f];
 }

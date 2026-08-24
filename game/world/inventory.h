@@ -36,6 +36,24 @@ typedef BlockId ItemId;
 // paired with a zero count, so "is this slot empty" is one field compare, not two.
 #define ITEM_NONE BLOCK_AIR
 
+// Whether the inventory is able to carry this id at all — the one home for the item-id
+// ceiling, so the rule is stated once instead of being restated at every call site.
+//
+// The ceiling is BLOCK_COUNT and NOT the registry's full 256-id space, on purpose. Slot
+// icons, the crafting tables and the hotbar art are all indexed by item id and are genuinely
+// BLOCK_COUNT wide, and deps/blocksmith-server/game/bsgame.c mirrors exactly this ceiling
+// for BS_INV_OP_PICKUP and BS_INV_OP_CONSUME — so a dynamic (server-registered, 0x80..0xFD)
+// id is not carryable on either side of the wire yet.
+//
+// ⚠ This predicate is also what scene/interact.c refuses a *break* on: a block the bag
+// cannot hold must not be minable, or breaking it deletes it from the world with nothing to
+// show for it. When inventory becomes registry-aware, widening this one function is what
+// lifts both rules at once — and interact.c's guard goes with it.
+static inline bool inventoryCanHold(ItemId item)
+{
+	return item != ITEM_NONE && (uint32_t)item < BLOCK_COUNT;
+}
+
 // ── Slot layout ────────────────────────────────────────────────────────────────────────
 //
 // Both the hotbar and the main grid are the *same* array — the hotbar is simply slots

@@ -25,7 +25,7 @@ InvAddResult inventoryAdd(Inventory* inv, ItemId item, uint8_t count, uint8_t* o
 {
 	if (out_leftover) *out_leftover = count;
 
-	if (!inv || item == ITEM_NONE || item >= BLOCK_COUNT)
+	if (!inv || !inventoryCanHold(item))
 		return INV_ADD_REFUSED;
 
 	if (count == 0) {
@@ -73,7 +73,7 @@ InvAddResult inventoryAdd(Inventory* inv, ItemId item, uint8_t count, uint8_t* o
 
 uint8_t inventoryRemove(Inventory* inv, ItemId item, uint8_t count)
 {
-	if (!inv || item == ITEM_NONE || item >= BLOCK_COUNT || count == 0) return 0;
+	if (!inv || !inventoryCanHold(item) || count == 0) return 0;
 
 	uint8_t remaining = count;
 	for (int i = 0; i < INV_SLOT_COUNT && remaining > 0; i++) {
@@ -344,7 +344,7 @@ bool inventoryLoad(Inventory* inv, const char* world_dir)
 		// id outside the block registry, or a count paired with ITEM_NONE, is treated the
 		// same way a malformed options.ini field is treated — fall back to "empty" rather
 		// than hand the rest of the game a slot state nothing else has ever validated.
-		if (item == ITEM_NONE || item >= BLOCK_COUNT || count == 0) continue;   // slot already zeroed by inventoryInit
+		if (!inventoryCanHold(item) || count == 0) continue;   // slot already zeroed by inventoryInit
 
 		inv->slots[i].item  = item;
 		inv->slots[i].count = (count > INV_STACK_MAX) ? INV_STACK_MAX : count;

@@ -29,6 +29,45 @@ enum {
 	BLOCK_COUNT
 };
 
+// Core blocks that are NOT items — roadmap tasks 17 and 19.
+//
+// These are ordinary compiled-in core registry rows (the core id space is
+// REG_ID_CORE_LO..REG_ID_CORE_HI, 0x01..0x7F — see world/registry.h), appended after
+// BLOCK_PLANKS exactly as every id before them was, and frozen for the same reason: an
+// id is written into every saved chunk and every block-edit packet. What is different
+// is that they sit OUTSIDE the enum above, and BLOCK_COUNT does not move.
+//
+// That is deliberate, and it is not a way of dodging a static assert. BLOCK_COUNT has
+// exactly one live use left in this client — inventoryCanHold() in world/inventory.h,
+// the ceiling on what a slot may carry — and one on the server, BS_BLOCK_COUNT in
+// deps/blocksmith-server/game/validate.h, which bounds the ITEM ids in
+// BS_INV_OP_PICKUP/CONSUME and in the armour slots precisely because those index client
+// tables sized BLOCK_COUNT. Every table indexed by a WORLD block id is already sized
+// REGISTRY_MAX or 256 — world/mesher.c's s_rect, world/visgraph.c's openTable,
+// world/light.c's emission table — because dynamic ids 0x80..0xFD have been arriving
+// over the wire since v1.6.0 Phase A. So BLOCK_COUNT is the item-id ceiling and nothing
+// else, and these two ids are strictly less exotic than a dyn id the client already
+// handles.
+//
+// Neither of these is an item. Water must not be minable or placeable until the
+// survival rung says otherwise, and tall grass has no drop yet. Widening BLOCK_COUNT to
+// 10 would make both legal item ids on THIS client while the server still refused them
+// at 8 — a client/server disagreement invented for no gain — and would need
+// deps/blocksmith-server's BS_BLOCK_COUNT to move in step, in a tree this client does
+// not own. Leaving BLOCK_COUNT alone gets the wanted behaviour for free:
+// inventoryCanHold() answers false, so scene/interact.c refuses the break rather than
+// deleting the block, and neither id can reach the hotbar.
+//
+// When the survival rung gives water a bucket and tall grass a seed drop, the move is
+// to widen inventoryCanHold() past BLOCK_COUNT on both sides — the change
+// scene/interact.c's own ⚠ comment already flags — not to slide these two into the enum
+// above, which would renumber nothing but would quietly re-point the server's item
+// ceiling at them.
+enum {
+	BLOCK_WATER      = BLOCK_COUNT,      // 8
+	BLOCK_TALL_GRASS = BLOCK_COUNT + 1,  // 9
+};
+
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
 // source/world/block_tiles_check.c static-asserts that the two agree, so the
@@ -44,6 +83,8 @@ enum {
 	BTEX_WOOD_TOP,
 	BTEX_LEAVES,
 	BTEX_PLANKS,
+	BTEX_WATER,
+	BTEX_TALL_GRASS,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is
@@ -61,12 +102,32 @@ enum {
 	BLOCK_FACES,
 };
 
+// Block shape (v1.6.0 task 13). What geometry a block turns into, as opposed to how
+// it behaves — the two are deliberately separate axes:
+//
+//   shape  says what the mesher draws and what the raycast is aiming at.
+//   solid  says whether it fills its cell for collision, AO and occlusion.
+//
+// A water block is FULL_CUBE and not solid; a plant is CROSS and not solid; every
+// block that exists today is FULL_CUBE and solid, which is why nothing about the
+// current world changes.
+//
+// Values are frozen: they are packed into BlockDef.flags (see registry.h) and so
+// travel on the wire and into registry.bin. Append, never insert. Three bits are
+// reserved there, so slabs and stairs have room without another format change.
+enum {
+	BLOCK_SHAPE_FULL_CUBE = 0,  // the six axis-aligned faces of a unit cube
+	BLOCK_SHAPE_CROSS     = 1,  // two quads on the cell's diagonals, double-sided
+	BLOCK_SHAPE_COUNT,
+};
+
 typedef struct {
 	const char* name;
 	uint8_t     tex[BLOCK_FACES];
 	bool        solid;         // fills its cell: hides the touching neighbour face
 	bool        transparent;   // drawn, but does not hide what is behind it
 	bool        liquid;
+	uint8_t     shape;         // BLOCK_SHAPE_*
 } BlockInfo;
 
 // Never returns NULL — an unknown id reads back as air, because a bad id should
@@ -75,6 +136,30 @@ const BlockInfo* blockInfo(BlockId id);
 
 static inline bool blockIsSolid(BlockId id) { return blockInfo(id)->solid; }
 static inline bool blockIsAir(BlockId id)   { return id == BLOCK_AIR; }
+
+// Whether this block occupies its whole cell geometrically. This is the question the
+// mesher's occlusion and AO tables want, and it is NOT `solid`: a non-cube shape can
+// never hide the face behind it however solid it is, and a cell it only crosses
+// diagonally is not a crevice for AO purposes.
+static inline bool blockIsFullCube(BlockId id)
+{
+	return blockInfo(id)->shape == BLOCK_SHAPE_FULL_CUBE;
+}
+
+// Whether the mesher emits geometry for this block at all.
+//
+// Until v1.6.0 task 13 this question did not exist: `solid` answered it, because every
+// block that was not air was solid. It has to be its own question now because the two
+// shapes this task exists for break that coincidence in opposite directions — a plant
+// draws without colliding, and so does water. Air never draws; neither does an id with
+// no registry row, which is what keeps a corrupt or not-yet-defined id a hole rather
+// than a cell textured with air's tile.
+bool blockIsDrawn(BlockId id);
+
+// Whether a raycast stops here — i.e. whether the player can aim at it, break it, or
+// place against it. Anything drawn and not a liquid: a plant must be breakable even
+// though you walk straight through it, and you must not be able to mine a lake.
+bool blockIsTargetable(BlockId id);
 
 // Atlas tile for one face. Out-of-range faces return the block's first tile.
 uint8_t blockFaceTex(BlockId id, int face);
