@@ -54,6 +54,7 @@
  * compile-time assert is. */
 #include "world/crafting.h"
 #include "world/inventory.h"
+#include "world/tick.h"
 
 /* Gate<->game framing. Not shared via a header because it is not part of
  * the wire protocol proper (see bs_proto.h's own header comment) — it is a
@@ -75,15 +76,32 @@ enum bs_game_msg {
  * socket: the envelope plus the largest application payload. */
 #define BS_GAME_MAX_DGRAM (BS_GAME_ENVELOPE_BYTES + BS_MAX_PAYLOAD)
 
-/* Tick rate: 10 Hz (100 ms). This is a block-placement game for 2-6 people
- * on 3DS Wi-Fi, not a shooter — nothing here needs sub-100ms precision, and
- * every extra tick is bandwidth spent on stale-tolerant position data
- * across up to BS_GAME_MAX_PLAYERS clients. 10 Hz is the same order as the
- * position-update rate most block-building games use and comfortably below
- * anything that would stress an Old 3DS's Wi-Fi stack or this process's
- * single poll() loop; the poll timeout below is what actually paces it, so
- * a quiet server spends the time between ticks blocked, not spinning. */
-#define BS_GAME_TICK_MS 100u
+/* v1.8.0 task 21. The simulation runs at world/tick.h's TICK_HZ (20 Hz, 50 ms),
+ * from the same shared source file the client compiles, because the spec defines
+ * every mechanic per tick and a mechanic that runs at a different speed on the
+ * server than on the client is a desync by construction.
+ *
+ * This replaces #define BS_GAME_TICK_MS 100u, which was never actually a tick
+ * rate. It was a poll() timeout, and tick() was called unconditionally after
+ * every poll() return — so a wakeup caused by an arriving datagram ticked the
+ * server as well, and the effective tick rate ROSE with traffic. A server that
+ * simulates faster the busier it gets is the specific failure a fixed-step clock
+ * exists to prevent, and it went unnoticed because the only thing tick() did was
+ * broadcast positions, which look perfectly fine arriving early.
+ *
+ * Position broadcast keeps its old 10 Hz cadence by running on every second tick
+ * rather than by holding the whole simulation down to 10 Hz. The original
+ * reasoning for 10 Hz still stands word for word, and is why this is decimated
+ * rather than simply doubled: this is a block-placement game for 2-6 people on
+ * 3DS Wi-Fi, not a shooter — nothing here needs sub-100ms precision, and every
+ * extra broadcast is bandwidth spent on stale-tolerant position data across up
+ * to BS_GAME_MAX_PLAYERS clients. 10 Hz is the same order as the position-update
+ * rate most block-building games use and comfortably below anything that would
+ * stress an Old 3DS's Wi-Fi stack. */
+#define BS_POS_BROADCAST_PERIOD (TICK_HZ / 10)   /* every 2nd tick = 10 Hz */
+
+_Static_assert(TICK_HZ / BS_POS_BROADCAST_PERIOD == 10,
+               "the position broadcast is no longer 10 Hz");
 
 /* V127-A: how long bsgame waits, after JOIN, for a player's first CHUNK_SUB
  * before deciding they are running a pre-V127-A client and falling back to
@@ -143,6 +161,19 @@ struct bs_game {
     uint64_t edits_rejected_rate;
     uint64_t edits_rejected_full;
 
+    /* Simulation steps actually RUN since startup, incremented by tick()
+     * itself rather than read back out of the TickClock in the main loop.
+     * That distinction is the whole point of it: the clock's own count is
+     * what the clock THINKS should have happened, while this is what the
+     * loop DID, and the regression this exists to catch (ticking once per
+     * poll() return, so traffic drives the simulation rate — see
+     * BS_POS_BROADCAST_PERIOD's comment) is precisely a case where those two
+     * numbers disagree. Reported in the status snapshot so the tick rate is
+     * measurable from outside the process, which is what
+     * bsgame_test.c's test_tick_rate_is_traffic_independent() measures it
+     * with; nothing in the simulation reads it. */
+    uint64_t ticks_total;
+
     /* The terrain seed this server's world generates from, sent to every
      * client at JOIN as BS_APP_WORLD_INFO. Persisted in --state-dir next to
      * block_diffs.bin, because the diffs are coordinates into the terrain this
@@ -162,6 +193,19 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* v1.8.0 task 21. The tick clock is fed microseconds, and a 50 ms tick period
+ * paced by a millisecond clock would quantise to 2% error — small, but it is
+ * error in the one number the whole simulation's speed is defined by, and it
+ * would accumulate in one direction forever. Same CLOCK_MONOTONIC as now_ms:
+ * the wall clock jumping (NTP, an operator setting the date) must not hand the
+ * simulation a burst of catch-up ticks or a stall. */
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
 }
 
 __attribute__((format(printf, 1, 2)))
@@ -1204,9 +1248,20 @@ static void handle_gate_msg(struct bs_game *g)
 
 /* ------------------------------------------------------------------- tick */
 
-static void tick(struct bs_game *g)
+static void tick(struct bs_game *g, uint64_t t)
 {
     uint64_t now = now_ms();
+
+    /* Counted here, at the one place a simulation step actually happens, so
+     * no rearrangement of the main loop can change what the number means. */
+    g->ticks_total++;
+
+    /* v1.8.0 task 21. The legacy-grace check below runs every tick — it is two
+     * integer comparisons per player and being twice as responsive costs
+     * nothing — but the position broadcast is decimated back to its old 10 Hz,
+     * because that rate was chosen for bandwidth reasons that did not change
+     * when the simulation rate did. See BS_POS_BROADCAST_PERIOD. */
+    const bool send_pos = tickDue(t, BS_POS_BROADCAST_PERIOD, 0);
 
     for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
         BsPlayer *p = &g->players.p[i];
@@ -1227,6 +1282,7 @@ static void tick(struct bs_game *g)
             p->legacy_sync_sent = true;
         }
 
+        if (!send_pos) continue;
         if (!p->has_pos || !p->pos_dirty) continue;
 
         uint8_t out[BS_POS_UPDATE_S_BYTES];
@@ -1277,7 +1333,16 @@ static void write_status(struct bs_game *g, uint64_t t)
     fprintf(f, "uptime_s %llu\n", (unsigned long long)((t - g->started_ms) / 1000u));
     fprintf(f, "players %u\n", players);
     fprintf(f, "players_max %u\n", BS_GAME_MAX_PLAYERS);
-    fprintf(f, "tick_ms %u\n", BS_GAME_TICK_MS);
+    fprintf(f, "tick_ms %u\n", (unsigned)TICK_PERIOD_MS);
+    /* Two readings of this, a known wall-clock interval apart, are the only
+     * way to observe the simulation's real rate from outside the process.
+     * Written here rather than one line later so it sits with tick_ms, the
+     * rate it is the counterpart to. tools/bsgate-status stores every
+     * key=value line it does not recognise and prints only the ones it knows
+     * about, so this extra line is inert there. */
+    fprintf(f, "ticks_total %llu\n", (unsigned long long)g->ticks_total);
+    fprintf(f, "pos_broadcast_ms %u\n",
+            (unsigned)(TICK_PERIOD_MS * BS_POS_BROADCAST_PERIOD));
     fprintf(f, "block_diffs %u\n", diffstoreCount(&g->diffs));
     fprintf(f, "block_diffs_max %u\n", BS_DIFF_MAX);
     fprintf(f, "joins_total %llu\n", (unsigned long long)g->joins_total);
@@ -1459,9 +1524,28 @@ int main(int argc, char **argv)
 
     logf_("game: ready (game-socket %s, gate-socket %s)", g.game_sock_path, g.gate_sock_path);
 
+    /* v1.8.0 task 21. The simulation clock. TICK_MAX_CATCHUP_DEFAULT matters
+     * here for a different reason than it does on the console: this process can
+     * be SIGSTOPped, migrated, or simply descheduled for a long time on a busy
+     * Proxmox host, and without the clamp the first tick after that would try to
+     * run every tick the machine was away for, in one pass, while datagrams
+     * queue up behind it. */
+    TickClock clock;
+    tickClockInit(&clock, TICK_MAX_CATCHUP_DEFAULT);
+
     while (!g_quit) {
+        /* Sleep exactly until the next tick is due, never a fixed 100 ms. The
+         * +999 rounds up so the timeout can never be 0 — poll(…, 0) returns
+         * immediately, which would spin this loop at whatever rate the kernel
+         * can schedule it. */
+        const int64_t until_us   = tickClockUntilNextUs(&clock);
+        int           timeout_ms = (int)((until_us + 999) / 1000);
+        if (timeout_ms < 1) timeout_ms = 1;
+
+        const uint64_t slept_from = now_us();
+
         struct pollfd fd = { .fd = g.unix_fd, .events = POLLIN };
-        int r = poll(&fd, 1, (int)BS_GAME_TICK_MS);
+        int r = poll(&fd, 1, timeout_ms);
         if (r < 0 && errno != EINTR) {
             logf_("game: poll: %s", strerror(errno));
             break;
@@ -1483,7 +1567,15 @@ int main(int argc, char **argv)
             write_status(&g, now_ms());
         }
 
-        tick(&g);
+        /* Bank the real time this iteration actually consumed — the poll sleep
+         * plus the drain plus the status write — and run whatever number of
+         * ticks that has earned. Usually one. Zero when a datagram woke the
+         * poll early, which is the entire bug this replaces: the old code
+         * ticked on that wakeup regardless. */
+        const int n = tickClockAdvance(&clock, (int64_t)(now_us() - slept_from));
+        const uint64_t first = tickClockCount(&clock) - (uint64_t)n;
+        for (int i = 0; i < n; i++)
+            tick(&g, first + (uint64_t)i + 1u);
     }
 
     logf_("game: shutting down");

@@ -890,6 +890,196 @@ static void test_status_snapshot(void)
     check(saw_newcomer_line, "a player line names the connected player's label");
 }
 
+/* ------------------------------------------------ tick-rate independence
+ *
+ * The simulation rate has to be a property of the clock and nothing else.
+ * bsgame used to tick once per poll() return, so every arriving datagram
+ * bought an extra simulation step and the effective rate ROSE with traffic —
+ * a busy server ran fast, an idle one ran slow, and every mechanic defined
+ * per tick (fluid spread, smelting, hunger, growth) changed speed with the
+ * player count. world/tick.c's fixed-step accumulator replaced that, but
+ * until this scenario existed nothing checked it, so a refactor could put the
+ * old behaviour back and the suite would stay green.
+ *
+ * This measures the daemon end to end: the real forked bsgame, its real
+ * poll(), its real main loop, observed only from outside via ticks_total in
+ * the SIGUSR1 status snapshot (which bsgame.c increments inside tick()
+ * itself, at the one place a simulation step actually happens — not from the
+ * TickClock's own count, which would still look right if the loop started
+ * calling tick() per wakeup again). Nothing here reimplements the clock; a
+ * test that recompiled the tick logic as its own translation unit would pass
+ * with the daemon's copy of it deleted. */
+
+/* Three seconds per arm. The failure being guarded against is a RATE, so the
+ * window has to be long relative to everything that blurs a rate reading:
+ * it is 60 tick periods, ~1000x the few milliseconds of uncertainty in each
+ * status-file timestamp below, and well past the 500 ms legacy-grace one-shot
+ * that JOIN eventually fires. It also means the busy arm delivers well over a
+ * thousand datagrams, so the one-extra-tick-per-wakeup regression has room to
+ * accumulate into an unmistakable difference instead of hiding inside noise —
+ * a shorter window can be answered correctly by a broken server simply
+ * because too little happened in it. Three arms cost the suite ~9.5 s. */
+#define BS_TICK_WINDOW_MS 3000u
+
+/* The accumulator can never run FAST — it spends banked real time and hands
+ * back the remainder — so a reading above the top of this band means the loop
+ * is ticking on something other than elapsed time. It can legitimately run
+ * slow if the host cannot keep up (that is what TickClock's `dropped` counts),
+ * hence a band rather than an equality, but 20 TPS on an idle Linux box is not
+ * demanding and a reading under 16 is a real finding, not noise. */
+#define BS_TICK_TPS_LO 16.0
+#define BS_TICK_TPS_HI 24.0
+
+/* The busy arm is worthless if the packets never actually got sent, so the
+ * arm asserts its own premise: at least 200 datagrams a second across the
+ * window. Without this the whole scenario could pass by not testing anything. */
+#define BS_TICK_BUSY_MIN_PKT (BS_TICK_WINDOW_MS / 5u)
+
+/* Forces a fresh status snapshot and reads ticks_total out of it, along with
+ * the wall-clock instant it was observed. The file is unlinked first so a
+ * stale one from the previous sample can never be mistaken for this one, and
+ * bsgame writes it to a temp path and renames, so the moment it exists it is
+ * complete. */
+static bool sample_ticks(uint64_t *ticks_out, uint64_t *at_ms)
+{
+    char status_path[192];
+    snprintf(status_path, sizeof status_path, "%s/status.txt", g_dir);
+    unlink(status_path);
+
+    if (kill(g_daemon, SIGUSR1) != 0) die("kill SIGUSR1");
+
+    /* Polled at 2 ms so the timestamp taken below is close to the rename that
+     * published the file; the daemon itself takes up to one tick period to
+     * notice the signal, which is why the deadline is generous. */
+    struct stat st;
+    bool appeared = false;
+    for (unsigned waited = 0; waited < 2000u; waited += 2u) {
+        if (stat(status_path, &st) == 0) { appeared = true; break; }
+        msleep(2);
+    }
+    if (!appeared) return false;
+    *at_ms = now_ms();
+
+    FILE *f = fopen(status_path, "r");
+    if (f == NULL) return false;
+
+    bool got = false;
+    char line[256];
+    while (fgets(line, sizeof line, f) != NULL) {
+        unsigned long long v;
+        if (sscanf(line, "ticks_total %llu", &v) == 1) {
+            *ticks_out = (uint64_t)v;
+            got = true;
+        }
+    }
+    fclose(f);
+    return got;
+}
+
+/* Sends one POS_UPDATE every `gap_ms` until `until_ms`, and returns how many
+ * it managed. POS_UPDATE is used because bsgame answers it with no datagram
+ * at all when the sender is the only relevant player and touches no disk (see
+ * handle_pos_update) — so this arm varies the packet rate and nothing else.
+ * gap_ms 0 means send nothing: the idle arm. */
+static unsigned pump_traffic(uint32_t sid, unsigned gap_ms, uint64_t until_ms)
+{
+    unsigned sent = 0;
+
+    if (gap_ms == 0) {
+        uint64_t at;
+        while ((at = now_ms()) < until_ms) {
+            uint64_t left = until_ms - at;
+            msleep(left > 20u ? 20u : (unsigned)left);
+        }
+        return 0;
+    }
+
+    while (now_ms() < until_ms) {
+        send_pos_update(sid, (float)sent, 64.0f, 0.0f, 0.0f, 0.0f);
+        sent++;
+        msleep(gap_ms);
+    }
+    return sent;
+}
+
+/* One arm: sample, generate traffic for the window, sample again. Returns
+ * ticks per second, or -1.0 if a snapshot could not be read. */
+static double measure_tps(uint32_t sid, unsigned gap_ms, unsigned *sent_out)
+{
+    uint64_t k0 = 0, k1 = 0, t0 = 0, t1 = 0;
+
+    *sent_out = 0;
+    if (!sample_ticks(&k0, &t0)) return -1.0;
+    *sent_out = pump_traffic(sid, gap_ms, t0 + BS_TICK_WINDOW_MS);
+    if (!sample_ticks(&k1, &t1)) return -1.0;
+    if (t1 <= t0 || k1 < k0) return -1.0;
+
+    return (double)(k1 - k0) * 1000.0 / (double)(t1 - t0);
+}
+
+static void test_tick_rate_is_traffic_independent(void)
+{
+    puts("tick rate is independent of network traffic");
+    drain();
+
+    const uint32_t sid = 0x71CC0007u;
+    send_join(sid, "ticker");
+
+    /* Let JOIN's own burst (WORLD_INFO, REGISTRY_INFO, INV_STATE,
+     * PLAYER_STATE) and the legacy-grace WORLD_SYNC land and be thrown away
+     * before the first window opens, so no arm is measured across them. */
+    msleep(BS_CHUNK_LEGACY_GRACE_MS + 400u);
+    drain();
+
+    unsigned sent_idle = 0, sent_light = 0, sent_busy = 0;
+
+    const double tps_idle = measure_tps(sid, 0, &sent_idle);
+    drain();
+    const double tps_light = measure_tps(sid, 100, &sent_light);   /* ~10 packets/s */
+    drain();
+    const double tps_busy = measure_tps(sid, 2, &sent_busy);       /* as fast as a 2 ms
+                                                                      sleep allows */
+    drain();
+
+    printf("        idle  %6.2f TPS over %ums, %u packets\n",
+           tps_idle, BS_TICK_WINDOW_MS, sent_idle);
+    printf("        light %6.2f TPS over %ums, %u packets\n",
+           tps_light, BS_TICK_WINDOW_MS, sent_light);
+    printf("        busy  %6.2f TPS over %ums, %u packets\n",
+           tps_busy, BS_TICK_WINDOW_MS, sent_busy);
+
+    /* Control. Stays green whether or not the rate itself is correct, so a
+     * red anywhere below is a real finding and not a broken harness. */
+    check(tps_idle > 0.0 && tps_light > 0.0 && tps_busy > 0.0,
+          "all three traffic arms produced a tick-rate reading");
+
+    /* The busy arm asserts its own premise before anything is concluded
+     * from it. */
+    check(sent_busy >= BS_TICK_BUSY_MIN_PKT,
+          "the busy arm actually delivered at least 200 packets a second");
+
+    check(tps_idle >= BS_TICK_TPS_LO && tps_idle <= BS_TICK_TPS_HI,
+          "a server receiving nothing ticks at 20 TPS");
+    check(tps_light >= BS_TICK_TPS_LO && tps_light <= BS_TICK_TPS_HI,
+          "a server receiving ~10 packets/s ticks at 20 TPS");
+    check(tps_busy >= BS_TICK_TPS_LO && tps_busy <= BS_TICK_TPS_HI,
+          "a server receiving hundreds of packets/s still ticks at 20 TPS");
+
+    /* And the claim itself, stated as a comparison rather than as three
+     * separate band checks, so it stays meaningful even on a host slow
+     * enough to drag every arm down together. */
+    check(tps_busy <= tps_idle * 1.25 && tps_busy >= tps_idle * 0.75,
+          "the busy tick rate matches the idle one within 25%");
+
+    /* Second control, and a crash check on the burst itself. */
+    check(kill(g_daemon, 0) == 0,
+          "the daemon survives a sustained packet burst");
+
+    send_leave(sid);
+    msleep(50);
+    drain();
+}
+
 static void test_disk_format(void)
 {
     puts("on-disk format");
@@ -2159,6 +2349,7 @@ int main(void)
     test_malformed_block_edit_length_kicks();
     test_restart_persists_diffs();
     test_status_snapshot();
+    test_tick_rate_is_traffic_independent();
     test_disk_format();
 
     test_chunk_sub_delivers_scoped_diffs();

@@ -236,9 +236,19 @@ static bool tmpPath(const char* path, char* out, size_t cap)
 	return snprintf(out, cap, "%s.tmp", path) < (int)cap;
 }
 
+// A NULL directory is a caller bug (see inventorySave/inventoryLoad below); an empty one
+// is a caller that has lost track of which world it is in — both refuse rather than
+// resolving "%s/%s" into "/inventory.dat", this process's filesystem root, instead of the
+// sandboxed world directory every caller actually means. Mirrors world/playerpose.c's
+// dirUsable() so the two save formats agree on what counts as a usable directory.
+static bool dirUsable(const char* world_dir)
+{
+	return world_dir != NULL && world_dir[0] != '\0';
+}
+
 bool inventorySave(const Inventory* inv, const char* world_dir)
 {
-	if (!inv || !world_dir) return false;
+	if (!inv || !dirUsable(world_dir)) return false;
 
 	char path[512], tmp[512];
 	if (!inventoryPath(path, sizeof(path), world_dir)) return false;
@@ -303,7 +313,7 @@ static void inventoryRecover(const char* path)
 
 bool inventoryLoad(Inventory* inv, const char* world_dir)
 {
-	if (!inv || !world_dir) return false;
+	if (!inv || !dirUsable(world_dir)) return false;
 
 	// Always start from a fully valid, empty inventory. Every early return below leaves
 	// this in place, so "file missing", "file corrupt" and "file from an incompatible
@@ -319,17 +329,24 @@ bool inventoryLoad(Inventory* inv, const char* world_dir)
 	FILE* f = fopen(path, "rb");
 	if (!f) return true;   // missing file is not an error — see inventory.h
 
-	uint8_t buf[INV_FILE_BYTES];
+	// One byte more than the record, so a file that is LONGER than INV_FILE_BYTES is
+	// refused too, the same way world/playerpose.c's playerPoseLoad() reads one byte more
+	// than its own record. Before this, inventoryLoad read exactly sizeof(buf) bytes and so
+	// could not tell a 68-byte file from a 6800-byte one — a file longer than the record is
+	// as wrong as a short one.
+	uint8_t buf[INV_FILE_BYTES + 1];
 	const size_t n = fread(buf, 1, sizeof(buf), f);
 	fclose(f);
-	if (n != sizeof(buf)) return true;   // short/truncated file: defaults
+	if (n != INV_FILE_BYTES) return true;   // short, or trailing bytes: defaults
 
 	if (get32(buf + 0) != INVENTORY_MAGIC)               return true;
 	if (get32(buf + 4) != INVENTORY_VERSION)             return true;
 	if (get32(buf + 8) != (uint32_t)INV_SLOT_COUNT)      return true;   // layout changed since save
 
 	const uint32_t stored   = get32(buf + 12);
-	const uint32_t computed = crc32(buf + 16, sizeof(buf) - 16);
+	// INV_FILE_BYTES, not sizeof(buf): buf is now one byte larger than the record (above),
+	// and the crc was never computed over that extra byte by the writer.
+	const uint32_t computed = crc32(buf + 16, INV_FILE_BYTES - 16);
 	if (stored != computed) return true;   // corrupted payload: defaults
 
 	uint8_t sel = buf[16];

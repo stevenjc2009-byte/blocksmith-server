@@ -80,7 +80,7 @@ LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 # world/registry.c IS compiled (v1.6.0 Phase A): bsgame owns the canonical
 # registry state — it loads <state-dir>/registry.bin at boot, fingerprints it
 # into REGISTRY_INFO, and streams dynamic defs back on REGISTRY_FETCH.
-WORLD_OBJS := world/inventory.o world/crafting.o world/crc32.o world/registry.o
+WORLD_OBJS := world/inventory.o world/crafting.o world/crc32.o world/registry.o world/tick.o
 
 OBJS := bsgame.o diffstore.o playerstate.o players.o validate.o $(WORLD_OBJS)
 
@@ -124,7 +124,7 @@ test: check-world-drift all bsgame_test
 # proves two implementations of them are identical is comparing the bytes
 # that produce that control flow. Hence `cmp -s`, run whenever the client
 # tree this could drift from is actually sitting next to this repo.
-VENDORED_WORLD_FILES := block.h inventory.h inventory.c crafting.h crafting.c crc32.h crc32.c registry.h registry.c
+VENDORED_WORLD_FILES := block.h inventory.h inventory.c crafting.h crafting.c crc32.h crc32.c registry.h registry.c tick.h tick.c
 
 ifeq ($(BS_HAVE_CLIENT_WORLD_HEADERS),1)
 check-world-drift:

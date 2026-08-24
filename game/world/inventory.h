@@ -227,13 +227,15 @@ uint8_t inventoryHeldCount(const Inventory* inv);
 // game has not validated.
 
 // Loads `world_dir`/inventory.dat into `inv`. Always leaves `inv` fully valid (see
-// inventoryInit) and always returns true, except when `inv` or `world_dir` is NULL, which
-// is a caller bug rather than a file-format problem.
+// inventoryInit) and always returns true, except when `inv` is NULL or `world_dir` is NULL
+// or empty, which is a caller bug rather than a file-format problem — see inventory.c's
+// dirUsable(). A file longer than the on-disk record is refused the same as a short one.
 bool inventoryLoad(Inventory* inv, const char* world_dir);
 
 // Saves `inv` to `world_dir`/inventory.dat. False on any IO failure (could not open the
-// tmp file, a short write, the final rename failing), in which case the previous save (if
-// any) is left exactly as it was — nothing here touches the real path until the
-// replacement is known-good and closed. The caller counts a failure rather than retries,
-// same as a failed region write; a lost inventory save is not worth stalling a frame over.
+// tmp file, a short write, the final rename failing) or on a NULL/empty `world_dir` (see
+// inventory.c's dirUsable()), in which case the previous save (if any) is left exactly as
+// it was — nothing here touches the real path until the replacement is known-good and
+// closed. The caller counts a failure rather than retries, same as a failed region write;
+// a lost inventory save is not worth stalling a frame over.
 bool inventorySave(const Inventory* inv, const char* world_dir);

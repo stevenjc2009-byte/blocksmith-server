@@ -42,7 +42,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLIENT_WORLD="$REPO_ROOT/../../source/world"
 VENDOR_WORLD="$REPO_ROOT/game/world"
 
-FILES=(block.h inventory.h inventory.c crafting.h crafting.c crc32.h crc32.c registry.h registry.c)
+FILES=(block.h inventory.h inventory.c crafting.h crafting.c crc32.h crc32.c registry.h registry.c tick.h tick.c)
 
 [[ -d "$CLIENT_WORLD" ]] || die "no client tree at $CLIENT_WORLD — this only works from inside a full Blocksmith checkout (this repo at <blocksmith>/deps/blocksmith-server), the same layout game/Makefile's WORLD probe requires."
 

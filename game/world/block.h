@@ -161,5 +161,24 @@ bool blockIsDrawn(BlockId id);
 // though you walk straight through it, and you must not be able to mine a lake.
 bool blockIsTargetable(BlockId id);
 
+// Whether breaking this block yields nothing to carry (v1.7.1 task 47).
+//
+// This exists because scene/interact.c used to ask ONE question — "can the bag hold what I am
+// about to break?" — and treat a no as "then it cannot be broken". That is right for a block
+// whose id the bag refuses because of the BLOCK_COUNT ceiling, and wrong for a plant, which is
+// meant to break and simply has nothing to give you. The two had been the same question only by
+// coincidence, and the coincidence broke the moment task 19 shipped tall grass: the comment on
+// blockIsTargetable above says a plant must be breakable, and it was not. steve reported it as
+// "the grass is not breakable, I do not know why that is" on 2026-08-24.
+//
+// Answered from the SHAPE, not from an id: every cross-quad plant behaves this way, so the next
+// one added — and v1.8.2 adds several, per biome — is correct without touching this file. When
+// the survival rung gives plants a real drop (seeds, saplings), this becomes the lookup that
+// returns it instead of a bool, and interact.c's call site does not move.
+static inline bool blockDropsNothing(BlockId id)
+{
+	return blockInfo(id)->shape == BLOCK_SHAPE_CROSS;
+}
+
 // Atlas tile for one face. Out-of-range faces return the block's first tile.
 uint8_t blockFaceTex(BlockId id, int face);
