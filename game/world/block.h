@@ -128,6 +128,13 @@ typedef struct {
 	bool        transparent;   // drawn, but does not hide what is behind it
 	bool        liquid;
 	uint8_t     shape;         // BLOCK_SHAPE_*
+	// How long a bare hand takes to break this block, in 20 TPS ticks (v1.9.x task 50).
+	// Copied straight out of BlockDef.hardness, which has carried this byte on the wire and
+	// in registry.bin since v1.6.0 Phase A — the read-side view simply never exposed it, so
+	// every caller that wanted it had to reach past blockInfo() into the registry. 0 means
+	// "no break time", which is air and water: neither is targetable, so neither is ever
+	// asked. world/mining.h turns this into the number of ticks a break actually takes.
+	uint8_t     hardness;
 } BlockInfo;
 
 // Never returns NULL — an unknown id reads back as air, because a bad id should
@@ -136,6 +143,11 @@ const BlockInfo* blockInfo(BlockId id);
 
 static inline bool blockIsSolid(BlockId id) { return blockInfo(id)->solid; }
 static inline bool blockIsAir(BlockId id)   { return id == BLOCK_AIR; }
+
+// Bare-hand break time in 20 TPS ticks. Zero for anything with no break time of its own —
+// air, and the ids no raycast will ever hand you. See world/mining.h for the arithmetic
+// that turns this into a break duration; this is only the lookup.
+static inline uint8_t blockHardnessTicks(BlockId id) { return blockInfo(id)->hardness; }
 
 // Whether this block occupies its whole cell geometrically. This is the question the
 // mesher's occlusion and AO tables want, and it is NOT `solid`: a non-cube shape can

@@ -12,51 +12,82 @@
 // BS_BLOCK_COUNT). 0x08 and 0x09 — water and tall grass, roadmap tasks 17 and 19 —
 // are core rows that are deliberately NOT items; world/block.h explains why that
 // distinction exists and why BLOCK_COUNT stayed at 8 rather than following them.
+//
+// ── .hardness (roadmap task 50) ────────────────────────────────────────────────────────
+//
+// The unit is TICKS at 20 TPS — world/tick.h's clock — and not deciseconds, not seconds,
+// not frames. Ticks because the ARM11 has no hardware divide instruction and this project
+// avoids a runtime division wherever a stored value will do: a break timer counting ticks
+// compares against this byte directly, where deciseconds would need a divide (or a second
+// constant) at every comparison. Frames were never a candidate; world/tick.h's own header
+// says why, and world/mining.h repeats it at the call site.
+//
+// These numbers are TUNED FOR A TOOLLESS GAME and are deliberately not Minecraft's. There
+// are no tools in this codebase yet (world/inventory.h says so outright: an ItemId IS a
+// BlockId), so every break is a bare-hand break, and Minecraft's bare-hand stone at 7.5 s
+// would be nothing but a wait. Roadmap task 32 (v1.10.0) introduces tools and retunes
+// these; until then:
+//
+//   grass / dirt   12 ticks = 0.60 s     sand         10 ticks = 0.50 s
+//   stone          45 ticks = 2.25 s     wood/planks  40 ticks = 2.00 s
+//   leaves          4 ticks = 0.20 s     tall grass    1 tick  = 0.05 s
+//
+// Air and water are 0, set explicitly rather than left to the zero-fill. Neither is
+// targetable (blockIsTargetable() is `drawn && !liquid`, and air is not drawn), so neither
+// value is ever read — writing them down says that is a decision and not an omission.
 static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	[REG_ID_AIR] = {
 		.name  = "air",
 		.tex   = { 0, 0, 0, 0, 0, 0 },
 		.flags = REG_FLAG_TRANSPARENT,
+		.hardness = 0,
 	},
 	[1] = { // grass
 		.name  = "grass",
 		.tex   = { BTEX_GRASS_SIDE, BTEX_GRASS_SIDE, BTEX_GRASS_TOP,
 		           BTEX_DIRT,        BTEX_GRASS_SIDE, BTEX_GRASS_SIDE },
 		.flags = REG_FLAG_SOLID,
+		.hardness = 12,
 	},
 	[2] = {
 		.name  = "dirt",
 		.tex   = { BTEX_DIRT, BTEX_DIRT, BTEX_DIRT, BTEX_DIRT, BTEX_DIRT, BTEX_DIRT },
 		.flags = REG_FLAG_SOLID,
+		.hardness = 12,
 	},
 	[3] = {
 		.name  = "stone",
 		.tex   = { BTEX_STONE, BTEX_STONE, BTEX_STONE,
 		           BTEX_STONE, BTEX_STONE, BTEX_STONE },
 		.flags = REG_FLAG_SOLID,
+		.hardness = 45,
 	},
 	[4] = {
 		.name  = "sand",
 		.tex   = { BTEX_SAND, BTEX_SAND, BTEX_SAND, BTEX_SAND, BTEX_SAND, BTEX_SAND },
 		.flags = REG_FLAG_SOLID,
+		.hardness = 10,
 	},
 	[5] = { // wood
 		.name  = "wood",
 		.tex   = { BTEX_WOOD_SIDE, BTEX_WOOD_SIDE, BTEX_WOOD_TOP,
 		           BTEX_WOOD_TOP,  BTEX_WOOD_SIDE, BTEX_WOOD_SIDE },
 		.flags = REG_FLAG_SOLID,
+		.hardness = 40,
 	},
 	[6] = { // leaves: solid (fills its cell) but transparent (alpha-0 holes)
 		.name  = "leaves",
 		.tex   = { BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES,
 		           BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES },
 		.flags = REG_FLAG_SOLID | REG_FLAG_TRANSPARENT,
+		.hardness = 4,
 	},
 	[7] = { // planks
 		.name  = "planks",
 		.tex   = { BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS,
 		           BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS },
 		.flags = REG_FLAG_SOLID,
+		.hardness = 40,
 	},
 	// Roadmap task 17. A full cube, drawn, NOT solid, and a liquid.
 	//
@@ -96,6 +127,10 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		.tex   = { BTEX_WATER, BTEX_WATER, BTEX_WATER,
 		           BTEX_WATER, BTEX_WATER, BTEX_WATER },
 		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID,
+		// Explicitly 0 and not defaulted: water carries REG_FLAG_LIQUID, so
+		// blockIsTargetable() is false and no break timer can ever ask. Written down so a
+		// later reader knows it is a decision rather than a row that was missed.
+		.hardness = 0,
 	},
 	// Roadmap task 19, and the first block in the game to use BLOCK_SHAPE_CROSS — the
 	// non-cube geometry path v1.6.0 task 13 built into world/mesher.c and that nothing
@@ -131,6 +166,7 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		.tex   = { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
 		           BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS },
 		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
 	},
 };
 
@@ -171,6 +207,7 @@ static void refreshView(BlockId id)
 	v->solid       = (d->flags & REG_FLAG_SOLID) != 0;
 	v->transparent = (d->flags & REG_FLAG_TRANSPARENT) != 0;
 	v->liquid      = (d->flags & REG_FLAG_LIQUID) != 0;
+	v->hardness    = d->hardness;
 
 	// Three bits can name eight shapes and only two exist, so a def from a newer or a
 	// tampered peer can carry a value this build has no geometry for. It reads back as
