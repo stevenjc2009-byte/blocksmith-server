@@ -106,10 +106,47 @@ SystemCallFilter=~@privileged @resources @obsolete @mount @debug @cpu-emulation 
 # unprivileged container without nesting.
 
 # Bounded so a leak or a flood on the game-logic side cannot take the host
-# down with it. This process holds one bounded in-memory diff table
-# (game/diffstore.h: BS_DIFF_MAX = 65536 entries, ~1.5 MiB live + ~512 KiB
-# index) plus a small fixed-size player table — 128M is generous headroom,
-# not a tight fit, same ceiling as bsgate for the same reason.
+# down with it. This process holds one bounded in-memory diff table plus a
+# small fixed-size player table — 128M is generous headroom, not a tight fit,
+# same ceiling as bsgate for the same reason.
+#
+# The diff table is one instance of game/diffstore.h's BsDiffStore:
+#   entry[BS_DIFF_MAX]    131072 x sizeof(BsDiff)  = 131072 x 16 = 2.000 MiB
+#   table[BS_DIFF_SLOTS]  262144 x sizeof(int32_t) = 262144 x  4 = 1.000 MiB
+#   sizeof(BsDiffStore)                            = 3146248 B   = 3.0005 MiB
+# Each figure names the struct it came from on purpose, so the next drift is
+# traceable to something re-derivable instead of to a number nobody can check.
+# Measured, not estimated: compiled against game/diffstore.h with this repo's
+# own CFLAGS and printed with sizeof on x86-64 Linux (gcc 15.2.0), 2026-08-25.
+#
+# Cross-checked against server commit b95f980 (2026-08-21), the commit that
+# raised BS_DIFF_MAX 65536 -> 131072, which records "2 MiB of entries plus 1 MiB
+# of index, measured in the linked binary as bss 3181512 bytes". Two independent
+# routes to the same 2 + 1. The 3181512 there is whole-binary bss and so is
+# larger than the 3146248 above, which is this one struct alone; the ~35 KiB
+# difference is the other statics in the image, not a disagreement.
+#
+# This used to read "BS_DIFF_MAX = 65536 entries, ~1.5 MiB live + ~512 KiB
+# index", and it was wrong in a more interesting way than simple staleness: it
+# is a mixture of two eras that reconciles against no single value. The count
+# was left at the pre-b95f980 65536, so an admin sizing a container off this
+# line planned for half the entries the process actually allocates. The
+# "~512 KiB index" was CORRECT, but for the old BS_DIFF_SLOTS of 131072. And
+# "~1.5 MiB live" matched neither era — 65536 x 16 is 1.000 MiB, not 1.5; it
+# looks like live+index summed and then double-counted. Doubling those figures
+# would therefore have produced a wrong answer twice over, which is why they are
+# recomputed here from the real sizeof rather than scaled.
+#
+# BS_DIFF_MAX itself is deliberately NOT changed by this edit, and the client's
+# source/net/blockdiff.h declaring 65536 against this repo's 131072 is DELIBERATE
+# DESIGN, not drift: what capped BS_DIFF_MAX was never memory here, it was memory
+# on a 3DS, because the client's inbox had to match the server's store — and once
+# per-column diff subscription landed the console holds edits for loaded columns
+# only, so the two ceilings correctly came apart. Do not "fix" them into
+# agreement. The client's check-diffcap-drift guard (client commit 6ff0b0f) takes
+# the same stance: it asserts the client's recorded copy of the server's value
+# still matches this repo's on-disk value, and pointedly does not assert that the
+# two caps are equal.
 MemoryMax=128M
 TasksMax=16
 LimitNOFILE=256
