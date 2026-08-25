@@ -57,40 +57,110 @@ _Static_assert(INV_STACK_MAX == BS_INV_STACK_MAX,
 _Static_assert(RECIPE_COUNT == BS_RECIPE_COUNT,
                "recipe count must track world/crafting.h");
 
+/* The registry wire record size, the one the REGISTRY_DEFS batch is built out
+ * of. Same shape and same reasoning as the four above, and unconditional for
+ * the same reason the REG_ID_DYN_HI include at the top of this file is:
+ * world/registry.h is VENDORED into game/world/, so this holds in the standalone
+ * daemon build too, not just in a client checkout.
+ *
+ * This is the assert that was missing, and its absence was not theoretical.
+ * bsgame.c's handle_registry_fetch() sizes its stack buffer and strides its
+ * packing with REGISTRY_WIRE_RECORD_BYTES, but declares the packet's length with
+ * BS_APP_REGISTRY_DEFS_BYTES(), which was a bare `28u`. Measured on the real
+ * headers with one extra byte added to BlockDef: 36 records packed 1048 bytes
+ * behind a declared wire length of 1012 — 36 bytes short on every batch — with
+ * MAX_N still 36 when only 35 fit, and 1048 overrunning BS_MAX_PAYLOAD (1024).
+ * gcc exited 0 with no warning. The failure mode is mismatched framing plus a
+ * payload overrun, and the only thing that turns it into a build error is this
+ * line. */
+_Static_assert(REGISTRY_WIRE_RECORD_BYTES == BS_REGISTRY_WIRE_RECORD_BYTES,
+               "REGISTRY_WIRE_RECORD_BYTES (world/registry.h) and "
+               "BS_REGISTRY_WIRE_RECORD_BYTES (proto/bs_proto.h) must be equal: "
+               "the REGISTRY_DEFS batch is packed with the first and its wire "
+               "length is declared with the second");
+
+/* BS_CHUNK_DIM and the shift bs_col_of() maps a block coordinate to a column
+ * with are the same constant written two ways, in the same header, with nothing
+ * relating them. Both are proto-side, so this compares bs_proto.h against
+ * itself rather than against a world header — it belongs here anyway, because
+ * bs_proto.h carries no asserts of its own and every other endpoint that
+ * includes it is a 3DS build this repo does not compile. */
+_Static_assert((1u << BS_CHUNK_DIM_SHIFT) == BS_CHUNK_DIM,
+               "BS_CHUNK_DIM_SHIFT must be log2(BS_CHUNK_DIM) (proto/bs_proto.h): "
+               "bs_col_of() shifts by the first to divide by the second");
+
 /* Pure, <3ds.h>-free headers (see source/world/block.h's own header comment).
  * Reading them here keeps BS_WORLD_HEIGHT and BS_BLOCK_COUNT honest instead of
  * letting them drift from the client's real world model. Nothing here links
  * against source/world's .c files: these are constants and an enum, not code.
  *
- * Only ONE of the two is actually reached through -I$(WORLD), despite what this
- * comment used to imply. Measured with `gcc -E -H` on a probe compiled in game/
- * with the real CFLAGS: "world/world.h" prints `. ../../../source/world/world.h`
- * (there is no game/world/world.h to find), but "world/block.h" prints
- * `. world/block.h` — the vendored game/world/block.h — and prints the same with
- * -I. dropped, because a quoted include searches the including file's OWN
- * directory before any -I path. block.h is in VENDORED_WORLD_FILES, so it is
- * always there. BLOCK_COUNT is therefore the same one-hop-removed comparison the
- * inventory/crafting asserts above are, closed end-to-end by check-world-drift's
- * `cmp -s`; only WORLD_HEIGHT is compared against the client tree directly.
+ * The two are NOT in the same situation, which is why they are no longer in the
+ * same include block.
  *
- * A consequence worth stating rather than leaving to be rediscovered: because
- * block.h is vendored, the BLOCK_COUNT assert below does not need this #if
- * either, and it too compiles out of the shipped standalone daemon. It is left
- * gated here only because it shares an include block with world.h, which does
- * need the guard. Moving it out is a separate, deliberate change.
+ * world/block.h is VENDORED into game/world/ (game/Makefile's
+ * VENDORED_WORLD_FILES), so it is present in every configuration and needs no
+ * guard. Measured with `gcc -E -H` on THIS file with the real CFLAGS, 2026-08-25
+ * (non-/usr lines only):
  *
- * Conditional because this repo also builds with no client tree beside it —
- * see the comment on the constants in validate.h. The Makefile probes for the
- * headers and always defines BS_HAVE_CLIENT_WORLD_HEADERS to 0 or 1, so -Wundef
- * stays meaningful: a typo in the macro name is a warning, not a silent skip. */
-#if BS_HAVE_CLIENT_WORLD_HEADERS
+ *   arm A  -I. -I.. -I$(WORLD) -DBS_HAVE_CLIENT_WORLD_HEADERS=1
+ *     . world/registry.h
+ *     .. ./world/block.h                      <- the VENDORED copy, depth 2
+ *     . world/inventory.h
+ *     . world/crafting.h
+ *     . ../../../source/world/world.h         <- the CLIENT's copy, depth 1
+ *   arm B  -I. -I.. -DBS_HAVE_CLIENT_WORLD_HEADERS=0
+ *     . world/registry.h
+ *     .. ./world/block.h                      <- still the VENDORED copy
+ *
+ * Two things earlier revisions of this comment asserted that the output above
+ * does not support, corrected here rather than repeated:
+ *
+ *   - block.h is NOT reached by this file's own-directory search. It arrives at
+ *     depth 2, pulled in by world/registry.h (included unconditionally above),
+ *     and it is -I. that resolves it: registry.h lives in game/world/, so its
+ *     own-directory search for "world/block.h" looks for
+ *     game/world/world/block.h and misses. By the time this file's own #include
+ *     below is reached the include guard has already closed, which is why that
+ *     line prints nothing of its own. Re-run arm A with -I. dropped and block.h
+ *     prints `.. ../../../source/world/block.h` — the CLIENT's copy. So -I. is
+ *     load-bearing for block.h too, not only for the vendored .c files.
+ *   - -I$(WORLD) is never consulted for block.h in either arm. Re-run arm A with
+ *     -I$(WORLD) dropped: block.h still prints `.. ./world/block.h`, and only
+ *     world/world.h goes fatal ("world/world.h: No such file or directory").
+ *
+ * The consequence is why this assert moved. block.h being present in every
+ * configuration means BLOCK_COUNT never needed the #if — and while it sat inside
+ * one, the check was preprocessed out of the SHIPPED standalone daemon, the one
+ * build it exists to protect, exactly as the four inventory/crafting asserts
+ * above were until 6730e44 moved them out. Out here it holds in both arms.
+ *
+ * What it compares is BS_BLOCK_COUNT against the VENDORED copy, one hop removed
+ * from the client's original; game/Makefile's check-world-drift closes that
+ * second hop with `cmp -s` whenever a client tree is actually beside this repo.
+ * WORLD_HEIGHT below stays the only one compared against the client tree
+ * directly. The #include is kept explicit rather than leaning on registry.h's
+ * transitive one: this file names the header whose constant it asserts against,
+ * so a later edit to registry.h cannot quietly take BLOCK_COUNT away. */
 #include "world/block.h"
-#include "world/world.h"
 
-/* Caught at compile time rather than at the first weird bug report if either
- * header's shape ever changes underneath this file. */
 _Static_assert(BLOCK_COUNT == BS_BLOCK_COUNT,
                "block id validation must track world/block.h");
+
+/* world/world.h is the one that genuinely needs the guard. There is no
+ * game/world/world.h, so this include resolves only through -I$(WORLD) into the
+ * client tree, and this repo also builds with no client tree beside it — see the
+ * comment on the constants in validate.h. The Makefile probes for the headers
+ * and always defines BS_HAVE_CLIENT_WORLD_HEADERS to 0 or 1, so -Wundef stays
+ * meaningful: a typo in the macro name is a warning, not a silent skip.
+ *
+ * This assert therefore does still compile out of the standalone daemon, and
+ * that is not the bug the one above was: in that build there is no client
+ * world.h present to have drifted from, so "cannot detect drift" and "cannot
+ * cause drift" are the same fact from two directions — the stance validate.h and
+ * check-world-drift's else-branch already take. */
+#if BS_HAVE_CLIENT_WORLD_HEADERS
+#include "world/world.h"
+
 _Static_assert(WORLD_HEIGHT == BS_WORLD_HEIGHT,
                "y-range validation must track world/world.h");
 #endif

@@ -379,6 +379,14 @@ enum bs_app_msg {
  * each other, not an internal choice either side may revise alone. */
 #define BS_CHUNK_DIM 16
 
+/* log2(BS_CHUNK_DIM), for the shift below. Named rather than left as a bare `4`
+ * in bs_col_of(): the two are one constant written two ways, and nothing tied
+ * them together — widening BS_CHUNK_DIM to 32 and leaving the shift at 4 would
+ * halve every column coordinate with no diagnostic at all, the same silent
+ * class of bug the registry record size had. game/validate.c asserts
+ * (1u << BS_CHUNK_DIM_SHIFT) == BS_CHUNK_DIM so the pair cannot drift apart. */
+#define BS_CHUNK_DIM_SHIFT 4
+
 /* Block coordinate to column coordinate. An arithmetic right shift, not a
  * division: `/ 16` truncates toward zero, so -1 / 16 == 0 and blocks at x = -1
  * and x = +1 would land in the same column while x = -16 landed in another.
@@ -386,7 +394,10 @@ enum bs_app_msg {
  * source/net/blockdiff.c on the client exactly — if one side ever changes, edits
  * near the origin get filed under a column nobody subscribes to and quietly
  * stop arriving. */
-static inline int32_t bs_col_of(int32_t block_coord) { return block_coord >> 4; }
+static inline int32_t bs_col_of(int32_t block_coord)
+{
+    return block_coord >> BS_CHUNK_DIM_SHIFT;
+}
 
 /* CHUNK_SUB and CHUNK_UNSUB: the column coordinate, two int32. Columns, not
  * blocks — a column is BS_CHUNK_DIM wide in x and z and spans the full world
@@ -613,20 +624,43 @@ enum bs_inv_op {
  */
 #define BS_APP_REGISTRY_FETCH_BYTES (BS_APP_HDR_BYTES + 1u)               /* 2 */
 
+/* One block on the wire: the id byte plus the packed BlockDef behind it.
+ *
+ * Mirrors REGISTRY_WIRE_RECORD_BYTES (world/registry.h), restated here for the
+ * same reason BS_INV_SLOT_COUNT is: the record travels on the wire, so its size
+ * stops being either end's private choice. game/validate.c static-asserts the
+ * two against each other — unconditionally, because registry.h is VENDORED into
+ * game/world/ and is therefore present in the standalone daemon build too.
+ *
+ * It exists at all because this used to be a bare `28u` written out twice
+ * below, and the two sites are not interchangeable: BS_APP_REGISTRY_DEFS_MAX_N
+ * sizes the batch, while bsgame.c's handle_registry_fetch() sizes its stack
+ * buffer and strides its packing with REGISTRY_WIRE_RECORD_BYTES and then
+ * DECLARES the packet's length with BS_APP_REGISTRY_DEFS_BYTES(). Add one field
+ * to BlockDef and the record goes 28 -> 29, and the literal does not move:
+ * measured on the real headers, 36 records then pack 1048 bytes into a buffer
+ * whose declared wire length is 1012 — 36 bytes of registry short on every
+ * batch — while MAX_N stays 36 when only 35 fit and 1048 overruns
+ * BS_MAX_PAYLOAD (1024). The compile was clean and silent: gcc rc=0, no
+ * warning. Mismatched framing, not merely a wrong count.
+ */
+#define BS_REGISTRY_WIRE_RECORD_BYTES 28u  /* mirrors REGISTRY_WIRE_RECORD_BYTES */
+
 /* REGISTRY_DEFS: one batch of consecutive dynamic defs.
  *
  *   u8  type (0x0E)
  *   u8  first                            id of the first record
- *   u8  n                                record count, 1..36
+ *   u8  n                                record count, 1..BS_APP_REGISTRY_DEFS_MAX_N
  *   u8  last                             1 on the final batch of a fetch
- *   ..  records                         n x 28 bytes, id-ascending
+ *   ..  records                         n x BS_REGISTRY_WIRE_RECORD_BYTES,
+ *                                        id-ascending
  *
  * The batch capacity is what fits one BS_MAX_PAYLOAD packet:
  * (1024 - 4) / 28 = 36 records.
  */
 #define BS_APP_REGISTRY_DEFS_MAX_N \
-    ((BS_MAX_PAYLOAD - BS_APP_HDR_BYTES - 3u) / 28u)                  /* 36 */
+    ((BS_MAX_PAYLOAD - BS_APP_HDR_BYTES - 3u) / BS_REGISTRY_WIRE_RECORD_BYTES)  /* 36 */
 #define BS_APP_REGISTRY_DEFS_BYTES(n) \
-    (BS_APP_HDR_BYTES + 3u + (uint32_t)(n) * 28u)
+    (BS_APP_HDR_BYTES + 3u + (uint32_t)(n) * BS_REGISTRY_WIRE_RECORD_BYTES)
 
 #endif /* BS_PROTO_H */
