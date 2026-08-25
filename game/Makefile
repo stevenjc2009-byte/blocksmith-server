@@ -13,17 +13,26 @@
 # <3ds.h>-free source/world/world.h instead of hand-duplicating that number; see
 # validate.c's static asserts for what breaks if it ever drifts.
 #
-# It does NOT do that for BLOCK_COUNT, which this comment claimed for a long
-# time. A quoted #include is searched in the INCLUDING FILE'S OWN DIRECTORY
-# before any -I path, and validate.c sits in game/, so its "world/block.h"
-# resolves to the VENDORED game/world/block.h and -I$(WORLD) is never consulted
-# for it. Measured with `gcc -E -H` on a probe compiled in game/ with the real
-# CFLAGS: "world/block.h" prints `. world/block.h` both with -I. present and
-# with it removed, while "world/world.h" prints `. ../../../source/world/world.h`
-# because there is no game/world/world.h to find. So BLOCK_COUNT is compared
-# against the vendored copy and check-world-drift below closes the second hop to
-# the client's original; WORLD_HEIGHT is the only one compared against the
-# client tree directly.
+# It does NOT do that for BLOCK_COUNT. -I$(WORLD) is never consulted for
+# "world/block.h" in either arm, so BLOCK_COUNT is compared against the VENDORED
+# game/world/block.h and check-world-drift below closes the second hop to the
+# client's original; WORLD_HEIGHT is the only one compared against the client
+# tree directly.
+#
+# The MECHANISM this comment used to give for that was wrong, and the correction
+# matters because the wrong one made -I. look droppable. It said a quoted include
+# searches the including file's own directory first, so validate.c sitting in
+# game/ reaches game/world/block.h with or without -I.. Re-measured with
+# `gcc -E -H` on validate.c itself with the real CFLAGS, 2026-08-25: block.h is
+# not reached from validate.c at all. It arrives at DEPTH 2, pulled in by
+# world/registry.h, which validate.c includes unconditionally — and registry.h
+# lives in game/world/, so its own-directory search for "world/block.h" looks for
+# game/world/world/block.h, misses, and -I. is what catches it. The output is
+# `.. ./world/block.h` in both arms with -I. present, and
+# `.. ../../../source/world/block.h` — the CLIENT's copy — with -I. removed.
+# So -I. is load-bearing for block.h as well as for the vendored .c files below.
+# Dropping -I$(WORLD) instead leaves block.h at `.. ./world/block.h` and takes
+# only world/world.h out ("world/world.h: No such file or directory").
 #
 # world/inventory.c, world/inventory.h, world/crafting.c, world/crafting.h,
 # world/crc32.c, world/crc32.h and world/block.h are VENDORED into game/world/
@@ -39,8 +48,8 @@
 # game/world/world/inventory.h and misses, and -I. is what catches it. Measured
 # the same way — `gcc -E -H world/inventory.c` prints `. ./world/inventory.h`
 # with -I., and `. ../../../source/world/inventory.h`, the CLIENT's copy, with
-# -I. removed. The -I. is load-bearing for the .c files even though it is not
-# for validate.c.
+# -I. removed. The -I. is load-bearing for these .c files, and — per the
+# correction above — for validate.c's block.h too. Do not drop it.
 
 CC     ?= cc
 
