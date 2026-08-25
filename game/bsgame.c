@@ -523,7 +523,49 @@ static void send_world_info(struct bs_game *g, uint32_t sid)
  * Sent immediately after WORLD_INFO at join (handle_join below) — a client
  * whose compiled-in table hashes identically is done on the spot, and one
  * that does not match answers with REGISTRY_FETCH, which only ever arrives
- * because this packet was seen (bs_proto.h's capability-probe note). */
+ * because this packet was seen (bs_proto.h's capability-probe note).
+ *
+ * THIS SIDE ONLY ANNOUNCES. IT NEVER VERIFIES. Verified by reading the code on
+ * 2026-08-25, because the released record of this repo says otherwise: the
+ * v1.8.1 annotated tag body and commit c77db54 both claim "the server compares
+ * that CRC on join". That is false and has never been true. Both are published
+ * and are deliberately left unrewritten; this comment is the correction, filed
+ * at the function the claim was made about.
+ *
+ * There is nothing here to compare against. BS_APP_REGISTRY_INFO is S->C only
+ * (proto/bs_proto.h:291) and the only registry message that travels C->S is
+ * BS_APP_REGISTRY_FETCH, two bytes of {type, first_index} (bs_proto.h:292). No
+ * CRC, count or revision ever reaches this process. The whole comparison is
+ * client-side, in registryMatchesInfo() at the client's source/net/networld.c:
+ * 210-216. The two send_kick() calls in handle_registry_fetch() just below are
+ * a length check and a range check on the FETCH request itself — they are not a
+ * fingerprint verdict, and no join is ever refused over the registry.
+ *
+ * A CORE-row mismatch cannot self-heal either. The client retries FETCH four
+ * times at 250 ms, but send_registry_defs() below streams only dynamic rows,
+ * and the client's registryDefUnpack() (world/registry.c:363) rejects any id
+ * below REG_ID_DYN_LO at :367. Core rows are compiled into both binaries and
+ * are untransmittable by construction, so once the two kCoreDefs tables differ
+ * the retry spends its budget on rows that were never the problem, the client's
+ * 2000 ms deadline expires, and it enters the world degraded for the rest of
+ * the session. On the client that degraded state is effectively invisible to a
+ * player: the "Joined - syncing block table..." row disappears on the deadline
+ * exactly as it would on success, and the only lasting indicator is a "!" on a
+ * debug overlay that is off unless the player turned it on.
+ *
+ * Which is why a core registry addition FORCES a matching release of THIS
+ * server, shipped first or simultaneously and never client-first. Nothing at
+ * runtime detects the disagreement for the player, nothing at runtime repairs
+ * it, and this process will accept the join regardless. The lockstep that
+ * tools/sync-world-sources.sh exists to support is a release-process
+ * obligation people have to keep, not something the protocol enforces.
+ *
+ * BS_PROTO_VERSION is a completely separate gate and must not be conflated with
+ * any of this. It is bumped only for incompatible wire changes (bs_proto.h:56)
+ * and it genuinely is enforced, by dropping the datagram: gateway/bsgate.c:867
+ * here and the client's net/bsnet_transport.c:570 there. v1.8.1 moved the core
+ * CRC 0x72A8 -> 0x4066 with BS_PROTO_VERSION unchanged at 1, which is exactly
+ * why that release needed a human-kept lockstep instead of a clean drop. */
 static void send_registry_info(struct bs_game *g, uint32_t sid)
 {
     uint8_t payload[BS_APP_REGISTRY_INFO_BYTES];
