@@ -56,18 +56,15 @@
 #include "world/inventory.h"
 #include "world/tick.h"
 
-/* Gate<->game framing. Not shared via a header because it is not part of
- * the wire protocol proper (see bs_proto.h's own header comment) — it is a
- * local IPC convention between two processes on the same box. Duplicated
- * here exactly as server/gateway/bsgate_test.c already duplicates it rather
- * than including gateway-private code from server/game. Canonical values:
- * server/gateway/bsgate.c:293-298. */
-enum bs_game_msg {
-    BS_GAME_JOIN  = 1,   /* gate -> game: sid(4) + pubkey(32) + label(32) */
-    BS_GAME_DATA  = 2,   /* both ways:    sid(4) + payload                */
-    BS_GAME_LEAVE = 3,   /* gate -> game: sid(4)                          */
-    BS_GAME_KICK  = 4    /* game -> gate: sid(4)                         */
-};
+/* Gate<->game framing (enum bs_game_msg). This used to be hand-copied here,
+ * under a comment naming "server/gateway/bsgate.c:293-298" as canonical — a
+ * line range that had since moved to 334-339, which is how a duplicate
+ * announces itself. It is defined once now, in ../proto/bs_gamelink.h, which
+ * both binaries include; that header carries the reasoning and names the two
+ * copies still left in the client tree. It is still NOT part of bs_proto.h's
+ * pinned wire contract, which is why it is a separate header and not a block
+ * appended to that one. */
+#include "../proto/bs_gamelink.h"
 
 #define BS_GAME_ENVELOPE_BYTES 5u   /* 1 kind + 4 sid, both directions */
 #define BS_JOIN_BODY_BYTES     64u  /* 32 pubkey + 32 label, per bsgate.c */

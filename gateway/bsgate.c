@@ -51,6 +51,7 @@
 
 #include <hydrogen.h>
 
+#include "../proto/bs_gamelink.h"
 #include "../proto/bs_proto.h"
 #include "allowlist.h"
 #include "invite.h"
@@ -331,12 +332,11 @@ static uint32_t fresh_sid(struct bs_gate *g)
 
 /* ------------------------------------------------------- game-side socket */
 
-enum bs_game_msg {
-    BS_GAME_JOIN  = 1,   /* gate -> game: sid, pubkey, label */
-    BS_GAME_DATA  = 2,   /* both ways:    sid, payload       */
-    BS_GAME_LEAVE = 3,   /* gate -> game: sid                */
-    BS_GAME_KICK  = 4    /* game -> gate: sid                */
-};
+/* enum bs_game_msg (BS_GAME_JOIN/DATA/LEAVE/KICK) was defined here. It is now
+ * in ../proto/bs_gamelink.h, included at the top of this file, because bsgame
+ * and both test harnesses each kept their own hand-copy of it with nothing
+ * holding the four equal. See that header for why, and for the copies that
+ * still exist in the client tree. */
 
 static void game_send(struct bs_gate *g, const uint8_t *buf, size_t len)
 {

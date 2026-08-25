@@ -31,14 +31,16 @@
 
 #include <hydrogen.h>
 
+/* enum bs_game_msg — this suite stands in for bsgame on the game socket, so it
+ * speaks the gate<->game framing and is bound by it. It used to declare its own
+ * anonymous copy of the four values below this include block. */
+#include "../proto/bs_gamelink.h"
 #include "../proto/bs_proto.h"
 #include "allowlist.h"
 #include "invite.h"
 #include "proxyproto.h"
 #include "ratelimit.h"
 #include "replay.h"
-
-enum { BS_GAME_JOIN = 1, BS_GAME_DATA = 2, BS_GAME_LEAVE = 3, BS_GAME_KICK = 4 };
 
 static int   g_checks = 0;
 static int   g_fails  = 0;
