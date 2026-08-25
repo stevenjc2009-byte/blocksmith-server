@@ -4,13 +4,14 @@
 #   tools/sync-world-sources.sh
 #
 # game/world/{block.h,inventory.h,inventory.c,crafting.h,crafting.c,crc32.h,
-# crc32.c} are vendored, byte-identical copies of the client's own
-# <3ds.h>-free world sources (source/world/ in the Blocksmith checkout), not
-# symlinks and not pulled in via an include path. That is deliberate: the
-# DEPLOYED server is a standalone clone of deps/blocksmith-server alone (see
-# tools/bs-update) with no client tree beside it, so the inventory/crafting
-# logic bsgame runs at authoritative slot-arrangement and crafting has to
-# physically live in this repo to ship at all.
+# crc32.c,registry.h,registry.c,tick.h,tick.c} are vendored, byte-identical
+# copies of the client's own <3ds.h>-free world sources (source/world/ in the
+# Blocksmith checkout), not symlinks and not pulled in via an include path.
+# That is deliberate: the DEPLOYED server is a standalone clone of
+# deps/blocksmith-server alone (see tools/bs-update) with no client tree beside
+# it, so the inventory/crafting logic bsgame runs at authoritative
+# slot-arrangement and crafting has to physically live in this repo to ship at
+# all.
 #
 # A vendored copy only stays trustworthy if it stays IDENTICAL to the
 # original, so game/Makefile's `check-world-drift` target (part of `make` and

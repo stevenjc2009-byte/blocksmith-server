@@ -48,10 +48,25 @@
  * vendored world/registry.h instead. BS_BLOCK_COUNT stays, and stays asserted
  * against the client's BLOCK_COUNT, because it is still the bound for the ids
  * that are NOT block placements: the ITEM ids in INV_OP_PICKUP/INV_OP_CONSUME
- * (bsgame.c) and in the armour slots (playerstate.c), both of which index
- * client-side tables sized BLOCK_COUNT and would read out of bounds on the 3DS
- * if a dyn id were let through. Two different ceilings because they guard two
- * different things; do not collapse them. */
+ * (bsgame.c) and in the armour slots (playerstate.c). Two different ceilings
+ * because they guard two different things; do not collapse them.
+ *
+ * v1.8.2 correction. This note used to say those item ids index client-side
+ * tables sized BLOCK_COUNT and would read OUT OF BOUNDS on the 3DS if a dyn id
+ * were let through. That is not true and was never true: grep finds no array
+ * anywhere in the client sized [BLOCK_COUNT], and none in this repo sized
+ * [BS_BLOCK_COUNT]. A slot icon resolves through atlasTile(blockFaceTex(id)),
+ * which reads the full 256-id registry and clamps an unknown tile onto
+ * ATLAS_TILE_MISSING in world/atlas_uv.h, so a dyn id in a slot draws the
+ * missing-texture marker rather than reading past anything. Crafting is
+ * [RECIPE_COUNT], indexed by recipe, not by item id.
+ *
+ * The real reason this ceiling must hold is a WIRE AGREEMENT: both ends have to
+ * agree on which ids are legal in an inventory op, and the client refuses to
+ * hold anything at or above BLOCK_COUNT (world/inventory.h). A mismatch loses
+ * the player's item, it does not corrupt their console. Recorded because the
+ * memory-safety wording made this look like a hard safety bound, and the next
+ * person weighing the item-ceiling lift would have priced it far too high. */
 
 /* True if (x, y, z, block) is an edit bsgame may apply. */
 bool bsEditValid(int32_t x, int32_t y, int32_t z, uint8_t block);

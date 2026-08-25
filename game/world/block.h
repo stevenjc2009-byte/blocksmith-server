@@ -63,10 +63,39 @@ enum {
 // scene/interact.c's own ⚠ comment already flags — not to slide these two into the enum
 // above, which would renumber nothing but would quietly re-point the server's item
 // ceiling at them.
+// ⚠ These are LITERALS, and they must stay literals. Do not "tidy" them back into
+// BLOCK_COUNT / BLOCK_COUNT + 1, however much more self-documenting that looks.
+//
+// They were spelled that way until v1.8.2 and it was a trap. BLOCK_COUNT terminates the
+// enum above, whose own comment invites appending — so appending one id, the single most
+// natural thing a person adding a block does, would move BLOCK_COUNT from 8 to 9 and drag
+// BLOCK_WATER to 9 and BLOCK_TALL_GRASS to 10 with it. The build stays clean. The saved
+// chunks do not move: registry.c's core table uses designated initialisers [8] and [9], so
+// the ROWS stay put while the SYMBOLS slide off them, and every saved world still holds
+// byte 8 for water and still renders it as water because the mesher reads the raw id.
+// What breaks is everything that says BLOCK_WATER by name — worldgen, world/water.c, the
+// liquid checks, the mesher's deferred pass — all of it now talking about tall grass,
+// while BLOCK_TALL_GRASS names an undefined row and becomes a hole. And inventoryCanHold()
+// starts answering true for id 8, so scene/interact.c stops refusing it.
+//
+// So the corruption is not in the file; it is in the meaning of the symbol, and it
+// presents as bad worldgen and strange water rather than as any kind of error. This
+// codebase has been bitten by that exact shape before — see world/atlas_uv.h's note that a
+// wrong texture constant still renders A texture, so the bug looks like bad art.
+//
+// The asserts below are what make that impossible: they fail the build the moment the
+// literals stop agreeing with what the enum implies. When the survival rung really does
+// give water a bucket and tall grass a seed drop, the move is still the one described
+// above — widen inventoryCanHold() past BLOCK_COUNT on both sides — not to append here.
 enum {
-	BLOCK_WATER      = BLOCK_COUNT,      // 8
-	BLOCK_TALL_GRASS = BLOCK_COUNT + 1,  // 9
+	BLOCK_WATER      = 8,
+	BLOCK_TALL_GRASS = 9,
 };
+_Static_assert(BLOCK_COUNT == 8,
+               "BLOCK_COUNT is the closed first item span and is written into every shipped "
+               "save and packet; it must never move");
+_Static_assert(BLOCK_WATER == 8 && BLOCK_TALL_GRASS == 9,
+               "water and tall grass ids are on players' SD cards; they must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
