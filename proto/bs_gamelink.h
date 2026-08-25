@@ -29,17 +29,28 @@
  * Both game/ and gateway/ reach this by relative path exactly as they already
  * reach bs_proto.h, so no Makefile change is needed for either binary.
  *
- * STILL DUPLICATED, OUTSIDE THIS REPO: the Blocksmith client tree carries two
- * further copies of these same four values —
+ * STILL DUPLICATED, OUTSIDE THIS REPO: the Blocksmith client tree carries ONE
+ * further copy of these same four values —
  *
- *   source/net/interop_test.c                    (enum bs_game_msg)
  *   source/net/hosttest/bsnet_transport_hosttest.c   (anonymous enum)
  *
- * Both are host-side harnesses that speak this exact IPC framing to a real
- * bsgate/bsgame pair, so they are bound by this contract as tightly as the four
- * above are. They are not changed here because they belong to the other repo;
- * they should include this header the same way once someone owns that edit.
- * Until they do, six copies became three, not one.
+ * It is a host-side harness that speaks this exact IPC framing to a real
+ * bsgate/bsgame pair, so it is bound by this contract as tightly as the four
+ * above are. It is not changed here because it belongs to the other repo, and
+ * source/net/hosttest/ is off limits there without its owner's say-so. It should
+ * include this header the same way once someone owns that edit.
+ *
+ * The client's other copy — source/net/interop_test.c's own enum bs_game_msg,
+ * which was the second entry in this list — is gone. That file now includes this
+ * header, spelled "proto/bs_gamelink.h" and reached by the same
+ * -I deps/blocksmith-server already in tools/run_host_tests.sh's interop_test
+ * stanza, so it needed no build change either. Proved load-bearing by moving
+ * this header aside, at which point that stanza fails with `fatal error:
+ * proto/bs_gamelink.h: No such file or directory`; restored, the suite runs
+ * green at its pinned `PASS: 56 checks, 0 failed`.
+ *
+ * So six copies are now two, not three, and the one that remains is a scope
+ * boundary rather than an oversight.
  */
 
 #ifndef BS_GAMELINK_H
