@@ -27,6 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../proto/bs_gamelink.h"  /* enum bs_game_msg — the gate<->game framing this suite speaks */
 #include "../proto/bs_proto.h"
 #include "players.h"   /* BS_EDIT_BURST / BS_EDIT_REFILL_MS, for the rate-limit ceiling */
 #include "playerstate.h"  /* BS_PLAYER_STATE_BODY_BYTES, for the player.dat fixtures */
@@ -34,11 +35,13 @@
 #include "world/crc32.h"    /* the checksum a hand-built player.dat has to carry */
 #include "world/registry.h" /* v1.6.0: mirror the daemon's table in-process */
 
-enum bs_game_msg { BS_GAME_JOIN = 1, BS_GAME_DATA = 2, BS_GAME_LEAVE = 3, BS_GAME_KICK = 4 };
-
-/* Mirrors bsgame.c's BS_CHUNK_LEGACY_GRACE_MS — not shared via a header for
- * the same reason the bs_game_msg enum above isn't: an internal
- * implementation constant, not part of the wire protocol. A player who never
+/* Mirrors bsgame.c's BS_CHUNK_LEGACY_GRACE_MS. Note this is NOT the same case
+ * as enum bs_game_msg, which this file used to hand-copy on the line above and
+ * now takes from ../proto/bs_gamelink.h: that enum is a contract between two
+ * BINARIES, so a divergence between copies is a production framing bug. This
+ * one is an internal implementation constant of one binary, not part of any
+ * protocol, and this file mirroring it is a test reading a tuning value. A
+ * player who never
  * sends CHUNK_SUB only gets the legacy full-dump WORLD_SYNC once this much
  * time has passed since JOIN (see tick(), bsgame.c) — every test below that
  * exercises that legacy path has to wait at least this long, plus a tick,
@@ -363,12 +366,58 @@ static bool wait_ready(unsigned timeout_ms)
  * the *same* world across restarts. 0 means "not seen yet". */
 static uint32_t g_seen_seed = 0;
 
+/* The core registry's advertised shape, pinned to hand-written literals rather
+ * than to the functions that produce it.
+ *
+ * recv_registry_info() below compares the REGISTRY_INFO wire bytes against
+ * registryCount() and registryCrc16() in THIS process. That is a real check —
+ * the daemon and this test binary link the same world/registry.c in two
+ * different processes, so it proves the two agree — but it is self-referential
+ * about the VALUE. Move a core def and both sides move together: every check
+ * stays green and the table has been silently re-baselined. That is not a
+ * cosmetic re-baseline. A core-def change is a wire-compatibility event: a
+ * client built against the old rows fails registryMatchesInfo() on crc, falls
+ * into the bounded REGISTRY_FETCH retry and finishes the session with
+ * s_reg_synced false. It has to be a named failure, not a quiet pass.
+ *
+ * Same idiom as the client's source/world/registry_test.c, which pins this same
+ * golden and records every move of it with the reason. The values here were
+ * verified independently of that file rather than copied from it: compiling
+ * world/registry.c + world/crc32.c on their own, calling registryInitCore() and
+ * printing the result gives count 10, crc16 0x4066, rev 1 — and the client's
+ * source/world/registry.c, compiled separately the same way, prints the
+ * identical pair, which is exactly what the byte-identical vendoring is
+ * supposed to guarantee and is now checked rather than assumed.
+ *
+ * If this goes red, do NOT edit the literal to match. Find which core def moved
+ * and decide whether that was intended. If it was, move the pin AND say why,
+ * the way registry_test.c does for 0x7E5B -> 0x72A8 -> 0x4066. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 10u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x4066u
+#define BS_REGISTRY_REV_GOLDEN        1u
+
+static void test_registry_core_pinned_to_golden(void)
+{
+    puts("registry: the core table matches a pinned golden, not only itself");
+    registryInitCore();
+    check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
+          "core-only registryCount() matches the pinned golden 10");
+    check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
+          "core-only registryCrc16() matches the pinned golden 0x4066");
+    check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
+          "REGISTRY_REV matches the pinned golden 1");
+}
+
 /* Reads one BS_APP_REGISTRY_INFO packet addressed to `sid` and shape-checks
  * it against THIS process's own registry (daemon and test binary link the
- * same world/registry.c, so rev/count/crc16 must agree exactly — which also
- * makes every comparison here a cross-process crc-stability proof). Tests
- * that load extra dynamic defs into this process (see the FETCH batching
- * scenario below) must mirror them locally first or these checks go red. */
+ * same world/registry.c, so rev/count/crc16 must agree exactly). This is the
+ * CROSS-PROCESS half of the pair: it proves the daemon's advertised table and
+ * this process's table are the same table. What it deliberately does not do is
+ * prove either of them is the INTENDED table — that is
+ * test_registry_core_pinned_to_golden() above, and the two only mean something
+ * together. Tests that load extra dynamic defs into this process (see the FETCH
+ * batching scenario below) must mirror them locally first or these checks go
+ * red. */
 static bool recv_registry_info(uint32_t sid, unsigned ms)
 {
     uint8_t out[64];
@@ -2324,6 +2373,12 @@ int main(void)
     if (mkdir(g_dir, 0700) != 0) die("mkdir state dir");
 
     puts("== bsgame test ==");
+
+    /* First, and before the daemon exists: a pure in-process check on the
+     * linked-in table, which must run while it is still core-only. The FETCH
+     * batching scenario at the end registers 40 dynamic defs into this same
+     * process, so this cannot be moved down there. */
+    test_registry_core_pinned_to_golden();
 
     set_sock_paths();
     open_sockets();
