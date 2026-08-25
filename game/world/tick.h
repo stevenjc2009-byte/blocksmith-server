@@ -83,6 +83,11 @@ uint64_t tickClockDropped(const TickClock* c);
 
 // The spec's rule, given a SQUARED distance in blocks. Returns the tick period: 1 for anything
 // inside the near radius, TICK_FAR_PERIOD beyond it.
+//
+// A NEGATIVE dist_sq returns TICK_FAR_PERIOD, never 1. A squared distance cannot legitimately be
+// negative, so the only way to produce one is a caller overflowing dx*dx + dz*dz in int32 — and
+// the safe reading of "so far away the arithmetic wrapped" is the cheap period, not the full
+// rate. See tick.c for why the guard is there rather than left to the caller.
 int tickPeriodForDistSq(int32_t dist_sq);
 
 // True when something with tick period `period` should run on tick `tick`. `id` staggers the

@@ -52,7 +52,27 @@ uint64_t tickClockDropped(const TickClock* c) { return c ? c->dropped : 0; }
 
 int tickPeriodForDistSq(int32_t dist_sq)
 {
-	return (dist_sq <= TICK_NEAR_DIST_SQ) ? 1 : TICK_FAR_PERIOD;
+	// The low side is guarded as well as the high one, and that is not defensive padding.
+	// `dist_sq` is a SQUARED distance, so a negative value does not describe something very
+	// close — it is arithmetic that has already gone wrong, and the overwhelmingly likely
+	// cause is a caller computing dx*dx + dz*dz in int32 and overflowing it. Without the
+	// `>= 0` term such a value satisfies `<= TICK_NEAR_DIST_SQ` and is handed back period 1,
+	// which is the exact inversion of the intent: the furthest thing in the world gets ticked
+	// at the FULL rate, precisely when it should be the cheapest thing there is. And it does
+	// so on the dedicated server too, because this file is vendored into it byte-identical.
+	//
+	// Not reachable at the distances anything calls this with today — the customer is a
+	// player-to-entity distance inside a 17-column render radius, about 1.5e5 squared against
+	// an int32 ceiling of 2.1e9. But world.h's coordinate conventions call block x and z
+	// "signed and unbounded", so that headroom is a property of where players currently walk,
+	// not a property this function is entitled to assume.
+	//
+	// What this does NOT do: rescue a caller whose overflow happens to wrap back into
+	// 0..TICK_NEAR_DIST_SQ. Nothing testable inside this function can, since such a value is
+	// indistinguishable from a genuinely near one; only doing the arithmetic in a wider type
+	// at the call site can. It makes the NEGATIVE-reads-as-near inversion impossible, which
+	// is the whole of the reachable failure and all of it that is this function's to own.
+	return (dist_sq >= 0 && dist_sq <= TICK_NEAR_DIST_SQ) ? 1 : TICK_FAR_PERIOD;
 }
 
 bool tickDue(uint64_t tick, int period, uint32_t id)
