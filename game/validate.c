@@ -17,10 +17,67 @@
  * and no _Static_assert needed to keep the two honest: there is only one. */
 #include "world/registry.h"
 
+/* The inventory/crafting shape proto/bs_proto.h's wire format duplicates
+ * (BS_INV_SLOT_COUNT etc.) — the moment a slot or recipe index travels on the
+ * wire, how many of them exist stops being a private choice either end can
+ * change alone (see bs_proto.h's own comment above those defines).
+ *
+ * Unconditional, for the same reason world/registry.h above is: world/inventory.h
+ * and world/crafting.h are VENDORED into game/world/ (game/Makefile's
+ * VENDORED_WORLD_FILES) and always present, so these includes cannot fail in any
+ * configuration. A quoted #include is searched in the INCLUDING FILE'S OWN
+ * DIRECTORY first, and this file sits in game/, so "world/inventory.h" reaches
+ * game/world/inventory.h whether or not -I$(WORLD) is on the command line —
+ * measured with `gcc -E -H`, which prints `. world/inventory.h` with -I$(WORLD)
+ * present and the same line with it removed.
+ *
+ * These four asserts used to sit inside the #if below, kept there only for "the
+ * same shape" as the two that genuinely need a client tree. That cost them the
+ * one build that matters. The DEPLOYED server is a standalone clone with no
+ * client tree beside it, so it compiles with BS_HAVE_CLIENT_WORLD_HEADERS=0 and
+ * all four preprocessed away in exactly the binary they exist to protect.
+ * Measured, not reasoned: sabotaging INV_STACK_MAX 99 -> 98 in
+ * game/world/inventory.h errored with `static assertion failed: "stack cap must
+ * track world/inventory.h"` in the client-tree arm and built CLEAN, exit 0, in
+ * the standalone arm. Out here they hold in both.
+ *
+ * What this compares is the proto duplicate against the VENDORED copy — one hop
+ * removed from the client's original. game/Makefile's check-world-drift closes
+ * that second hop with `cmp -s` whenever a client tree is actually beside this
+ * repo; the two checks compose into an end-to-end guarantee. */
+#include "world/inventory.h"
+#include "world/crafting.h"
+
+_Static_assert(INV_SLOT_COUNT == BS_INV_SLOT_COUNT,
+               "inventory slot count must track world/inventory.h");
+_Static_assert(INV_HOTBAR_SLOTS == BS_INV_HOTBAR_SLOTS,
+               "hotbar slot count must track world/inventory.h");
+_Static_assert(INV_STACK_MAX == BS_INV_STACK_MAX,
+               "stack cap must track world/inventory.h");
+_Static_assert(RECIPE_COUNT == BS_RECIPE_COUNT,
+               "recipe count must track world/crafting.h");
+
 /* Pure, <3ds.h>-free headers (see source/world/block.h's own header comment).
  * Reading them here keeps BS_WORLD_HEIGHT and BS_BLOCK_COUNT honest instead of
  * letting them drift from the client's real world model. Nothing here links
  * against source/world's .c files: these are constants and an enum, not code.
+ *
+ * Only ONE of the two is actually reached through -I$(WORLD), despite what this
+ * comment used to imply. Measured with `gcc -E -H` on a probe compiled in game/
+ * with the real CFLAGS: "world/world.h" prints `. ../../../source/world/world.h`
+ * (there is no game/world/world.h to find), but "world/block.h" prints
+ * `. world/block.h` — the vendored game/world/block.h — and prints the same with
+ * -I. dropped, because a quoted include searches the including file's OWN
+ * directory before any -I path. block.h is in VENDORED_WORLD_FILES, so it is
+ * always there. BLOCK_COUNT is therefore the same one-hop-removed comparison the
+ * inventory/crafting asserts above are, closed end-to-end by check-world-drift's
+ * `cmp -s`; only WORLD_HEIGHT is compared against the client tree directly.
+ *
+ * A consequence worth stating rather than leaving to be rediscovered: because
+ * block.h is vendored, the BLOCK_COUNT assert below does not need this #if
+ * either, and it too compiles out of the shipped standalone daemon. It is left
+ * gated here only because it shares an include block with world.h, which does
+ * need the guard. Moving it out is a separate, deliberate change.
  *
  * Conditional because this repo also builds with no client tree beside it —
  * see the comment on the constants in validate.h. The Makefile probes for the
@@ -36,38 +93,6 @@ _Static_assert(BLOCK_COUNT == BS_BLOCK_COUNT,
                "block id validation must track world/block.h");
 _Static_assert(WORLD_HEIGHT == BS_WORLD_HEIGHT,
                "y-range validation must track world/world.h");
-
-/* Same treatment for the inventory/crafting shape proto/bs_proto.h's wire
- * format duplicates (BS_INV_SLOT_COUNT etc.) — the moment a slot or recipe
- * index travels on the wire, how many of them exist stops being a private
- * choice either end can change alone (see bs_proto.h's own comment above
- * those defines).
- *
- * Unlike world/block.h and world/world.h above, world/inventory.h and
- * world/crafting.h are NOT reached via -I$(WORLD): they are vendored into
- * game/world/ (see game/Makefile's drift-guard comment) and always present
- * in this repo, so this #include resolves to that vendored copy regardless
- * of BS_HAVE_CLIENT_WORLD_HEADERS. The #if guard is kept anyway, for the
- * same reason and the same shape as the BLOCK_COUNT/WORLD_HEIGHT asserts
- * above: BS_HAVE_CLIENT_WORLD_HEADERS is still the signal that a live client
- * copy exists to have drifted from, even though the comparison this file can
- * make is one hop removed from it (proto duplicate vs. the vendored copy,
- * not vs. the client's original directly). That second hop — vendored copy
- * vs. client original — is exactly what game/Makefile's check-world-drift
- * target verifies with `cmp -s` whenever this branch is taken; the two
- * checks compose into the same end-to-end guarantee BLOCK_COUNT gets
- * directly. */
-#include "world/inventory.h"
-#include "world/crafting.h"
-
-_Static_assert(INV_SLOT_COUNT == BS_INV_SLOT_COUNT,
-               "inventory slot count must track world/inventory.h");
-_Static_assert(INV_HOTBAR_SLOTS == BS_INV_HOTBAR_SLOTS,
-               "hotbar slot count must track world/inventory.h");
-_Static_assert(INV_STACK_MAX == BS_INV_STACK_MAX,
-               "stack cap must track world/inventory.h");
-_Static_assert(RECIPE_COUNT == BS_RECIPE_COUNT,
-               "recipe count must track world/crafting.h");
 #endif
 
 bool bsEditValid(int32_t x, int32_t y, int32_t z, uint8_t block)

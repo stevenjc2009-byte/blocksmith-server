@@ -9,23 +9,38 @@
 # server/proto/bs_proto.h and the small BS_GAME_* enum bsgame.c duplicates
 # from bsgate.c (see the comment at its definition for why).
 #
-# -I$(WORLD) lets validate.c pull BLOCK_COUNT and WORLD_HEIGHT straight from
-# the client's own <3ds.h>-free world headers (source/world/block.h,
-# source/world/world.h) instead of hand-duplicating those numbers; see
-# validate.c's static asserts for what breaks if they ever drift.
+# -I$(WORLD) lets validate.c pull WORLD_HEIGHT straight from the client's own
+# <3ds.h>-free source/world/world.h instead of hand-duplicating that number; see
+# validate.c's static asserts for what breaks if it ever drifts.
+#
+# It does NOT do that for BLOCK_COUNT, which this comment claimed for a long
+# time. A quoted #include is searched in the INCLUDING FILE'S OWN DIRECTORY
+# before any -I path, and validate.c sits in game/, so its "world/block.h"
+# resolves to the VENDORED game/world/block.h and -I$(WORLD) is never consulted
+# for it. Measured with `gcc -E -H` on a probe compiled in game/ with the real
+# CFLAGS: "world/block.h" prints `. world/block.h` both with -I. present and
+# with it removed, while "world/world.h" prints `. ../../../source/world/world.h`
+# because there is no game/world/world.h to find. So BLOCK_COUNT is compared
+# against the vendored copy and check-world-drift below closes the second hop to
+# the client's original; WORLD_HEIGHT is the only one compared against the
+# client tree directly.
 #
 # world/inventory.c, world/inventory.h, world/crafting.c, world/crafting.h,
 # world/crc32.c, world/crc32.h and world/block.h are VENDORED into game/world/
-# (byte-identical copies of the client's own <3ds.h>-free files), not pulled in
-# via -I$(WORLD) the way block.h/world.h are for validate.c above. The
+# (byte-identical copies of the client's own <3ds.h>-free files). The
 # deployed server is a standalone clone of this repo with no client tree next
 # to it — tools/bs-update clones deps/blocksmith-server alone — so the
 # inventory/crafting logic bsgame runs at authoritative slot-arrangement and
 # crafting operations has to physically live here, compiled unconditionally,
-# not gated behind a probe the way BLOCK_COUNT/WORLD_HEIGHT are. -I. below is
-# what lets those vendored .c files' own `#include "world/..."` lines resolve
-# against this directory the same way they resolve against the client tree's
-# root, without rewriting a single include.
+# not gated behind a probe the way WORLD_HEIGHT is. -I. below is what lets those
+# vendored .c files' own `#include "world/..."` lines resolve against this
+# directory, without rewriting a single include: they live in game/world/, so
+# their own-directory search for "world/inventory.h" looks for
+# game/world/world/inventory.h and misses, and -I. is what catches it. Measured
+# the same way — `gcc -E -H world/inventory.c` prints `. ./world/inventory.h`
+# with -I., and `. ../../../source/world/inventory.h`, the CLIENT's copy, with
+# -I. removed. The -I. is load-bearing for the .c files even though it is not
+# for validate.c.
 
 CC     ?= cc
 
