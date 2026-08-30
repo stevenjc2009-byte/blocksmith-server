@@ -108,12 +108,46 @@ WORLD_OBJS := world/inventory.o world/crafting.o world/crc32.o world/registry.o 
 
 OBJS := bsgame.o diffstore.o playerstate.o players.o validate.o $(WORLD_OBJS)
 
+# bsgame_test.o is not in OBJS (it carries its own main()), but it includes the
+# same headers, so it needs a dep file too or `make test` inherits the exact bug
+# described below for the one translation unit the test suite actually runs.
+DEPS := $(OBJS:.o=.d) bsgame_test.d
+
 .PHONY: all test clean install-check check-world-drift
 
 all: check-world-drift bsgame
 
+# -MMD -MP, with the generated .d files read back by the -include at the bottom
+# of this file. This is the idiom the client build already uses — devkitARM's
+# base_rules compiles with `-MMD -MP -MF $(DEPSDIR)/$*.d` and the client Makefile
+# ends with `-include $(DEPSDIR)/*.d` — so this is that same mechanism written out
+# by hand, for a build that has no base_rules to inherit it from.
+#
+# Without it this rule listed NO header prerequisites at all, and the failure mode
+# was not "an occasional stale object". Editing any header in game/ left every
+# affected .o untouched while make printed "'bsgame' is up to date." and exited 0.
+# Measured 2026-08-30 from a clean tree: `touch world/tick.h && make bsgame` ->
+# "make: 'bsgame' is up to date.", rc=0, with bsgame.o, diffstore.o, playerstate.o,
+# players.o, validate.o and world/tick.o all provably older than the header.
+#
+# That is worse than a slow build, because a skipped rebuild and a passing check
+# are the SAME output. A verification pass that edits a header, rebuilds, and sees
+# green has proven nothing about the code it just wrote — it re-ran the previous
+# binary. Every "fixed, tests pass" claim resting on a header-only change in this
+# directory was unfounded, and nothing in the log would say so.
+#
+# -MMD rather than -MD: system headers are not our drift risk and listing them
+# makes every .d churn on a libc update. -MP emits a phony target for each header
+# so that DELETING a header gives a clean recompile instead of make aborting with
+# "No rule to make target 'world/tick.h'" against a dep file that outlived it.
+#
+# Deliberately NOT the blunt alternative (`$(OBJS): $(wildcard *.h world/*.h)`,
+# the shape of the client's own `$(OFILES_SOURCES) : $(HFILES)` line). That would
+# also turn the red arm below green, while rebuilding all ten objects for any
+# header touched — which passes the same test for the wrong reason and hides
+# which translation units actually depend on what. The .d files are exact.
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 bsgame: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -182,4 +216,16 @@ install-check: bsgame
 	@readelf -lW bsgame | grep -q 'GNU_STACK.*RW ' && echo "  NX stack ok"       || (echo "  stack may be executable"; exit 1)
 
 clean:
-	rm -f *.o world/*.o bsgame bsgame_test
+	rm -f *.o *.d world/*.o world/*.d bsgame bsgame_test
+
+# Read back the header dependencies recorded by -MMD -MP on the last compile.
+# Leading '-' because on a clean tree these do not exist yet and their absence is
+# not an error: the first build has to compile everything anyway, and it is that
+# build which writes them.
+#
+# This is the counterpart to the rule near the top of the file; the two are only
+# useful together. Note the consequence for anyone testing this mechanism: a tree
+# built BEFORE this line existed has no .d files, so the first `make` after the
+# change still cannot see header deps for objects it considers up to date. Run
+# `make clean` once when adopting this, or the fix looks like it did not work.
+-include $(DEPS)
