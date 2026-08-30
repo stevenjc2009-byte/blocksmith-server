@@ -47,7 +47,11 @@
  * stanza, so it needed no build change either. Proved load-bearing by moving
  * this header aside, at which point that stanza fails with `fatal error:
  * proto/bs_gamelink.h: No such file or directory`; restored, the suite runs
- * green at its pinned `PASS: 56 checks, 0 failed`.
+ * green at its pinned `PASS: 66 checks, 0 failed` — 56 when this paragraph was
+ * written on 2026-08-25; v1.8.3 Phase 4 added scenario 9 (BS_APP_WORLD_GEN
+ * across the real process boundary), ten checks. This sentence is a second copy
+ * of INTEROP_TEST_EXPECTED_CHECKS that nothing enforces, so it has to be moved
+ * by hand every time that pin moves.
  *
  * So six copies are now two, not three, and the one that remains is a scope
  * boundary rather than an oversight.

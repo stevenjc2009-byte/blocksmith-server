@@ -323,16 +323,33 @@ static void open_sockets(void)
     if (bind(g_gate, (struct sockaddr *)&un, sizeof un) != 0) die("bind gate.sock");
 }
 
+/* v1.8.3 Phase 4. NULL for every start in this suite except the three inside
+ * test_world_gen_persists_across_restart(), which is the only scenario that
+ * needs the daemon brought up on a declaration it did not mint. A file-scope
+ * knob rather than a parameter so the ~10 existing start_daemon() call sites
+ * stay untouched — this is a test-harness detail, not a behaviour they have an
+ * opinion about. */
+static const char *g_forced_gen = NULL;
+
 static void start_daemon(void)
 {
     pid_t pid = fork();
     if (pid < 0) die("fork");
     if (pid == 0) {
-        execl("./bsgame", "bsgame",
-              "--game-socket", g_game_sock,
-              "--gate-socket", g_gate_sock,
-              "--state-dir",   g_dir,
-              (char *)NULL);
+        if (g_forced_gen != NULL) {
+            execl("./bsgame", "bsgame",
+                  "--game-socket", g_game_sock,
+                  "--gate-socket", g_gate_sock,
+                  "--state-dir",   g_dir,
+                  "--world-gen",   g_forced_gen,
+                  (char *)NULL);
+        } else {
+            execl("./bsgame", "bsgame",
+                  "--game-socket", g_game_sock,
+                  "--gate-socket", g_gate_sock,
+                  "--state-dir",   g_dir,
+                  (char *)NULL);
+        }
         _exit(127);
     }
     g_daemon = pid;
@@ -434,6 +451,51 @@ static bool recv_registry_info(uint32_t sid, unsigned ms)
     return true;
 }
 
+/* v1.8.3 Phase 4. What every join in this run must be told the generator is.
+ * Spelled out rather than read back off the wire and compared to itself: a test
+ * that only checks the second packet agrees with the first would stay green if
+ * the daemon declared 7 to everyone. This is the client's GEN_VERSION_LEGACY,
+ * and it is what bsgame.c's BSGAME_WORLD_GEN_DEFAULT mints a fresh --state-dir
+ * at, which is what this suite always runs against. */
+#define BSGAME_TEST_WORLD_GEN 1u
+
+/* Reads the BS_APP_WORLD_GEN that rides immediately behind WORLD_INFO, and
+ * checks its POSITION IN THE BURST as well as its bytes.
+ *
+ * The position matters as much as the value and is easy to lose: recv_app_for()
+ * filters by session id only, never by message type, so if send_world_gen()
+ * were moved below send_registry_info() this helper would read the REGISTRY_INFO
+ * instead — and every later read in the caller would be off by one packet. That
+ * is exactly what makes the ordering assertion here real rather than decorative.
+ *
+ * The byte-level little-endian check is separate from the value check on
+ * purpose. bs_get_u16() is this repo's own decoder, so a value check alone
+ * passes against a big-endian encoder as long as both sides are wrong the same
+ * way — the whole failure mode interop_test.c exists for. Checking out[1]/out[2]
+ * against the literal bytes is the half that does not go through bs_get_u16.
+ *
+ * Returns false when the packet was not a WORLD_GEN at all, so a caller can
+ * bail rather than read the rest of the burst at the wrong offset. */
+static bool recv_world_gen(uint32_t sid, unsigned ms)
+{
+    uint8_t out[64];
+    memset(out, 0, sizeof out);
+    ssize_t n = recv_app_for(sid, out, sizeof out, ms);
+
+    const bool shaped = (n == (ssize_t)BS_WORLD_GEN_BYTES && out[0] == BS_APP_WORLD_GEN);
+    check(shaped, "WORLD_GEN rides second in the join burst, behind WORLD_INFO and ahead of"
+                  " REGISTRY_INFO, exactly BS_WORLD_GEN_BYTES long");
+    if (!shaped) return false;
+
+    check(bs_get_u16(out + 1) == BSGAME_TEST_WORLD_GEN,
+          "WORLD_GEN declares generator 1 (legacy) — the one every client that has ever"
+          " joined this server actually generated");
+    check(out[1] == 0x01 && out[2] == 0x00,
+          "WORLD_GEN's version field is little-endian on the wire: the three bytes are"
+          " {0x0F, 0x01, 0x00}, checked without going through bs_get_u16");
+    return true;
+}
+
 static void test_join_sends_world_info_then_sync(void)
 {
     puts("end-to-end: join gets WORLD_INFO first, then a WORLD_SYNC");
@@ -464,6 +526,12 @@ static void test_join_sends_world_info_then_sync(void)
         g_seen_seed = bs_get_u32(out + 1);
         check(g_seen_seed != 0, "WORLD_INFO carries a non-zero world seed");
     }
+
+    /* v1.8.3 Phase 4: WORLD_GEN took the slot immediately behind WORLD_INFO,
+     * so it has to be consumed before REGISTRY_INFO is looked for — see
+     * recv_world_gen() for why reading it in the right place is itself the
+     * ordering assertion. */
+    (void)recv_world_gen(0xA11CE001u, 500);
 
     /* Immediately after WORLD_INFO comes REGISTRY_INFO (v1.6.0 Phase A):
      * handle_join sends it before anything else that refers to block ids so
@@ -1399,6 +1467,8 @@ static void test_inv_join_sends_empty_inv_state(void)
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "the first packet after JOIN is still WORLD_INFO, unchanged by this feature");
 
+    (void)recv_world_gen(0xF2A50009u, 500);   /* v1.8.3 Phase 4, second in the burst */
+
     bool got_reg = recv_registry_info(0xF2A50009u, 500);
     check(got_reg, "REGISTRY_INFO arrives second, between WORLD_INFO and INV_STATE");
 
@@ -1610,6 +1680,7 @@ static void join_expect_fresh_player_state(uint32_t sid, const char *label)
     ssize_t n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "WORLD_INFO still leads the join sequence");
+    (void)recv_world_gen(sid, 500);   /* v1.8.3 Phase 4, second in the burst */
     bool got_reg = recv_registry_info(sid, 500);
     check(got_reg, "REGISTRY_INFO arrives second, between WORLD_INFO and INV_STATE");
 
@@ -1741,6 +1812,7 @@ static void test_ps_report_persists_across_sigterm_restart(void)
     ssize_t n = recv_app_for(0x50A00003u, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "restarted daemon still opens with WORLD_INFO");
+    (void)recv_world_gen(0x50A00003u, 500);   /* v1.8.3 Phase 4, second in the burst */
     bool got_reg = recv_registry_info(0x50A00003u, 500);
     check(got_reg, "REGISTRY_INFO still arrives second after a restart");
     n = recv_app_for(0x50A00003u, out, sizeof out, 500);
@@ -1941,15 +2013,28 @@ static void make_player_dir(const char *label, char *out, size_t cap)
     if (mkdir(out, 0700) != 0 && errno != EEXIST) die("mkdir player dir");
 }
 
-/* Joins and swallows the three welcome packets that precede PLAYER_STATE
- * without re-asserting their order — join_expect_fresh_player_state() above
- * already owns that assertion, and everything below is about what the
- * fourth packet SAYS, not where it sits. */
+/* Joins and swallows the welcome packets that precede PLAYER_STATE without
+ * re-asserting their order — join_expect_fresh_player_state() above already
+ * owns that assertion, and everything below is about what the LAST packet
+ * SAYS, not where it sits.
+ *
+ * The count is a named constant rather than a bare 3 because a bare number here
+ * is a silent trap, and it sprang: v1.8.3 Phase 4 put WORLD_GEN second in the
+ * burst and this loop, still swallowing three, handed its callers the INV_STATE
+ * to read as a PLAYER_STATE. recv_app_for() filters on session id and never on
+ * message type, so that surfaced three scenarios away from the change as
+ * "a join over an orphaned tmp still gets a well-formed PLAYER_STATE" going
+ * red — a sentence about crash recovery with nothing in it about ordering. Any
+ * future packet added to handle_join() ahead of PLAYER_STATE has to be counted
+ * in here too. */
+#define JOIN_WELCOME_PACKETS_BEFORE_PLAYER_STATE 4u   /* WORLD_INFO, WORLD_GEN, REGISTRY_INFO, INV_STATE */
+
 static void join_skip_welcome(uint32_t sid, const char *label)
 {
     send_join(sid, label);
     uint8_t out[128];
-    for (unsigned i = 0; i < 3; i++) (void)recv_app_for(sid, out, sizeof out, 500);
+    for (unsigned i = 0; i < JOIN_WELCOME_PACKETS_BEFORE_PLAYER_STATE; i++)
+        (void)recv_app_for(sid, out, sizeof out, 500);
 }
 
 static bool file_exists(const char *path)
@@ -2208,6 +2293,117 @@ static void send_registry_fetch(uint32_t sid, uint8_t first_index)
     send_app(sid, p, sizeof p);
 }
 
+/* ------------------------------------------- v1.8.3 Phase 4: world_gen.txt */
+
+/* Brings the daemon back up with (or without) a --world-gen argument and waits
+ * for it, so the scenario below reads as three restarts rather than thirty
+ * lines of fork bookkeeping. */
+static void restart_with_gen(const char *gen)
+{
+    stop_daemon();
+    g_forced_gen = gen;
+    start_daemon();
+    if (!wait_ready(5000)) {
+        fprintf(stderr, "test: daemon never became ready after a --world-gen restart\n");
+        exit(1);
+    }
+    g_forced_gen = NULL;
+    drain();
+}
+
+/* Joins, throws away WORLD_INFO, and returns the raw two version bytes of the
+ * WORLD_GEN behind it. Separate from recv_world_gen() because that helper pins
+ * the value to 1, which is the right assertion everywhere else in this suite
+ * and the wrong one here — the whole point of this scenario is a declaration
+ * that is deliberately NOT the default. */
+static bool join_read_gen_bytes(uint32_t sid, const char *label, uint8_t v[2])
+{
+    send_join(sid, label);
+
+    uint8_t out[64];
+    memset(out, 0, sizeof out);
+    ssize_t n = recv_app_for(sid, out, sizeof out, 500);
+    if (n != (ssize_t)BS_WORLD_INFO_BYTES || out[0] != BS_APP_WORLD_INFO) return false;
+
+    memset(out, 0, sizeof out);
+    n = recv_app_for(sid, out, sizeof out, 500);
+    if (n != (ssize_t)BS_WORLD_GEN_BYTES || out[0] != BS_APP_WORLD_GEN) return false;
+
+    v[0] = out[1];
+    v[1] = out[2];
+    return true;
+}
+
+/* The declaration is READ from --state-dir/world_gen.txt, not decided afresh
+ * every boot.
+ *
+ * Restarting and checking the two joins agree would not prove that, and the
+ * trap is worth naming because it is the obvious test to write: the mint
+ * default is 1, so an implementation that ignored the file entirely and minted
+ * on every boot would hand both joins a 1 and pass. So this forces a value that
+ * is NOT the default (3), restarts WITHOUT the flag, and requires 3 to come
+ * back. Only reading the file can produce that.
+ *
+ * 3 is not a generator any client can make. That is deliberate and it is safe
+ * here: the server never generates anything, this state-dir is a scratch
+ * directory this run created, and the declaration is restored to 1 at the end —
+ * which the registry scenarios that follow re-verify for free, because their
+ * own recv_world_gen() pins it. It also happens to be the value a client's
+ * refusal path would fire on, which is what interop_test.c uses it for. */
+static void test_world_gen_persists_across_restart(void)
+{
+    puts("v1.8.3 Phase 4: the declared generator comes out of world_gen.txt, not out of a fresh mint every boot");
+
+    char path[256];
+    snprintf(path, sizeof path, "%s/world_gen.txt", g_dir);
+
+    unsigned long long stored = 0;
+    FILE *f = fopen(path, "r");
+    check(f != NULL, "world_gen.txt was written into --state-dir on the daemon's first run");
+    if (f != NULL) {
+        check(fscanf(f, "%llu", &stored) == 1, "world_gen.txt holds a plain decimal number an operator can cat");
+        fclose(f);
+    }
+    check(stored == BSGAME_TEST_WORLD_GEN,
+          "a fresh --state-dir mints the declaration at 1 (legacy), which is what every client"
+          " that has ever joined actually generated");
+
+    /* Forced to a value the mint would never choose, and written through. */
+    restart_with_gen("3");
+    uint8_t v[2] = { 0xFF, 0xFF };
+    check(join_read_gen_bytes(0x6E0F0001u, "genforce", v),
+          "--world-gen 3 comes up and still sends WORLD_INFO then WORLD_GEN in that order");
+    check(v[0] == 0x03 && v[1] == 0x00,
+          "--world-gen 3 is declared on the wire as the little-endian bytes {0x03, 0x00}");
+
+    /* And now the actual claim: no flag, and 3 has to survive. */
+    restart_with_gen(NULL);
+    v[0] = 0xFF; v[1] = 0xFF;
+    check(join_read_gen_bytes(0x6E0F0002u, "genread", v),
+          "the daemon restarted with NO --world-gen still sends WORLD_GEN");
+    check(v[0] == 0x03 && v[1] == 0x00,
+          "the forced 3 came back after a restart with no argument — the declaration is read"
+          " from world_gen.txt, not minted (a mint-every-boot build answers 1 here)");
+
+    stored = 0;
+    f = fopen(path, "r");
+    check(f != NULL, "world_gen.txt still exists after the restart");
+    if (f != NULL) {
+        if (fscanf(f, "%llu", &stored) != 1) stored = 0;
+        fclose(f);
+    }
+    check(stored == 3u, "world_gen.txt on disk holds the forced 3, matching what the wire said");
+
+    /* Restore, so every join after this one is told 1 again. The registry
+     * scenarios below re-prove it landed, through recv_world_gen(). */
+    restart_with_gen("1");
+    v[0] = 0xFF; v[1] = 0xFF;
+    check(join_read_gen_bytes(0x6E0F0003u, "genrestore", v),
+          "the state dir is put back and the daemon comes up clean");
+    check(v[0] == 0x01 && v[1] == 0x00,
+          "the declaration is 1 again for the rest of this run");
+}
+
 /* Consumes the four-packet welcome sequence for a fresh sid, asserting the
  * v1.6.0 order WORLD_INFO -> REGISTRY_INFO -> INV_STATE -> PLAYER_STATE with
  * the INFO fully validated by recv_registry_info(). */
@@ -2219,6 +2415,7 @@ static void join_expect_registry_sequence(uint32_t sid, const char *label)
     ssize_t n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "registry probe: WORLD_INFO leads");
+    (void)recv_world_gen(sid, 500);   /* v1.8.3 Phase 4, second in the burst */
     bool got_reg = recv_registry_info(sid, 500);
     check(got_reg, "registry probe: REGISTRY_INFO arrives second");
     n = recv_app_for(sid, out, sizeof out, 500);
@@ -2432,6 +2629,13 @@ int main(void)
     test_ps_bad_checksum_dat_degrades_to_fresh_spawn();
     test_ps_report_out_of_range_armour_is_dropped();
     test_ps_identical_report_does_not_rewrite_file();
+
+    /* v1.8.3 Phase 4. Placed here, above the registry scenarios, because it
+     * restarts the daemon three times and leaves the declaration back at 1 —
+     * and the registry joins below then re-prove that restore for free through
+     * recv_world_gen(). Running it after them would leave nothing to check the
+     * restore with. */
+    test_world_gen_persists_across_restart();
 
     /* Registry sync runs last: its batching scenario rewrites registry.bin
      * and restarts the daemon, which would change what any later join's

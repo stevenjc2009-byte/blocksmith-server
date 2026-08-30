@@ -292,12 +292,43 @@ enum bs_app_msg {
     BS_APP_REGISTRY_FETCH = 0x0D, /* C->S: {first_index u8}. Only sent after an
                                    * INFO has arrived; asks for dynamic defs
                                    * from first_index up, in DEFS batches.       */
-    BS_APP_REGISTRY_DEFS  = 0x0E  /* S->C only: {first u8, n u8, last u8,
+    BS_APP_REGISTRY_DEFS  = 0x0E, /* S->C only: {first u8, n u8, last u8,
                                    * n x 28B records}. last is 1 on the final
                                    * batch of a fetch. The 28-byte record is
                                    * {id, name[16], tex[6], flags, luminance,
                                    * hardness, variant_of, fluid_class} — all
                                    * single bytes, so no endianness inside it.   */
+
+    /* v1.8.3 Phase 4. WHICH GENERATOR shaped the world that WORLD_INFO's seed
+     * feeds, as opposed to which world it is. Terrain is never transmitted —
+     * every client generates the landscape for itself out of the seed — so two
+     * clients running different generators over the same seed are standing in
+     * two different worlds: one player's floor is another player's sky, and
+     * every block edit lands in the wrong hillside. Until this message existed
+     * the client had no way to ask and covered for it by always generating its
+     * oldest generator (see the client's world/genversion.h,
+     * genVersionForSession, whose comment names this message as its own exit).
+     *
+     * S->C ONLY, and that is load-bearing rather than incidental. A new C->S
+     * type would meet handle_app_payload()'s `default: send_kick()` on every
+     * server older than this one, which is why a client-to-server message can
+     * only ever be introduced by shipping the server first — v1.2.7 learned
+     * that the hard way. A new S->C type costs an old client nothing: its own
+     * dispatch ends in a silent `default: break;`. The whole decision this
+     * message feeds — enter the world, or refuse it — is the client's, and this
+     * side only announces, exactly as it does for BS_APP_REGISTRY_INFO. Do NOT
+     * add an acknowledgement or a capability report; that would turn a
+     * ship-order preference into kick-or-be-kicked.
+     *
+     * Phase 4 declares 1 (the client's GEN_VERSION_LEGACY) and nothing else.
+     * Declaring 2 (DENSITY) is a SEPARATE and larger change and must not be
+     * done by editing world_gen.txt: the density generator places water, and
+     * the client keeps water LEVEL in a local sparse side map that is on no
+     * wire, in no region file and in no chunk encoding. Two clients that agree
+     * on "2" would generate the same lakes and then simulate their own flow
+     * out of them, with nothing reconciling the two and — because they agree —
+     * no refusal to fire. Water has to go on the wire first. */
+    BS_APP_WORLD_GEN      = 0x0F  /* S->C only: {gen_version u16 LE}.            */
 };
 
 /* Why INV_STATE is sent unprompted, and why the client must never open with
@@ -429,6 +460,21 @@ static inline int32_t bs_col_of(int32_t block_coord)
  * silently half-parse it, so widening this later means a new message type, not
  * a bigger one. */
 #define BS_WORLD_INFO_BYTES (BS_APP_HDR_BYTES + 4u)                   /* 5 */
+
+/* WORLD_GEN: the generator version, one uint16 little-endian, and nothing else.
+ *
+ * uint16 rather than uint32 because 16 bits is the width the number already has
+ * where it is durable: the client writes its world's generator into a 12-byte
+ * genver.bin sidecar as two bytes (its world/genversion.c). A 32-bit wire field
+ * would let a server declare a version no world file could ever hold, giving one
+ * number two widths and a range only half of which can be stored.
+ *
+ * No reserved bytes and no room to grow, for exactly the reason stated on
+ * BS_WORLD_INFO_BYTES above and enforced the same way — the client rejects on
+ * strict length equality, and a strict-equality reader cannot tell "reserved,
+ * ignore" from "a field I have never heard of". Widening this later means a new
+ * message type (0x10), not a bigger one. */
+#define BS_WORLD_GEN_BYTES (BS_APP_HDR_BYTES + 2u)                    /* 3 */
 
 /* ---- inventory ----------------------------------------------------------
  *

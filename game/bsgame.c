@@ -179,6 +179,31 @@ struct bs_game {
      * running. */
     uint32_t world_seed;
 
+    /* v1.8.3 Phase 4. WHICH GENERATOR the world those diffs are coordinates
+     * into was made with, sent to every client at JOIN as BS_APP_WORLD_GEN.
+     *
+     * DECLARED, not reported. This process has no terrain generator and never
+     * will (see the note further down about what the server does and does not
+     * simulate) — it holds a seed and a diff store, nothing else. So this is an
+     * assertion about the world the operator's block_diffs.bin belongs to, and
+     * the client is the only side that can act on it.
+     *
+     * Persisted in --state-dir/world_gen.txt for the same reason world_seed is
+     * persisted rather than compiled in: a constant baked into this binary would
+     * change silently on every upgrade, and every stored edit is a coordinate
+     * into terrain the declared generator produced. It would also be invisible
+     * to an operator — nothing on the box could be read with cat to find out
+     * what a running deployment claims. Loaded or minted once at startup, never
+     * changed while running.
+     *
+     * Treat the file as immutable after its first write. Changing it points
+     * every diff already in block_diffs.bin at a different hillside, and unlike
+     * the seed there is no matching value anywhere for the client to notice
+     * with. In particular it must not be edited to 2 to "turn on" the density
+     * generator: see BS_APP_WORLD_GEN in proto/bs_proto.h for why water makes
+     * that a separate and much larger change. */
+    uint32_t world_gen;
+
     BsPlayers   players;
     BsDiffStore diffs;
 };
@@ -304,6 +329,115 @@ static bool world_seed_load(const char *state_dir, const char *forced,
 
     logf_("game: world seed %u (%s, written to %s)", *out,
           forced ? "forced by --world-seed" : "newly minted", path);
+    return true;
+}
+
+/* --------------------------------------------------- world generator (P4) */
+
+/* What a state-dir with no world_gen.txt in it is minted at, and the only value
+ * this release ever declares.
+ *
+ * 1 is the client's GEN_VERSION_LEGACY (its world/genversion.h). Spelled as a
+ * bare 1 here because this repo does not and must not include that header — the
+ * server has no generator to share with it — and named rather than written into
+ * the code below so there is one place to read this comment.
+ *
+ * Minting an EXISTING state-dir at 1 is not a guess, it is what actually
+ * happened: every client that has ever joined this server generated legacy,
+ * because until BS_APP_WORLD_GEN existed genVersionForSession() returned that
+ * constant unconditionally and nothing could vary it. So the diffs in
+ * block_diffs.bin are coordinates into legacy terrain by construction, and 1 is
+ * the declaration that describes them. Any other default would be a claim about
+ * worlds that already exist, made by an upgrade nobody opted into. */
+#define BSGAME_WORLD_GEN_DEFAULT 1u
+
+/* Loads --state-dir/world_gen.txt, or mints and writes one on first run.
+ * Deliberately world_seed_load() above with the numbers changed, rather than a
+ * shared helper: the two differ in what a bad value means (a seed cannot be
+ * wrong, a generator declaration can be out of range) and the shared version
+ * would be a parameterised text-file reader whose parameters were the whole of
+ * the function.
+ *
+ * `forced` is a --world-gen argument, which overwrites whatever is stored. It
+ * exists for the migration case a persisted file cannot serve by itself — an
+ * operator who KNOWS their world is not legacy — and for the test suite, which
+ * needs to start a daemon on a known declaration. Changing it on a live world
+ * strands every diff in block_diffs.bin against terrain of a different shape,
+ * so it is an explicit operator act and never something that happens by itself.
+ *
+ * A stored value above 0xFFFF is refused rather than truncated. BS_WORLD_GEN's
+ * wire field is a uint16 (proto/bs_proto.h), so truncating would declare a
+ * DIFFERENT generator than the file says, silently, which is the one outcome
+ * this whole message exists to prevent.
+ *
+ * Returns false only on a fault the operator needs to know about; a missing file
+ * is the ordinary first-run path. */
+static bool world_gen_load(const char *state_dir, const char *forced,
+                           uint32_t *out, char *err, size_t errcap)
+{
+    char path[512];
+    if (!path_set(path, sizeof path, "%s/world_gen.txt", state_dir)) {
+        snprintf(err, errcap, "--state-dir is too long for the world gen path");
+        return false;
+    }
+
+    if (forced == NULL) {
+        FILE *f = fopen(path, "r");
+        if (f != NULL) {
+            unsigned long long v = 0;
+            int got = fscanf(f, "%llu", &v);
+            fclose(f);
+            if (got != 1) {
+                /* Names the file and not the full path, for the reason
+                 * world_seed_load() states above: `path` can be 512 bytes and
+                 * the caller's buffer is 256. */
+                snprintf(err, errcap, "world_gen.txt in --state-dir holds no number");
+                return false;
+            }
+            if (v == 0 || v > 0xFFFFu) {
+                snprintf(err, errcap,
+                         "world_gen.txt in --state-dir holds %llu, which no client can be told"
+                         " (the wire field is 16 bits and 0 is not a generator)", v);
+                return false;
+            }
+            *out = (uint32_t)v;
+            logf_("game: world generator %u (from %s)", *out, path);
+            return true;
+        }
+        if (errno != ENOENT) {
+            snprintf(err, errcap, "cannot read world_gen.txt in --state-dir: %s",
+                     strerror(errno));
+            return false;
+        }
+    }
+
+    if (forced != NULL) {
+        unsigned long long v = strtoull(forced, NULL, 10);
+        if (v == 0 || v > 0xFFFFu) {
+            snprintf(err, errcap,
+                     "--world-gen %llu is out of range (1..65535; the wire field is 16 bits)", v);
+            return false;
+        }
+        *out = (uint32_t)v;
+    } else {
+        *out = BSGAME_WORLD_GEN_DEFAULT;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        snprintf(err, errcap, "cannot write world_gen.txt in --state-dir: %s",
+                 strerror(errno));
+        return false;
+    }
+    fprintf(f, "%u\n", *out);
+    if (fclose(f) != 0) {
+        snprintf(err, errcap, "short write on world_gen.txt in --state-dir: %s",
+                 strerror(errno));
+        return false;
+    }
+
+    logf_("game: world generator %u (%s, written to %s)", *out,
+          forced ? "forced by --world-gen" : "newly minted", path);
     return true;
 }
 
@@ -512,6 +646,27 @@ static void send_world_info(struct bs_game *g, uint32_t sid)
     uint8_t payload[BS_WORLD_INFO_BYTES];
     payload[0] = BS_APP_WORLD_INFO;
     bs_put_u32(payload + 1, g->world_seed);
+    send_data(g, sid, payload, sizeof payload);
+}
+
+/* v1.8.3 Phase 4. Tells one player which GENERATOR shaped the world whose seed
+ * they were just given. Sent immediately behind WORLD_INFO and ahead of
+ * REGISTRY_INFO: the pair answers "which world is this" together, and the
+ * generator is needed strictly earlier than the block table, because it decides
+ * whether this client is going to generate anything at all.
+ *
+ * Volunteered, never requested, and never verified here — see
+ * send_registry_info() below for the same posture stated at length. A client
+ * that does not recognise 0x0F drops it in its own `default: break;` and keeps
+ * the behaviour it has always had; a client that does recognise it and cannot
+ * generate what this says refuses the join on its own side and tells its
+ * player. Nothing about the decision reaches this process, and no join is ever
+ * refused here over it. */
+static void send_world_gen(struct bs_game *g, uint32_t sid)
+{
+    uint8_t payload[BS_WORLD_GEN_BYTES];
+    payload[0] = BS_APP_WORLD_GEN;
+    bs_put_u16(payload + 1, (uint16_t)g->world_gen);
     send_data(g, sid, payload, sizeof payload);
 }
 
@@ -900,6 +1055,14 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
      * is a safe way to tell a pre-V127-A client apart from a modern one
      * without a capability bit the fixed wire format has no room for. */
     send_world_info(g, sid);
+
+    /* v1.8.3 Phase 4. WORLD_GEN rides in the slot WORLD_INFO already owns —
+     * immediately behind it, ahead of REGISTRY_INFO — because the two are one
+     * answer to "which world is this" and the client needs the generator before
+     * anything that could make it generate or mesh a column. Second, not first:
+     * WORLD_INFO is the packet that admits the client (see above), and it is
+     * also what starts the client's own registry/gen clock, so it has to lead. */
+    send_world_gen(g, sid);
 
     /* REGISTRY_INFO rides right behind WORLD_INFO and before anything that
      * could put a block id on the wire — the join order world_info ->
@@ -1460,21 +1623,30 @@ static void usage(void)
         "usage: bsgame --game-socket PATH --gate-socket PATH --state-dir DIR\n"
         "  --game-socket PATH   unix socket this process binds (gate sends JOIN/DATA/LEAVE here)\n"
         "  --gate-socket PATH   unix socket bsgate binds (this process sends DATA/KICK there)\n"
-        "  --state-dir DIR      holds block_diffs.bin, world_seed.txt and, on SIGUSR1, status.txt\n"
+        "  --state-dir DIR      holds block_diffs.bin, world_seed.txt, world_gen.txt and, on SIGUSR1, status.txt\n"
         "  --world-seed N       force this world's terrain seed, overwriting world_seed.txt.\n"
         "                       Omit it: the stored seed is reused, or minted on first run.\n"
-        "                       Changing it strands every edit already in block_diffs.bin.\n");
+        "                       Changing it strands every edit already in block_diffs.bin.\n"
+        "  --world-gen N        force the generator version declared to clients (1..65535),\n"
+        "                       overwriting world_gen.txt. Omit it: the stored value is reused,\n"
+        "                       or minted to 1 (legacy) on first run, which is what every client\n"
+        "                       that has ever joined this server actually generated.\n"
+        "                       Changing it strands every edit already in block_diffs.bin, and\n"
+        "                       setting it to 2 does NOT enable the density generator -- see\n"
+        "                       BS_APP_WORLD_GEN in proto/bs_proto.h before touching it.\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *game_sock = NULL, *gate_sock = NULL, *state_dir = NULL, *world_seed = NULL;
+    const char *world_gen = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--game-socket") && i + 1 < argc)      game_sock = argv[++i];
         else if (!strcmp(argv[i], "--gate-socket") && i + 1 < argc) gate_sock = argv[++i];
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc)   state_dir = argv[++i];
         else if (!strcmp(argv[i], "--world-seed") && i + 1 < argc)  world_seed = argv[++i];
+        else if (!strcmp(argv[i], "--world-gen") && i + 1 < argc)   world_gen = argv[++i];
         else { usage(); return 2; }
     }
     if (game_sock == NULL || gate_sock == NULL || state_dir == NULL) {
@@ -1509,6 +1681,14 @@ int main(int argc, char **argv)
     /* Before the diff store, so a bad seed file stops the server while the
      * world is still untouched rather than after diffs are already open. */
     if (!world_seed_load(state_dir, world_seed, &g.world_seed, err, sizeof err)) {
+        logf_("game: %s", err);
+        return 1;
+    }
+    /* Beside the seed and for the same reason it is above the diff store: a bad
+     * declaration must stop the server while the world is still untouched,
+     * rather than after clients have been told a number the operator's file
+     * does not actually say. */
+    if (!world_gen_load(state_dir, world_gen, &g.world_gen, err, sizeof err)) {
         logf_("game: %s", err);
         return 1;
     }
