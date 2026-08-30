@@ -32,7 +32,18 @@ CFLAGS  := -std=c11 -O2 -g \
 
 LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 
-OBJS    := bsgate.o allowlist.o invite.o proxyproto.o ratelimit.o replay.o $(HYDRO)/hydrogen.o
+# Split out from OBJS so DEPS below can name our own translation units without
+# also naming libhydrogen's. hydrogen.o is compiled by its own rule with its own
+# flags (see the third-party note below), generates no .d, and must not appear in
+# an -include list that would then never be satisfied.
+GATE_OBJS := bsgate.o allowlist.o invite.o proxyproto.o ratelimit.o replay.o
+
+OBJS    := $(GATE_OBJS) $(HYDRO)/hydrogen.o
+
+# bsgate_test.o carries its own main() and so is not in GATE_OBJS, but it includes
+# the same headers; without its .d, `make test` keeps the bug described at the
+# compile rule for the one translation unit the suite actually runs.
+DEPS_MK := $(GATE_OBJS:.o=.d) bsgate_test.d
 
 .PHONY: all deps test clean install-check
 
@@ -57,8 +68,46 @@ $(HYDRO)/hydrogen.h:
 $(HYDRO)/hydrogen.o: $(HYDRO)/hydrogen.c
 	$(CC) -std=c11 -O2 -g -fPIE -I$(HYDRO) -c $< -o $@
 
+# -MMD -MP, with the generated .d files read back by the -include at the foot of
+# this file. Same mechanism and same idiom as game/Makefile and as the client
+# build (devkitARM's base_rules compiles with `-MMD -MP -MF $(DEPSDIR)/$*.d` and
+# the client Makefile ends with `-include $(DEPSDIR)/*.d`); the two server
+# Makefiles are deliberately kept the same shape.
+#
+# The $(HYDRO)/hydrogen.h prerequisite below is NOT a header dependency and is not
+# made redundant by -MMD. It is an ordering guarantee: on a fresh checkout the
+# libhydrogen clone has not happened yet, and this is what forces the
+# $(HYDRO)/hydrogen.h clone rule above to run first. -MMD can only
+# record headers that existed at the time of a successful compile, so it cannot
+# bootstrap that. Keep the prerequisite.
+#
+# Before this, the rule named that ONE header and no others, so editing
+# allowlist.h, invite.h, proxyproto.h, ratelimit.h or replay.h left the matching
+# object stale while make printed "'bsgate' is up to date." and exited 0.
+# Measured 2026-08-30 from a clean tree: `touch allowlist.h ratelimit.h replay.h
+# && make bsgate` -> "make: 'bsgate' is up to date.", rc=0, with all six of
+# bsgate.o allowlist.o invite.o proxyproto.o ratelimit.o replay.o left untouched
+# and older than the headers.
+#
+# That matters more here than anywhere else in this repo. This is the only
+# process facing the internet, and the objects that silently do not get rebuilt
+# are the allowlist, the rate limiter and the replay guard. A security fix to one
+# of those headers could be edited, rebuilt, tested green and shipped without ever
+# having been compiled in, because a skipped rebuild and a passing check produce
+# byte-identical output.
+#
+# -MMD rather than -MD: libhydrogen and libc are not our drift risk, and listing
+# them churns every .d on a toolchain update. -MP emits a phony target per header
+# so DELETING a header gives a clean recompile instead of make aborting with
+# "No rule to make target 'allowlist.h'" against a dep file that outlived it.
+#
+# Deliberately NOT the blunt `$(GATE_OBJS): $(wildcard *.h)` form. That would also
+# turn the red arm above green while rebuilding all six objects for any header
+# touched - passing the test for the wrong reason and hiding which translation
+# unit actually depends on what. The .d files are exact; see the commit message
+# for the per-object rebuild sets measured against them.
 %.o: %.c $(HYDRO)/hydrogen.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 bsgate: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -78,4 +127,18 @@ install-check: bsgate
 	@readelf -lW bsgate | grep -q 'GNU_STACK.*RW ' && echo "  NX stack ok"       || (echo "  stack may be executable"; exit 1)
 
 clean:
-	rm -f *.o bsgate bsgate_test $(HYDRO)/hydrogen.o
+	rm -f *.o *.d bsgate bsgate_test $(HYDRO)/hydrogen.o
+
+# Read back the header dependencies recorded by -MMD -MP on the last compile.
+# Leading '-' because on a clean tree these do not exist yet and their absence is
+# not an error: the first build compiles everything regardless, and it is that
+# build which writes them.
+#
+# Consequence worth knowing before testing this mechanism: a tree built BEFORE
+# this line existed has no .d files, so the first `make` after the change still
+# cannot see header deps for objects it already considers up to date. Run
+# `make clean` once when adopting this, or the fix looks like it did not work.
+#
+# Note this does NOT remove .deps/libhydrogen - `clean` only deletes that clone's
+# hydrogen.o, so a clean does not re-trigger a network fetch of the pinned commit.
+-include $(DEPS_MK)
