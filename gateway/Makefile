@@ -32,10 +32,12 @@ CFLAGS  := -std=c11 -O2 -g \
 
 LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 
-# Split out from OBJS so DEPS below can name our own translation units without
-# also naming libhydrogen's. hydrogen.o is compiled by its own rule with its own
-# flags (see the third-party note below), generates no .d, and must not appear in
-# an -include list that would then never be satisfied.
+# Split out from OBJS because our translation units and libhydrogen's are built
+# by different rules with different flags: ours get the hardening set below,
+# hydrogen.o gets its own minimal set (see the third-party note at its rule).
+# Both now generate a .d, so both are named in DEPS_MK - they just get there by
+# different routes, and hydrogen.d lands beside its object inside $(HYDRO)
+# rather than in this directory.
 GATE_OBJS := bsgate.o allowlist.o invite.o proxyproto.o ratelimit.o replay.o
 
 OBJS    := $(GATE_OBJS) $(HYDRO)/hydrogen.o
@@ -43,7 +45,11 @@ OBJS    := $(GATE_OBJS) $(HYDRO)/hydrogen.o
 # bsgate_test.o carries its own main() and so is not in GATE_OBJS, but it includes
 # the same headers; without its .d, `make test` keeps the bug described at the
 # compile rule for the one translation unit the suite actually runs.
-DEPS_MK := $(GATE_OBJS:.o=.d) bsgate_test.d
+#
+# $(HYDRO)/hydrogen.d is written by the hydrogen.o rule's own -MMD; the path is
+# spelled out rather than derived from OBJS so that adding a future third-party
+# object cannot quietly enrol it here without its rule being given -MMD too.
+DEPS_MK := $(GATE_OBJS:.o=.d) bsgate_test.d $(HYDRO)/hydrogen.d
 
 .PHONY: all deps test clean install-check
 
@@ -64,9 +70,32 @@ $(HYDRO)/hydrogen.h:
 	  || (echo "libhydrogen checkout is not at the pinned commit"; exit 1)
 	@echo "libhydrogen pinned at $(HYDRO_COMMIT)"
 
-# libhydrogen is third-party; do not fail its build on our warning set.
+# libhydrogen is third-party; do not fail its build on our warning set. The flags
+# on this line are deliberately NOT $(CFLAGS): no -Wall/-Wextra/-Werror here, or a
+# diagnostic in code we do not own becomes our build break. Only the dependency
+# tracking is shared with our own rule below.
+#
+# hydrogen.c is a single-file amalgamation - it is little more than a list of
+# #includes, and every line of the crypto actually lives in $(HYDRO)/impl/*.h.
+# So naming hydrogen.c as the only prerequisite tracked nothing at all: the one
+# file listed is the one file that never changes. Editing, patching or
+# checking out a different revision of any impl header left hydrogen.o stale
+# while make exited 0, and the gateway then linked a crypto implementation that
+# was not the one on disk - the failure mode the pinned commit above exists to
+# prevent, arriving by a different door.
+#
+# Measured 2026-08-30 from a clean tree, before this -MMD -MP was added:
+# `touch .deps/libhydrogen/impl/common.h && make bsgate` -> "make: 'bsgate' is
+# up to date.", rc=0, with .deps/libhydrogen/hydrogen.o left one second OLDER
+# than the header it includes.
+#
+# -MMD writes $(HYDRO)/hydrogen.d beside the object because the driver derives
+# the .d path from -o, and names the target with that same -o path
+# (".deps/libhydrogen/hydrogen.o:", verified on gcc 15.2.0) so it matches the
+# target make is building rather than a bare "hydrogen.o:" that would never
+# apply. -MMD not -MD, and -MP, for the reasons given at the rule below.
 $(HYDRO)/hydrogen.o: $(HYDRO)/hydrogen.c
-	$(CC) -std=c11 -O2 -g -fPIE -I$(HYDRO) -c $< -o $@
+	$(CC) -std=c11 -O2 -g -fPIE -I$(HYDRO) -MMD -MP -c $< -o $@
 
 # -MMD -MP, with the generated .d files read back by the -include at the foot of
 # this file. Same mechanism and same idiom as game/Makefile and as the client
@@ -127,7 +156,7 @@ install-check: bsgate
 	@readelf -lW bsgate | grep -q 'GNU_STACK.*RW ' && echo "  NX stack ok"       || (echo "  stack may be executable"; exit 1)
 
 clean:
-	rm -f *.o *.d bsgate bsgate_test $(HYDRO)/hydrogen.o
+	rm -f *.o *.d bsgate bsgate_test $(HYDRO)/hydrogen.o $(HYDRO)/hydrogen.d
 
 # Read back the header dependencies recorded by -MMD -MP on the last compile.
 # Leading '-' because on a clean tree these do not exist yet and their absence is
@@ -139,6 +168,7 @@ clean:
 # cannot see header deps for objects it already considers up to date. Run
 # `make clean` once when adopting this, or the fix looks like it did not work.
 #
-# Note this does NOT remove .deps/libhydrogen - `clean` only deletes that clone's
-# hydrogen.o, so a clean does not re-trigger a network fetch of the pinned commit.
+# Note this does NOT remove .deps/libhydrogen - `clean` only deletes the two
+# build products this Makefile put inside that clone, hydrogen.o and hydrogen.d,
+# so a clean does not re-trigger a network fetch of the pinned commit.
 -include $(DEPS_MK)
