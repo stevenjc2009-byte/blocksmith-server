@@ -106,6 +106,21 @@ typedef struct {
     bool     chunk_sub_seen;    /* this player has sent at least one CHUNK_SUB */
     bool     legacy_sync_sent;  /* the grace-window full WORLD_SYNC already went out */
     uint64_t joined_ms;
+
+    /* v1.9.0. How many EXTRA copies of BS_APP_WORLD_GEN have gone to this
+     * player since the join burst, counted so tick() can stop at
+     * BS_WORLD_GEN_RESENDS. Zero from playerAlloc's memset, which is the
+     * right starting value: the join burst's own copy is not counted here.
+     *
+     * The transport is plain UDP with no retransmission
+     * (net/bsnet_transport.h: "UDP, so callers must treat every send as
+     * best-effort"), and WORLD_GEN is the one join packet whose loss is
+     * SILENT AND WRONG rather than merely missing. A client that never hears
+     * it falls through its own 250 ms grace, concludes "server too old to
+     * say", generates legacy terrain, and plays in a different world from
+     * everyone else with both sides believing they agree. Every other join
+     * packet either repeats on its own or fails visibly. */
+    uint8_t  world_gen_sends;
 } BsPlayer;
 
 typedef struct {

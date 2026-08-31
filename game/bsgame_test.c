@@ -528,6 +528,133 @@ static bool recv_world_gen(uint32_t sid, unsigned ms)
     return true;
 }
 
+/* v1.9.0. recv_app_for, but discarding BS_APP_WORLD_GEN.
+ *
+ * bsgame.c now resends WORLD_GEN twice after the join burst, one tick apart, so
+ * for the first ~100 ms of a session that message can turn up between any two
+ * other packets. recv_app_for filters by session id and never by type, so a test
+ * reading a SEQUENCE would either mis-type the packet it wanted or, worse, find
+ * something where it asserted nothing arrives. Three checks failed exactly that
+ * way the first time the resend went in — the failure was in the suite's
+ * assumptions, not in the daemon, and this is the repair.
+ *
+ * Deliberately NOT used by recv_world_gen() above, and that separation is the
+ * whole point. recv_world_gen asserts WHERE in the burst WORLD_GEN sits; a
+ * helper that skipped the message would turn that assertion into a tautology.
+ * Every other reader wants the next packet that is not a resend.
+ *
+ * The skip is counted and returned so a caller can still see them if it cares;
+ * nothing does yet, and a test that asserted silence would be lying if it could
+ * not tell "nothing came" from "only resends came". */
+static ssize_t recv_app_skip_gen(uint32_t sid, uint8_t *out, size_t cap, unsigned ms,
+                                 unsigned *skipped)
+{
+    if (skipped) *skipped = 0;
+    const uint64_t until = now_ms() + ms;
+
+    for (;;) {
+        const uint64_t now = now_ms();
+        if (now >= until) return -1;
+
+        const ssize_t n = recv_app_for(sid, out, cap, (unsigned)(until - now));
+        if (n < 1) return n;
+        if (out[0] != BS_APP_WORLD_GEN) return n;
+        if (skipped) (*skipped)++;
+    }
+}
+
+/* v1.9.0. How many BS_APP_WORLD_GEN datagrams one join must put on the wire:
+ * the join burst's own, plus bsgame.c's BS_WORLD_GEN_RESENDS.
+ *
+ * A LITERAL ON PURPOSE, for the reason BSGAME_TEST_WORLD_GEN above is one.
+ * bsgame.c's constants are not visible here anyway — this suite is a separate
+ * process talking over the gateway socket — but even if they were, a test that
+ * counted `1 + BS_WORLD_GEN_RESENDS` would agree with the daemon no matter what
+ * that number became, including zero. Three is the claim being made: enough that
+ * a silent downgrade to the legacy generator needs three losses in 100 ms rather
+ * than one, and few enough to fit inside the client's 250 ms
+ * NETWORLD_GEN_GRACE_MS with 150 ms to spare. */
+#define BSGAME_TEST_WORLD_GEN_COPIES 3u
+
+/* v1.9.0. The resend schedule, end to end against the real daemon.
+ *
+ * What this is defending: the transport is plain UDP with no retransmission, and
+ * WORLD_GEN is the only packet in the join burst whose loss is silent AND wrong.
+ * A client that never hears it waits out its own 250 ms grace, decides the server
+ * is too old to have an opinion, and generates the LEGACY terrain — a different
+ * world from everyone else's, with both sides believing they agree. There is no
+ * C->S message to ask again with and adding one is banned in that direction, so
+ * the only place the repair can live is here.
+ *
+ * Counts rather than reading positions, deliberately. recv_world_gen() above
+ * pins the burst ORDER and is the right tool for that; this one has to survive
+ * two more copies arriving in among REGISTRY_INFO, INV_STATE and PLAYER_STATE,
+ * whose interleaving with a 50 ms timer is not something a test should pin. */
+static void test_world_gen_is_resent_after_join(void)
+{
+    puts("end-to-end: WORLD_GEN is resent, so one lost datagram cannot silently"
+         " downgrade a client to the legacy generator");
+    drain();
+
+    const uint32_t sid = 0x9E43110Fu;
+    send_join(sid, "genresend");
+
+    /* 300 ms: past the last scheduled resend at 100 ms with room for a late
+     * tick, and short of BS_CHUNK_LEGACY_GRACE_MS (500) so the full WORLD_SYNC
+     * that fires there cannot land inside the window. A window that spanned two
+     * different timers would make a failure ambiguous about which one broke. */
+    const uint64_t until = now_ms() + 300u;
+
+    unsigned seen = 0;
+    unsigned malformed = 0;
+    unsigned spins = 0;
+    for (;;) {
+        const uint64_t now = now_ms();
+        if (now >= until) break;
+        /* recv_app_for returns -1 both on timeout and on a packet it cannot
+         * file, so the deadline alone is not a guaranteed exit. */
+        if (++spins > 512u) break;
+
+        uint8_t out[2048];
+        const ssize_t n = recv_app_for(sid, out, sizeof out, (unsigned)(until - now));
+        if (n < 1) continue;
+        if (out[0] != BS_APP_WORLD_GEN) continue;
+
+        seen++;
+        if (n != (ssize_t)BS_WORLD_GEN_BYTES) { malformed++; continue; }
+        if (bs_get_u16(out + 1) != BSGAME_TEST_WORLD_GEN) malformed++;
+    }
+
+    /* Each of the first two was made to go red on its own, against production code,
+     * before this test was believed:
+     *
+     *   seen      — bsgame.c's resend site reduced to `(void)0`, so the block still
+     *               runs on schedule and still counts but puts nothing on the wire,
+     *               which is exactly the behaviour before this change. Result:
+     *               "FAIL 292 checks, 1 failed", this check and only this check,
+     *               total unchanged, so the arm failed a check rather than deleting
+     *               any. (Arming it at BS_WORLD_GEN_RESENDS 2u -> 0u does not
+     *               compile: a uint8_t < 0u is -Werror=type-limits.)
+     *   malformed — send_world_gen() shortened by one byte. Result: this check red
+     *               while `seen` stayed green, so the two are not the same claim.
+     *               That arm is over-broad and is NOT a clean one — a short
+     *               WORLD_GEN breaks every positional join-burst read in the suite
+     *               and the total fell from 292 to 184. It shows this check can
+     *               fail; it shows nothing else.
+     *
+     * The third is deliberately not a claim about the daemon. It is this test's own
+     * runaway guard, green in both arms and in the fixed build, and it is here so a
+     * `seen` failure can never be blamed on the loop having exited early. */
+    check(seen == BSGAME_TEST_WORLD_GEN_COPIES,
+          "one join puts three WORLD_GEN datagrams on the wire: the burst's own plus two"
+          " resends one tick apart");
+    check(malformed == 0,
+          "every resent copy is a whole BS_WORLD_GEN_BYTES declaring the same generator —"
+          " a resend that disagreed with the first would be worse than no resend at all");
+    check(spins <= 512u, "the collection loop terminated on its deadline, not on its"
+                         " runaway guard");
+}
+
 static void test_join_sends_world_info_then_sync(void)
 {
     puts("end-to-end: join gets WORLD_INFO first, then a WORLD_SYNC");
@@ -551,7 +678,8 @@ static void test_join_sends_world_info_then_sync(void)
      * where `send_world_sync()` sent nothing at all when the diff store was
      * empty. */
     uint8_t out[64];   /* was [16]; BS_INV_STATE_BYTES (50) is now the largest packet caught below */
-    ssize_t n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
+    unsigned gen_skipped = 0;
+    ssize_t n = recv_app_skip_gen(0xA11CE001u, out, sizeof out, 500, &gen_skipped);
     check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
           "the first packet after JOIN is WORLD_INFO");
     if (n == (ssize_t)BS_WORLD_INFO_BYTES) {
@@ -584,7 +712,7 @@ static void test_join_sends_world_info_then_sync(void)
      * catch this packet instead (recv_app_for filters by sid only, not by
      * message type) and fail on a type/length mismatch that has nothing to
      * do with what this test is checking. */
-    n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
+    n = recv_app_skip_gen(0xA11CE001u, out, sizeof out, 500, &gen_skipped);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
           "JOIN's third packet is the INV_STATE capability probe");
 
@@ -596,11 +724,12 @@ static void test_join_sends_world_info_then_sync(void)
      * (test_ps_join_fresh_sends_zeroed_state). Without consuming it here the
      * legacy-WORLD_SYNC wait below would catch it instead and fail on a
      * type mismatch unrelated to what this test checks. */
-    n = recv_app_for(0xA11CE001u, out, sizeof out, 500);
+    n = recv_app_skip_gen(0xA11CE001u, out, sizeof out, 500, &gen_skipped);
     check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
           "JOIN's fourth packet is the PLAYER_STATE capability probe");
 
-    n = recv_app_for(0xA11CE001u, out, sizeof out, BS_CHUNK_LEGACY_GRACE_MS + 400u);
+    n = recv_app_skip_gen(0xA11CE001u, out, sizeof out,
+                          BS_CHUNK_LEGACY_GRACE_MS + 400u, &gen_skipped);
     check(n == (ssize_t)BS_WORLD_SYNC_BYTES(0) && out[0] == BS_APP_WORLD_SYNC,
           "a fresh, zero-diff world still sends one legacy-path WORLD_SYNC packet");
     if (n == (ssize_t)BS_WORLD_SYNC_BYTES(0)) {
@@ -2568,7 +2697,8 @@ static void test_registry_fetch_batches_over_36_defs(void)
 
     /* And nothing further arrives: two batches was the whole answer. */
     uint8_t extra[16];
-    n = recv_app_for(0x9E670002u, extra, sizeof extra, 300);
+    unsigned defs_gen_skipped = 0;
+    n = recv_app_skip_gen(0x9E670002u, extra, sizeof extra, 300, &defs_gen_skipped);
     check(n < 0, "no third DEFS batch follows the LAST-flagged one");
 }
 
@@ -2619,6 +2749,7 @@ int main(void)
     }
 
     test_join_sends_world_info_then_sync();
+    test_world_gen_is_resent_after_join();
     test_edit_broadcast_to_other_player_only();
     test_invalid_block_id_rejected();
     test_highest_block_id_is_accepted();

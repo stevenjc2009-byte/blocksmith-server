@@ -120,6 +120,42 @@ _Static_assert(TICK_HZ / BS_POS_BROADCAST_PERIOD == 10,
  * broadcast_block_edit()). */
 #define BS_CHUNK_LEGACY_GRACE_MS 500u
 
+/* v1.9.0. Extra copies of BS_APP_WORLD_GEN, and how far apart, on top of the
+ * one send_world_gen() call in handle_join().
+ *
+ * WHY THIS ONE PACKET AND NOTHING ELSE IN THE JOIN BURST. The transport is
+ * plain UDP with no retransmission (the client's net/bsnet_transport.h says
+ * "UDP, so callers must treat every send as best-effort"). Losing WORLD_INFO
+ * loses the join outright and the player sees it. Losing REGISTRY_INFO leaves
+ * the client asking for it — REGISTRY_FETCH retries up to
+ * NETWORLD_REG_FETCH_MAX_SENDS times. Losing INV_STATE costs an inventory the
+ * next report restores. WORLD_GEN is the only one whose loss is silent AND
+ * wrong: net/networld.c's networldGenWaiting() holds world entry for just
+ * NETWORLD_GEN_GRACE_MS (250) and then lets the client in with
+ * networldServerGenVersion() false, which means "a server too old to say" and
+ * resolves to the legacy generator. There is no C->S message to ask again with,
+ * and adding one is banned in this direction — an unknown app id from a client
+ * meets handle_app_payload()'s `default: send_kick()` on every older server.
+ *
+ * So the repair belongs on this side, and it is a resend rather than an ack
+ * because there is nothing to ack with. Two extra copies one tick apart puts
+ * three WORLD_GEN datagrams on the wire at roughly t=0, 50 and 100 ms after
+ * JOIN, all of them inside the client's 250 ms window with 150 ms to spare.
+ * That does not make delivery certain — nothing over UDP does — it makes a
+ * silent downgrade need three losses in 100 ms instead of one.
+ *
+ * SAFE AGAINST EVERY CLIENT THAT EXISTS. A client older than v1.8.3 has never
+ * heard of app id 0x0F and drops all three in its `default: break;`. A v1.8.3
+ * client's applyWorldGen() only assigns two fields and is explicitly documented
+ * as tolerating a resend: it deliberately does not call registryGateArm(),
+ * "so a server that resent WORLD_GEN" cannot push the origin of its timing
+ * bounds forward. This change is what that sentence was written for.
+ *
+ * Not a client-visible protocol change, so it needs no PROTO_COMMIT bump and no
+ * client release: the same message, sent more than once. */
+#define BS_WORLD_GEN_RESENDS   2u
+#define BS_WORLD_GEN_RESEND_MS 50u
+
 static volatile sig_atomic_t g_quit = 0;
 static void on_sigterm(int s) { (void)s; g_quit = 1; }
 
@@ -1482,6 +1518,25 @@ static void tick(struct bs_game *g, uint64_t t)
             && since_join >= BS_CHUNK_LEGACY_GRACE_MS) {
             send_world_sync(g, p->sid);
             p->legacy_sync_sent = true;
+        }
+
+        /* v1.9.0. The WORLD_GEN resends — see BS_WORLD_GEN_RESENDS for why this
+         * packet and no other one in the join burst gets them.
+         *
+         * Unconditional, with no check that the client needs them, because
+         * there is nothing on this side that could know: WORLD_GEN is S->C only
+         * and no acknowledgement of any kind comes back. Two extra datagrams of
+         * BS_WORLD_GEN_BYTES each, once per player per join, is not a bandwidth
+         * question worth an if.
+         *
+         * The threshold multiplies by sends+1 rather than tracking a deadline,
+         * so a tick that runs late cannot fire both copies into the same
+         * millisecond: after the first resend at 50 ms the next one is not due
+         * until 100 ms, whenever the first actually happened. */
+        if (p->world_gen_sends < BS_WORLD_GEN_RESENDS
+            && since_join >= (uint64_t)(p->world_gen_sends + 1) * BS_WORLD_GEN_RESEND_MS) {
+            send_world_gen(g, p->sid);
+            p->world_gen_sends++;
         }
 
         if (!send_pos) continue;
