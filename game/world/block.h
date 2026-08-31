@@ -29,7 +29,7 @@ enum {
 	BLOCK_COUNT
 };
 
-// Core blocks that are NOT items — roadmap tasks 17 and 19.
+// Core blocks that are NOT items — roadmap tasks 17 and 19, and v1.8.3 Phase 3.
 //
 // These are ordinary compiled-in core registry rows (the core id space is
 // REG_ID_CORE_LO..REG_ID_CORE_HI, 0x01..0x7F — see world/registry.h), appended after
@@ -57,6 +57,26 @@ enum {
 // not own. Leaving BLOCK_COUNT alone gets the wanted behaviour for free:
 // inventoryCanHold() answers false, so scene/interact.c refuses the break rather than
 // deleting the block, and neither id can reach the hotbar.
+//
+// **v1.8.3 Phase 3 appends five more of exactly this kind — snow, ice, cactus, dead bush
+// and fern, ids 10..14 — and BLOCK_COUNT still does not move.** That was a decision, and
+// the alternative it beat is recorded so nobody re-opens it by accident: the ceiling and
+// the blocks are two INDEPENDENT changes, and only the blocks are needed for terrain. A
+// block can be drawn, generated, walked on and aimed at without being carriable; what the
+// ceiling decides is only whether the bag may receive it. Measured against the real
+// guard at scene/interact.c — `!blockDropsNothing(here) && !inventoryCanHold(here)`,
+// which reads the SHAPE and the id and nothing else:
+//
+//   snow, ice, cactus   FULL_CUBE and past the ceiling, so the break is REFUSED. They
+//                       are unminable scenery, which is the same end state the paragraph
+//                       above argues for water, and on a snow cap or a frozen lake it is
+//                       arguably the right one rather than a shortfall.
+//   dead_bush, fern     CROSS, so blockDropsNothing() is true, the break is allowed, and
+//                       it yields nothing — identical to tall grass today.
+//
+// The day snow and ice must be collectable the move is STILL the one described above:
+// widen inventoryCanHold() past BLOCK_COUNT on both sides. Moving BLOCK_COUNT walks
+// straight into the trap the next paragraph documents.
 //
 // When the survival rung gives water a bucket and tall grass a seed drop, the move is
 // to widen inventoryCanHold() past BLOCK_COUNT on both sides — the change
@@ -90,12 +110,23 @@ enum {
 enum {
 	BLOCK_WATER      = 8,
 	BLOCK_TALL_GRASS = 9,
+	// v1.8.3 Phase 3. Literals for the same reason as the two above, and the ⚠ note
+	// applies to every one of them: do not tidy these into BLOCK_COUNT + n.
+	BLOCK_SNOW       = 10,
+	BLOCK_ICE        = 11,
+	BLOCK_CACTUS     = 12,
+	BLOCK_DEAD_BUSH  = 13,
+	BLOCK_FERN       = 14,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
                "save and packet; it must never move");
 _Static_assert(BLOCK_WATER == 8 && BLOCK_TALL_GRASS == 9,
                "water and tall grass ids are on players' SD cards; they must never move");
+_Static_assert(BLOCK_SNOW == 10 && BLOCK_ICE == 11 && BLOCK_CACTUS == 12 &&
+                   BLOCK_DEAD_BUSH == 13 && BLOCK_FERN == 14,
+               "v1.8.3 Phase 3's ids are written into saved chunks and block-edit packets "
+               "the moment a server ships them; they must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
@@ -114,6 +145,14 @@ enum {
 	BTEX_PLANKS,
 	BTEX_WATER,
 	BTEX_TALL_GRASS,
+	// v1.8.3 Phase 3, slots 12..16. Same order as gfx/atlas_tiles.h and as
+	// tools/make_atlas.py's TILES list, which is what makes each name land on its own art;
+	// world/block_tiles_check.c fails the build if the two enums ever disagree.
+	BTEX_SNOW,
+	BTEX_ICE,
+	BTEX_CACTUS,
+	BTEX_DEAD_BUSH,
+	BTEX_FERN,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

@@ -4,14 +4,15 @@
 #include <stdio.h>
 #include <string.h>
 
-// The compiled-in core rows, ids 0x00..0x09. These are the old kBlocks[] table
+// The compiled-in core rows, ids 0x00..0x0E. These are the old kBlocks[] table
 // recast as BlockDefs; the ids and textures are frozen forever because every
 // saved region file and every replay encodes them by number.
 //
 // 0x00..0x07 are also the ITEM ids (world/block.h's BLOCK_COUNT and the server's
 // BS_BLOCK_COUNT). 0x08 and 0x09 — water and tall grass, roadmap tasks 17 and 19 —
-// are core rows that are deliberately NOT items; world/block.h explains why that
-// distinction exists and why BLOCK_COUNT stayed at 8 rather than following them.
+// and 0x0A..0x0E — snow, ice, cactus, dead bush and fern, v1.8.3 Phase 3 — are core
+// rows that are deliberately NOT items; world/block.h explains why that distinction
+// exists and why BLOCK_COUNT stayed at 8 rather than following them.
 //
 // ── .hardness (roadmap task 50) ────────────────────────────────────────────────────────
 //
@@ -157,14 +158,118 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	//                   cleared. The whole cell is the target, not the two quads inside
 	//                   it — world/raycast.c says so in as many words.
 	//
-	// Breaking it does nothing today: BLOCK_TALL_GRASS is past BLOCK_COUNT, so
-	// inventoryCanHold() refuses it and scene/interact.c counts the press as refused
-	// instead of deleting a block the bag cannot receive. That is the right end state
-	// until the survival rung gives it a drop; see world/block.h.
+	// Breaking it YIELDS nothing today, but it is not REFUSED — a distinction this comment
+	// got wrong until 2026-08-30. scene/interact.c:178 guards with
+	//
+	//     if (!blockDropsNothing(here) && !inventoryCanHold(here)) { ...refuse... }
+	//
+	// and world/block.h:258 defines blockDropsNothing() as `shape == BLOCK_SHAPE_CROSS`.
+	// Tall grass IS a CROSS, so the first term is false, the guard never fires, and the
+	// block is removed normally; only the pickup is skipped, because it is past
+	// BLOCK_COUNT and inventoryCanHold() answers false. Measured by a probe linked
+	// against this file and world/block.c, not reasoned off the guard's shape.
+	//
+	// The distinction matters for the five rows below: the two CROSS ones behave exactly
+	// like this, while snow, ice and cactus are FULL_CUBE and so are genuinely refused.
+	// Either way it is the right end state until the survival rung gives them a drop;
+	// see world/block.h.
 	[9] = { // tall grass
 		.name  = "tall_grass",
 		.tex   = { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
 		           BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	// ── v1.8.3 Phase 3: ids 10..14 ────────────────────────────────────────────────────
+	//
+	// Five more core rows that are deliberately NOT items, for exactly the reason 8 and 9
+	// are not: they are past BLOCK_COUNT, so world/inventory.h's inventoryCanHold() answers
+	// false for all five. BLOCK_COUNT does NOT move for them and must not — world/block.h's
+	// long note explains why sliding it drags BLOCK_WATER and BLOCK_TALL_GRASS off their
+	// rows, and world/block.h:62 and scene/interact.c already prescribe the other route
+	// (widen the PREDICATE, never the constant) for the day these become collectable.
+	//
+	// What that costs the player, stated rather than discovered:
+	//
+	//   snow, ice, cactus   FULL_CUBE and past the ceiling, so scene/interact.c's guard —
+	//                       `!blockDropsNothing(here) && !inventoryCanHold(here)` — refuses
+	//                       the break outright. They are scenery: you can walk on them, aim
+	//                       at them and build against them, and you cannot mine them. That
+	//                       is the same end state world/block.h argues for water, and it is
+	//                       what makes this a content change rather than a protocol one.
+	//   dead_bush, fern     CROSS, so blockDropsNothing() is true and the break is allowed;
+	//                       it deletes the plant and yields nothing, identically to tall
+	//                       grass today.
+	//
+	// ── .hardness ──
+	//
+	// Only the two CROSS rows can ever be asked (the three cubes are refused before a break
+	// timer starts), but every row carries a real number anyway, for the reason the water
+	// row's explicit 0 is written down: a value that is never read should say it is a
+	// decision. Tuned on the toolless scale at the top of this file — sand 10, leaves 4:
+	//
+	//   snow    8 ticks = 0.40 s     softer than sand; it is settled snow, not packed ice
+	//   ice    10 ticks = 0.50 s     sand's number; a solid pane, not a rock
+	//   cactus  8 ticks = 0.40 s     plant matter, not timber
+	//   dead_bush / fern  1 tick     tall grass's number; every CROSS plant is instant
+	[10] = { // snow — the tundra surface cap, replacing v1.8.3 Phase 2's bare-dirt placeholder
+		.name  = "snow",
+		.tex   = { BTEX_SNOW, BTEX_SNOW, BTEX_SNOW,
+		           BTEX_SNOW, BTEX_SNOW, BTEX_SNOW },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 8,
+	},
+	// Ice. SOLID and NOT transparent, and both are deliberate.
+	//
+	//   SOLID          you walk on a frozen lake; it is the surface, not the water under it.
+	//                  world/physics.c collides on blockIsSolid() alone, so this one flag is
+	//                  the whole of that behaviour.
+	//   not LIQUID     so blockIsTargetable() is true and the crosshair stops on it, which
+	//                  is what lets a player build against a frozen lake. It is still
+	//                  unbreakable, but by the item ceiling and not by being invisible to
+	//                  the raycast — a distinction that matters the day the ceiling widens.
+	//   not TRANSPARENT   the ART is opaque. tools/make_atlas.py's tile_ice says why in
+	//                  full: this sheet is RGBA5551, the pass is an alpha TEST, and one bit
+	//                  of alpha cannot make a translucent pane — a dither of holes at 16x16
+	//                  on a 240 px screen reads as holes in the ice, not as glass. Claiming
+	//                  TRANSPARENT for art that is opaque would cost the mesher every
+	//                  internal face of a frozen lake and buy nothing visible.
+	[11] = { // ice
+		.name  = "ice",
+		.tex   = { BTEX_ICE, BTEX_ICE, BTEX_ICE, BTEX_ICE, BTEX_ICE, BTEX_ICE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 10,
+	},
+	// Cactus. A FULL_CUBE and not a shape of its own: this build has two shapes, and the
+	// 15/16-of-a-cube column other games use would need a third one — new geometry in
+	// world/mesher.c, a new value in the three reserved shape bits, and a wire change. That
+	// is a bigger rung than this one. A full cube of cactus art is what ships; the shape
+	// enum has room for the narrow version whenever somebody writes the mesher path.
+	//
+	// No damage-on-touch: there is no damage system in this build at all.
+	[12] = { // cactus
+		.name  = "cactus",
+		.tex   = { BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS,
+		           BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 8,
+	},
+	// The two CROSS plants. Same flag set and the same reasoning as tall grass at [9], which
+	// world/block.h's blockDropsNothing() note calls out by name: answering from the SHAPE
+	// rather than from an id is precisely what makes these two correct without touching
+	// scene/interact.c. All six tex entries carry the same tile because mesher.c's emitCross
+	// takes FACE_EAST's rect for the whole shape.
+	[13] = { // dead bush — desert flora
+		.name  = "dead_bush",
+		.tex   = { BTEX_DEAD_BUSH, BTEX_DEAD_BUSH, BTEX_DEAD_BUSH,
+		           BTEX_DEAD_BUSH, BTEX_DEAD_BUSH, BTEX_DEAD_BUSH },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	[14] = { // fern — taiga and jungle undergrowth
+		.name  = "fern",
+		.tex   = { BTEX_FERN, BTEX_FERN, BTEX_FERN,
+		           BTEX_FERN, BTEX_FERN, BTEX_FERN },
 		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
 		.hardness = 1,
 	},

@@ -408,9 +408,41 @@ static uint32_t g_seen_seed = 0;
  *
  * If this goes red, do NOT edit the literal to match. Find which core def moved
  * and decide whether that was intended. If it was, move the pin AND say why,
- * the way registry_test.c does for 0x7E5B -> 0x72A8 -> 0x4066. */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 10u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x4066u
+ * the way registry_test.c does for 0x7E5B -> 0x72A8 -> 0x4066.
+ *
+ * MOVED 2026-08-31, 10 -> 15 and 0x4066 -> 0x189B, and it WAS intended: client
+ * v1.8.3 Phase 3 (6d4847e) appends five core rows -- snow, ice, cactus, dead
+ * bush and fern -- and world/registry.c is one of the eleven files vendored
+ * byte-identical from the client by tools/sync-world-sources.sh. So this pin
+ * did exactly its job: it caught a deliberate content change arriving through
+ * the mirror rather than through an edit to this repo.
+ *
+ * The instruction above was followed rather than short-cut. Neither number was
+ * copied out of the failing printout. A probe that links ONLY registry.c and
+ * crc32.c -- no test file, so no pinned literal is reachable from it -- was
+ * compiled twice, once against this repo's game/world/ and once against the
+ * client's source/world/, and both printed
+ *
+ *     count=15 crc16=0x189B rev=1
+ *
+ * which is the same independent-verification method the paragraph above
+ * describes for the previous value, and which re-confirms the byte-identical
+ * vendoring at the same time. All eleven mirrored files were separately checked
+ * identical with cmp.
+ *
+ * REGISTRY_REV deliberately stays 1. It is the wire revision of the registry
+ * protocol, not a hash of the rows; nothing about how the table is transmitted
+ * changed, and the crc16 above is what detects content drift. Bumping it would
+ * have told every already-deployed client the format had moved when it had not.
+ *
+ * Rows 0..9 are unchanged by that commit -- proved mechanically rather than by
+ * reading, by a probe linking this tree's registry.c and the pre-Phase-3 one
+ * and diffing only the old rows' output -- so a client built before v1.8.3 and
+ * one built after still agree about every block either of them knows. What they
+ * disagree about is the crc, which is exactly what registryMatchesInfo() is for
+ * and why the server ships ahead of the client. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 15u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x189Bu
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -418,9 +450,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 10");
+          "core-only registryCount() matches the pinned golden 15");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0x4066");
+          "core-only registryCrc16() matches the pinned golden 0x189B");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }
