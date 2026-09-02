@@ -440,9 +440,64 @@ static uint32_t g_seen_seed = 0;
  * and diffing only the old rows' output -- so a client built before v1.8.3 and
  * one built after still agree about every block either of them knows. What they
  * disagree about is the crc, which is exactly what registryMatchesInfo() is for
- * and why the server ships ahead of the client. */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 15u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x189Bu
+ * and why the server ships ahead of the client.
+ *
+ * MOVED AGAIN 2026-09-02, 0x189B -> 0xBDC5, by the client's v1.8.8, and this move is a
+ * different shape from the one above: the COUNT does not move. It stays 15. No record was
+ * added; exactly one byte inside one existing record changed value -- world/registry.c's
+ * cactus row (id 12), .hardness 8 -> 9 -- which makes this task 50's shape, not Phase 3's.
+ * So registryMatchesInfo() disagrees on the crc half only, and BS_PROTO_VERSION stays 1
+ * because nothing about transport packet types changed.
+ *
+ * Why the byte moved at all: v1.8.8 is the first release in which a cactus can be broken.
+ * The client's inventoryCanHold() used to reject any id >= BLOCK_COUNT (8), so a cactus
+ * drop could never enter the bag and the block was effectively unbreakable; its .hardness
+ * was a number nothing read. With the ceiling widened, that byte is now the block's break
+ * time, and it was set to 9 so it is distinct from snow's 8 and ice's 10.
+ *
+ * Measured by ABLATION on the client tree, not by subtracting totals: rebuilding the real
+ * registry.c with ONLY the cactus hardness put back to 8 reproduces 0x189B exactly, which
+ * proves the ceiling widening itself is crc-neutral (it is a predicate; predicates store no
+ * bytes) and that this entire move belongs to the durability retune.
+ *
+ * The lockstep rule above still holds and still points the same way: the SERVER SHIPS
+ * FIRST.
+ *
+ * MOVED A THIRD TIME 2026-09-02, 0xBDC5 -> 0xD236, and this time the COUNT moves with it,
+ * 15 -> 27. This is the rest of the client's v1.8.8: twelve new core rows, ids 15..26 --
+ * birch_log/birch_planks/birch_leaves, spruce_log/spruce_planks/spruce_leaves,
+ * tall_grass_top, poppy/daisy/bluebell/orchid, apple. So this move has Phase 3's shape
+ * (records ADDED, count moves), not the cactus retune's (one byte inside an existing row).
+ *
+ * BS_PROTO_VERSION and REGISTRY_REV both stay 1, for the same reason as both moves above:
+ * twelve more records travel over a wire whose format did not change. What moved is the
+ * CONTENT of the table, which is exactly what registryMatchesInfo()'s crc half is for.
+ *
+ * Rows 0..14 are untouched by this change -- nothing was renumbered and no existing row's
+ * hardness was retuned -- so the only thing a v1.8.7 client and a v1.8.8 one disagree about
+ * is the twelve rows the older one has never heard of.
+ *
+ * That asymmetry is why the ordering matters more here than it did for the cactus byte. A
+ * NEW client joining an OLD server is a refused join: loud, immediate, recoverable. The
+ * reverse -- an OLD client on a NEW server -- is the dangerous direction, because every
+ * birch log, spruce leaf and flower the server places is an id that client cannot name, and
+ * it would render them as holes rather than as an error. The crc refusing the join is the
+ * only thing standing between those two cases, so a server carrying 0xD236 has to be
+ * DEPLOYED BEFORE the client that generates these blocks is released.
+ *
+ * Measured, not copied out of a failing printout: the probe method this comment describes
+ * for 0x189B was re-run for this move -- registry.c and crc32.c only, no test file linked,
+ * so no pinned literal is reachable from the binary and it cannot echo back the number it
+ * is meant to be checking. Compiled once against this repo's game/world/ and once against
+ * the client's source/world/. Both printed
+ *
+ *     count=27 crc16=0xD236 rev=1
+ *
+ * and all eleven mirrored files were separately confirmed byte-identical with cmp after
+ * tools/sync-world-sources.sh ran (it reported block.h and registry.c synced, the other
+ * nine unchanged). */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 27u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0xD236u
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -450,9 +505,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 15");
+          "core-only registryCount() matches the pinned golden 27");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0x189B");
+          "core-only registryCrc16() matches the pinned golden 0xD236");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }

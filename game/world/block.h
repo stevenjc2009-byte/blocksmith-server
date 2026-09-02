@@ -29,7 +29,8 @@ enum {
 	BLOCK_COUNT
 };
 
-// Core blocks that are NOT items — roadmap tasks 17 and 19, and v1.8.3 Phase 3.
+// Core blocks appended after the closed first span — roadmap tasks 17 and 19, and v1.8.3
+// Phase 3.
 //
 // These are ordinary compiled-in core registry rows (the core id space is
 // REG_ID_CORE_LO..REG_ID_CORE_HI, 0x01..0x7F — see world/registry.h), appended after
@@ -37,52 +38,68 @@ enum {
 // id is written into every saved chunk and every block-edit packet. What is different
 // is that they sit OUTSIDE the enum above, and BLOCK_COUNT does not move.
 //
-// That is deliberate, and it is not a way of dodging a static assert. BLOCK_COUNT has
-// exactly one live use left in this client — inventoryCanHold() in world/inventory.h,
-// the ceiling on what a slot may carry — and one on the server, BS_BLOCK_COUNT in
-// deps/blocksmith-server/game/validate.h, which bounds the ITEM ids in
-// BS_INV_OP_PICKUP/CONSUME and in the armour slots precisely because those index client
-// tables sized BLOCK_COUNT. Every table indexed by a WORLD block id is already sized
-// REGISTRY_MAX or 256 — world/mesher.c's s_rect, world/visgraph.c's openTable,
-// world/light.c's emission table — because dynamic ids 0x80..0xFD have been arriving
-// over the wire since v1.6.0 Phase A. So BLOCK_COUNT is the item-id ceiling and nothing
-// else, and these two ids are strictly less exotic than a dyn id the client already
-// handles.
+// ── What BLOCK_COUNT means, as of v1.8.8 ───────────────────────────────────────────────
 //
-// Neither of these is an item. Water must not be minable or placeable until the
-// survival rung says otherwise, and tall grass has no drop yet. Widening BLOCK_COUNT to
-// 10 would make both legal item ids on THIS client while the server still refused them
-// at 8 — a client/server disagreement invented for no gain — and would need
-// deps/blocksmith-server's BS_BLOCK_COUNT to move in step, in a tree this client does
-// not own. Leaving BLOCK_COUNT alone gets the wanted behaviour for free:
-// inventoryCanHold() answers false, so scene/interact.c refuses the break rather than
-// deleting the block, and neither id can reach the hotbar.
+// It is the WIRE item span, and nothing else. It is no longer the bag's ceiling.
 //
-// **v1.8.3 Phase 3 appends five more of exactly this kind — snow, ice, cactus, dead bush
-// and fern, ids 10..14 — and BLOCK_COUNT still does not move.** That was a decision, and
-// the alternative it beat is recorded so nobody re-opens it by accident: the ceiling and
-// the blocks are two INDEPENDENT changes, and only the blocks are needed for terrain. A
-// block can be drawn, generated, walked on and aimed at without being carriable; what the
-// ceiling decides is only whether the bag may receive it. Measured against the real
-// guard at scene/interact.c — `!blockDropsNothing(here) && !inventoryCanHold(here)`,
-// which reads the SHAPE and the id and nothing else:
+// Until v1.8.8 it was both, because world/inventory.h's inventoryCanHold() was literally
+// `item < BLOCK_COUNT`. That is what made every row from water (8) upward uncarryable, and
+// — since scene/interact.c refuses a break whose drop the bag cannot bank — what made the
+// three FULL_CUBE rows among them, snow, ice and CACTUS, unbreakable. steve reported the
+// cactus. It was never an id-space problem: BlockId is a uint8_t and the core span had 112
+// free rows under it at the time.
 //
-//   snow, ice, cactus   FULL_CUBE and past the ceiling, so the break is REFUSED. They
-//                       are unminable scenery, which is the same end state the paragraph
-//                       above argues for water, and on a snow cap or a frozen lake it is
-//                       arguably the right one rather than a shortfall.
-//   dead_bush, fern     CROSS, so blockDropsNothing() is true, the break is allowed, and
-//                       it yields nothing — identical to tall grass today.
+// v1.8.8 took the route this comment had been prescribing all along — widen the PREDICATE,
+// never the constant. inventoryCanHold() now asks the REGISTRY — defined, not air, not a
+// liquid — instead of comparing against 8. So:
 //
-// The day snow and ice must be collectable the move is STILL the one described above:
-// widen inventoryCanHold() past BLOCK_COUNT on both sides. Moving BLOCK_COUNT walks
-// straight into the trap the next paragraph documents.
+//   BLOCK_COUNT (8)        the frozen span of ids the WIRE agrees are items. The server's
+//                          BS_BLOCK_COUNT in deps/blocksmith-server/game/validate.h is the
+//                          same number, and its game/bsgame.c bounds BS_INV_OP_PICKUP and
+//                          BS_INV_OP_CONSUME by it, as game/playerstate.c does the armour
+//                          slots. world/inventory.h's inventoryItemOnWire() is this client's
+//                          name for that span, and net/inv_bridge.c is its only caller.
+//                          ⚠ It cannot move on one side alone. See inventoryItemOnWire().
+//   inventoryCanHold()     what the BAG may hold, locally. Registry-driven, so it already
+//                          covers every row v1.8.8 and later append without another edit.
+//                          It lives in world/inventory.h and not here — see the ⚠ beside
+//                          blockIsTargetable() below for the link reason that keeps it there.
 //
-// When the survival rung gives water a bucket and tall grass a seed drop, the move is
-// to widen inventoryCanHold() past BLOCK_COUNT on both sides — the change
-// scene/interact.c's own ⚠ comment already flags — not to slide these two into the enum
-// above, which would renumber nothing but would quietly re-point the server's item
-// ceiling at them.
+// Every table indexed by a WORLD block id was already sized REGISTRY_MAX or 256 —
+// world/mesher.c's s_rect, world/visgraph.c's openTable, world/light.c's emission table —
+// because dynamic ids 0x80..0xFD have been arriving over the wire since v1.6.0 Phase A. So
+// nothing was ever sized [BLOCK_COUNT] and widening the bag reads nothing out of bounds.
+//
+// Water is still not carryable, and still for the reason below rather than by accident of a
+// constant: it sets REG_FLAG_LIQUID, and inventoryCanHold() excludes liquids because there
+// is no bucket. That exclusion is now a stated game rule in one place instead of a side
+// effect of where the ceiling happened to fall.
+//
+// ── What v1.8.8 changed for the Phase 3 five ───────────────────────────────────────────
+//
+// snow, ice, cactus, dead bush and fern (ids 10..14) were appended by v1.8.3 Phase 3 with
+// BLOCK_COUNT held at 8, which was right for that rung: the ceiling and the blocks were two
+// INDEPENDENT changes and only the blocks were needed for terrain. The consequence, recorded
+// there and measured against the real guard at scene/interact.c —
+// `!blockDropsNothing(here) && !inventoryCanHold(here)` — was:
+//
+//   snow, ice, cactus   FULL_CUBE and past the ceiling, so the break was REFUSED. Unminable
+//                       scenery. **v1.8.8 ends this**: all three are carryable, so the guard
+//                       does not fire, and all three break and drop themselves.
+//   dead_bush, fern     CROSS, so blockDropsNothing() is true, the break is allowed, and it
+//                       yields nothing — identical to tall grass, and UNCHANGED by v1.8.8.
+//                       They are carryable now, but breakComplete() hands the bag BLOCK_AIR
+//                       for any CROSS block, so no plant id reaches a slot until the survival
+//                       rung gives plants a real drop.
+//
+// What is still open, and is a wire question rather than a client one: an id at or above
+// BLOCK_COUNT that the bag now holds is NOT reported to a server, because inventoryItemOnWire()
+// still stops at 8. In single player that is invisible. On a server the block breaks, the
+// BS_APP_BLOCK_EDIT goes out and is honoured, and the pickup is not — so the server's
+// authoritative inventory does not know about it and the next BS_APP_INV_STATE snapshot takes
+// it back. Nothing crashes, nothing is kicked, and the world is consistent; the bag is not.
+// Closing it needs BS_BLOCK_COUNT and the two guards in the server tree to move first.
+//
 // ⚠ These are LITERALS, and they must stay literals. Do not "tidy" them back into
 // BLOCK_COUNT / BLOCK_COUNT + 1, however much more self-documenting that looks.
 //
@@ -95,8 +112,9 @@ enum {
 // byte 8 for water and still renders it as water because the mesher reads the raw id.
 // What breaks is everything that says BLOCK_WATER by name — worldgen, world/water.c, the
 // liquid checks, the mesher's deferred pass — all of it now talking about tall grass,
-// while BLOCK_TALL_GRASS names an undefined row and becomes a hole. And inventoryCanHold()
-// starts answering true for id 8, so scene/interact.c stops refusing it.
+// while BLOCK_TALL_GRASS names an undefined row and becomes a hole. And BLOCK_COUNT is the
+// WIRE item span (see above), so moving it to 9 also silently offers id 8 to
+// BS_INV_OP_PICKUP while the server still refuses it at 8.
 //
 // So the corruption is not in the file; it is in the meaning of the symbol, and it
 // presents as bad worldgen and strange water rather than as any kind of error. This
@@ -104,9 +122,10 @@ enum {
 // wrong texture constant still renders A texture, so the bug looks like bad art.
 //
 // The asserts below are what make that impossible: they fail the build the moment the
-// literals stop agreeing with what the enum implies. When the survival rung really does
-// give water a bucket and tall grass a seed drop, the move is still the one described
-// above — widen inventoryCanHold() past BLOCK_COUNT on both sides — not to append here.
+// literals stop agreeing with what the enum implies. v1.8.8 widened the PREDICATE exactly as
+// this paragraph used to prescribe, and BLOCK_COUNT did not move — which is the shape every
+// future widening should copy. When the survival rung really does give water a bucket, that
+// is one more row's worth of behaviour inside inventoryCanHold(), still not an append here.
 enum {
 	BLOCK_WATER      = 8,
 	BLOCK_TALL_GRASS = 9,
@@ -117,6 +136,28 @@ enum {
 	BLOCK_CACTUS     = 12,
 	BLOCK_DEAD_BUSH  = 13,
 	BLOCK_FERN       = 14,
+	// ── v1.8.8: per-biome timber and flora, ids 15..26 ─────────────────────────────────
+	//
+	// Literals, for the same reason as every id above them; the ⚠ note applies unchanged.
+	//
+	// Twelve rows and not more. Biome COLOUR is a tint applied by the mesher, not an id —
+	// there is deliberately no "taiga grass" or "jungle dirt" here, because a block only
+	// earns an id when it BEHAVES or DRAWS differently, and a recoloured grass block does
+	// neither. What is below is materials: two more species of tree whose bark, boards and
+	// canopies are drawn differently rather than tinted differently, the upper half of a
+	// two-block grass clump, four flowers that grow in different biomes, and a fruit.
+	BLOCK_BIRCH_LOG     = 15,
+	BLOCK_BIRCH_PLANKS  = 16,
+	BLOCK_BIRCH_LEAVES  = 17,
+	BLOCK_SPRUCE_LOG    = 18,
+	BLOCK_SPRUCE_PLANKS = 19,
+	BLOCK_SPRUCE_LEAVES = 20,
+	BLOCK_TALL_GRASS_TOP = 21,
+	BLOCK_POPPY         = 22,
+	BLOCK_DAISY         = 23,
+	BLOCK_BLUEBELL      = 24,
+	BLOCK_ORCHID        = 25,
+	BLOCK_APPLE         = 26,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
@@ -126,6 +167,13 @@ _Static_assert(BLOCK_WATER == 8 && BLOCK_TALL_GRASS == 9,
 _Static_assert(BLOCK_SNOW == 10 && BLOCK_ICE == 11 && BLOCK_CACTUS == 12 &&
                    BLOCK_DEAD_BUSH == 13 && BLOCK_FERN == 14,
                "v1.8.3 Phase 3's ids are written into saved chunks and block-edit packets "
+               "the moment a server ships them; they must never move");
+_Static_assert(BLOCK_BIRCH_LOG == 15 && BLOCK_BIRCH_PLANKS == 16 &&
+                   BLOCK_BIRCH_LEAVES == 17 && BLOCK_SPRUCE_LOG == 18 &&
+                   BLOCK_SPRUCE_PLANKS == 19 && BLOCK_SPRUCE_LEAVES == 20 &&
+                   BLOCK_TALL_GRASS_TOP == 21 && BLOCK_POPPY == 22 && BLOCK_DAISY == 23 &&
+                   BLOCK_BLUEBELL == 24 && BLOCK_ORCHID == 25 && BLOCK_APPLE == 26,
+               "v1.8.8's per-biome ids are written into saved chunks and block-edit packets "
                "the moment a server ships them; they must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
@@ -153,6 +201,22 @@ enum {
 	BTEX_CACTUS,
 	BTEX_DEAD_BUSH,
 	BTEX_FERN,
+	// v1.8.8, slots 17..30. Same order as gfx/atlas_tiles.h and as tools/make_atlas.py's
+	// TILES list; world/block_tiles_check.c fails the build if the two enums disagree.
+	BTEX_BIRCH_LOG_SIDE,
+	BTEX_BIRCH_LOG_TOP,
+	BTEX_BIRCH_PLANKS,
+	BTEX_BIRCH_LEAVES,
+	BTEX_SPRUCE_LOG_SIDE,
+	BTEX_SPRUCE_LOG_TOP,
+	BTEX_SPRUCE_PLANKS,
+	BTEX_SPRUCE_LEAVES,
+	BTEX_TALL_GRASS_TOP,
+	BTEX_POPPY,
+	BTEX_DAISY,
+	BTEX_BLUEBELL,
+	BTEX_ORCHID,
+	BTEX_APPLE,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is
@@ -215,6 +279,15 @@ static inline bool blockIsAir(BlockId id)   { return id == BLOCK_AIR; }
 // Bare-hand break time in 20 TPS ticks. Zero for anything with no break time of its own —
 // air, and the ids no raycast will ever hand you. See world/mining.h for the arithmetic
 // that turns this into a break duration; this is only the lookup.
+//
+// ⚠ ADDING A BLOCK: its break time is the `.hardness` byte on its row in
+// world/registry.c's kCoreDefs[], and there is no default worth having. A row written
+// without one gets 0 from the designated-initialiser zero-fill, breakTicksRequired()
+// returns 0, and the block shatters the instant the button goes down — a plausible-looking
+// block with no durability at all, and nothing in any build reports it. That is why
+// world/registry_test.c's coreHardnessIsDeclared() fails the host suite for any DEFINED,
+// TARGETABLE core row whose hardness is 0. If a row genuinely must be 0, it has to be
+// untargetable (a liquid, like water) and the test exempts it for that reason and no other.
 static inline uint8_t blockHardnessTicks(BlockId id) { return blockInfo(id)->hardness; }
 
 // Whether this block occupies its whole cell geometrically. This is the question the
@@ -241,13 +314,26 @@ bool blockIsDrawn(BlockId id);
 // though you walk straight through it, and you must not be able to mine a lake.
 bool blockIsTargetable(BlockId id);
 
+// ⚠ The item-id ceiling — "may the bag hold this id" — is NOT in this header. It is
+// world/inventory.h's inventoryCanHold(), and since v1.8.8 it is answered from the registry
+// (defined, not air, not a liquid) rather than by comparing against BLOCK_COUNT.
+//
+// It is over there and not here for a link reason worth knowing before moving it back: this
+// header is mirrored into deps/blocksmith-server, but block.c is NOT — that server's own
+// game/Makefile says so in as many words ("block.h has no block.c ... there is no
+// world/block.o"). The server does compile world/inventory.c and world/registry.c, so a
+// predicate written over registry.h links on both sides and one written over blockInfo() does
+// not. It would compile here and fail to link there.
+
 // Whether breaking this block yields nothing to carry (v1.7.1 task 47).
 //
 // This exists because scene/interact.c used to ask ONE question — "can the bag hold what I am
 // about to break?" — and treat a no as "then it cannot be broken". That is right for a block
-// whose id the bag refuses because of the BLOCK_COUNT ceiling, and wrong for a plant, which is
-// meant to break and simply has nothing to give you. The two had been the same question only by
-// coincidence, and the coincidence broke the moment task 19 shipped tall grass: the comment on
+// whose id the bag genuinely refuses (since v1.8.8: a liquid, or an id with no registry row at
+// all — see world/inventory.h's inventoryCanHold(), and the ⚠ beside blockIsTargetable), and
+// wrong for a plant, which is meant to break and simply has nothing to give you. The two had
+// been the same question only by coincidence, and the coincidence broke the moment task 19
+// shipped tall grass: the comment on
 // blockIsTargetable above says a plant must be breakable, and it was not. steve reported it as
 // "the grass is not breakable, I do not know why that is" on 2026-08-24.
 //

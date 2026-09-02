@@ -4,15 +4,44 @@
 #include <stdio.h>
 #include <string.h>
 
-// The compiled-in core rows, ids 0x00..0x0E. These are the old kBlocks[] table
+// The compiled-in core rows, ids 0x00..0x1A. These are the old kBlocks[] table
 // recast as BlockDefs; the ids and textures are frozen forever because every
 // saved region file and every replay encodes them by number.
 //
-// 0x00..0x07 are also the ITEM ids (world/block.h's BLOCK_COUNT and the server's
-// BS_BLOCK_COUNT). 0x08 and 0x09 — water and tall grass, roadmap tasks 17 and 19 —
-// and 0x0A..0x0E — snow, ice, cactus, dead bush and fern, v1.8.3 Phase 3 — are core
-// rows that are deliberately NOT items; world/block.h explains why that distinction
-// exists and why BLOCK_COUNT stayed at 8 rather than following them.
+// 0x00..0x07 are the WIRE item span (world/block.h's BLOCK_COUNT and the server's
+// BS_BLOCK_COUNT). Since v1.8.8 that is all BLOCK_COUNT means: what the BAG may hold is
+// world/inventory.h's inventoryCanHold(), which reads THIS table through registryIsDefined()
+// and registryView() — defined, not air, not a liquid — so every row here except air and
+// water is carryable, and a row added below is carryable the moment it exists.
+// world/inventory.h holds the whole account of the split and of what the wire still costs.
+//
+// ── ⚠ ADDING A BLOCK — the five places, and the one that bites ────────────────────────
+//
+// Do all five. Four of them fail loudly if you miss them; the fifth does not, which is why
+// it is listed first.
+//
+//   1. THIS TABLE — the row, INCLUDING `.hardness`.
+//      A row written without .hardness gets 0 from the designated-initialiser zero-fill.
+//      Nothing warns. blockHardnessTicks() returns 0, breakTicksRequired() returns 0, and
+//      the block shatters on the first frame of the press — a block that looks finished and
+//      has no durability at all. This is the failure mode this note exists for.
+//      world/registry_test.c's coreHardnessIsDeclared() is the backstop: it fails the host
+//      suite for any DEFINED and TARGETABLE core row whose hardness is 0. Only an
+//      untargetable row (a liquid — see water at [8]) may legitimately be 0, and it is
+//      exempted for exactly that reason.
+//   2. world/block.h — the BLOCK_* id, as a LITERAL outside the BLOCK_COUNT enum. That
+//      header's own ⚠ note explains at length why it must be a literal; do not append to
+//      the enum.
+//   3. world/block.h — the BTEX_* tile constant, in the same order as gfx/atlas_tiles.h.
+//      world/block_tiles_check.c static-asserts the two enums agree, so a mismatch fails
+//      the build.
+//   4. tools/make_atlas.py — the tile's entry in TILES and the function that draws it.
+//      Art is generated, never borrowed. A missing tile renders ATLAS_TILE_MISSING.
+//   5. world/block.h's _Static_assert list — pin the new id's number, so a later append
+//      cannot slide it.
+//
+// Nothing in step 1 needs an inventory or interact.c edit any more. That was the point of
+// v1.8.8: the bag reads the registry, so a correct row IS a carryable, breakable block.
 //
 // ── .hardness (roadmap task 50) ────────────────────────────────────────────────────────
 //
@@ -163,16 +192,21 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	//
 	//     if (!blockDropsNothing(here) && !inventoryCanHold(here)) { ...refuse... }
 	//
-	// and world/block.h:258 defines blockDropsNothing() as `shape == BLOCK_SHAPE_CROSS`.
+	// and world/block.h defines blockDropsNothing() as `shape == BLOCK_SHAPE_CROSS`.
 	// Tall grass IS a CROSS, so the first term is false, the guard never fires, and the
-	// block is removed normally; only the pickup is skipped, because it is past
-	// BLOCK_COUNT and inventoryCanHold() answers false. Measured by a probe linked
+	// block is removed normally; only the pickup is skipped. Measured by a probe linked
 	// against this file and world/block.c, not reasoned off the guard's shape.
 	//
-	// The distinction matters for the five rows below: the two CROSS ones behave exactly
-	// like this, while snow, ice and cactus are FULL_CUBE and so are genuinely refused.
-	// Either way it is the right end state until the survival rung gives them a drop;
-	// see world/block.h.
+	// v1.8.8 changes WHY the pickup is skipped and nothing else about this row. It used to
+	// be skipped because tall grass sits past BLOCK_COUNT and inventoryCanHold() answered
+	// false; the bag would take it now, but breakComplete() still hands the bag BLOCK_AIR
+	// for any CROSS block, so no plant id reaches a slot. Same behaviour, resting on the
+	// rule the code actually states instead of on where a ceiling happened to fall.
+	//
+	// What v1.8.8 DID change is the three FULL_CUBE rows below — snow, ice and cactus were
+	// genuinely refused, i.e. not merely dropless but UNBREAKABLE, which is the defect steve
+	// reported against the cactus. All three break and drop themselves now. The two CROSS
+	// rows below are unaffected.
 	[9] = { // tall grass
 		.name  = "tall_grass",
 		.tex   = { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
@@ -182,35 +216,40 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	},
 	// ── v1.8.3 Phase 3: ids 10..14 ────────────────────────────────────────────────────
 	//
-	// Five more core rows that are deliberately NOT items, for exactly the reason 8 and 9
-	// are not: they are past BLOCK_COUNT, so world/inventory.h's inventoryCanHold() answers
-	// false for all five. BLOCK_COUNT does NOT move for them and must not — world/block.h's
-	// long note explains why sliding it drags BLOCK_WATER and BLOCK_TALL_GRASS off their
-	// rows, and world/block.h:62 and scene/interact.c already prescribe the other route
-	// (widen the PREDICATE, never the constant) for the day these become collectable.
-	//
-	// What that costs the player, stated rather than discovered:
+	// Five more core rows, shipped by v1.8.3 Phase 3 with BLOCK_COUNT deliberately held at 8.
+	// That was right for that rung — the ceiling and the blocks were two INDEPENDENT changes
+	// and only the blocks were needed for terrain — but it left all five past
+	// inventoryCanHold()'s `item < BLOCK_COUNT`, and for the three FULL_CUBE ones that was
+	// not "uncollectable", it was UNBREAKABLE:
 	//
 	//   snow, ice, cactus   FULL_CUBE and past the ceiling, so scene/interact.c's guard —
-	//                       `!blockDropsNothing(here) && !inventoryCanHold(here)` — refuses
-	//                       the break outright. They are scenery: you can walk on them, aim
-	//                       at them and build against them, and you cannot mine them. That
-	//                       is the same end state world/block.h argues for water, and it is
-	//                       what makes this a content change rather than a protocol one.
+	//                       `!blockDropsNothing(here) && !inventoryCanHold(here)` — refused
+	//                       the break outright. Walk on them, aim at them, build against
+	//                       them; never mine them.
 	//   dead_bush, fern     CROSS, so blockDropsNothing() is true and the break is allowed;
 	//                       it deletes the plant and yields nothing, identically to tall
-	//                       grass today.
+	//                       grass.
+	//
+	// v1.8.8 fixed that, by the route world/block.h had been prescribing all along: widen the
+	// PREDICATE, never the constant. inventoryCanHold() now reads this table (defined, not
+	// air, not liquid), BLOCK_COUNT did not move, no saved chunk or packet changed shape, and
+	// all three cubes break and drop themselves. The two CROSS rows are unchanged — carryable
+	// in principle, still handed BLOCK_AIR by breakComplete().
 	//
 	// ── .hardness ──
 	//
-	// Only the two CROSS rows can ever be asked (the three cubes are refused before a break
-	// timer starts), but every row carries a real number anyway, for the reason the water
-	// row's explicit 0 is written down: a value that is never read should say it is a
-	// decision. Tuned on the toolless scale at the top of this file — sand 10, leaves 4:
+	// Every row here is now LIVE: all five are targetable and, since v1.8.8, all five can
+	// actually reach a break timer. Until v1.8.8 only the two CROSS rows could — the three
+	// cubes were refused before a timer started, so their numbers had never once been
+	// exercised. Cactus's was retuned at its row below for exactly that reason; snow's and
+	// ice's are left where Phase 3 put them, because those were already the values a break
+	// would have used and there is no measurement saying otherwise. Tuned on the toolless
+	// scale at the top of this file — sand 10, leaves 4:
 	//
 	//   snow    8 ticks = 0.40 s     softer than sand; it is settled snow, not packed ice
 	//   ice    10 ticks = 0.50 s     sand's number; a solid pane, not a rock
-	//   cactus  8 ticks = 0.40 s     plant matter, not timber
+	//   cactus  9 ticks = 0.45 s     plant matter, not timber; and its OWN number, not a
+	//                               copy of snow's — see the row itself for why 8 became 9
 	//   dead_bush / fern  1 tick     tall grass's number; every CROSS plant is instant
 	[10] = { // snow — the tundra surface cap, replacing v1.8.3 Phase 2's bare-dirt placeholder
 		.name  = "snow",
@@ -225,9 +264,12 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	//                  world/physics.c collides on blockIsSolid() alone, so this one flag is
 	//                  the whole of that behaviour.
 	//   not LIQUID     so blockIsTargetable() is true and the crosshair stops on it, which
-	//                  is what lets a player build against a frozen lake. It is still
-	//                  unbreakable, but by the item ceiling and not by being invisible to
-	//                  the raycast — a distinction that matters the day the ceiling widens.
+	//                  is what lets a player build against a frozen lake. Under v1.8.3 that
+	//                  made it unbreakable by the ITEM ceiling rather than by being invisible
+	//                  to the raycast — a distinction Phase 3 said would matter the day the
+	//                  ceiling widened. v1.8.8 is that day: not being a liquid is now exactly
+	//                  what makes ice carryable, so it breaks and drops itself, and the flag
+	//                  set on this row did not have to change for that to happen.
 	//   not TRANSPARENT   the ART is opaque. tools/make_atlas.py's tile_ice says why in
 	//                  full: this sheet is RGBA5551, the pass is an alpha TEST, and one bit
 	//                  of alpha cannot make a translucent pane — a dither of holes at 16x16
@@ -247,12 +289,27 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 	// enum has room for the narrow version whenever somebody writes the mesher path.
 	//
 	// No damage-on-touch: there is no damage system in this build at all.
+	//
+	// v1.8.8 retunes .hardness from 8 to 9. Two reasons, and the first is the one that
+	// matters: until v1.8.8 this row's hardness was NEVER READ. Cactus was past the old
+	// item ceiling, so scene/interact.c refused the break before a timer could start, and
+	// the 8 written here was an unexercised guess. It is a live number now — this is the
+	// block v1.8.8 exists to make breakable — so it gets picked rather than inherited.
+	//
+	// 9 ticks = 0.45 s, and it is 9 and not 8 so that it is ITS OWN durability rather than
+	// a duplicate of the row above it: snow is 8 and ice is 10, and a cactus reading
+	// identically to settled snow says the number was never considered. Between the two is
+	// where cactus belongs on the toolless scale at the top of this file — tougher than
+	// snow, softer than a pane of ice, and well under sand's 10 because it is plant matter
+	// and not mineral. It is a game-feel number and it is meant to be retuned by hand; what
+	// is NOT negotiable is that it is nonzero and deliberate. See world/block.h's note on
+	// blockHardnessTicks and registry_test.c's coreHardnessIsDeclared().
 	[12] = { // cactus
 		.name  = "cactus",
 		.tex   = { BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS,
 		           BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS },
 		.flags = REG_FLAG_SOLID,
-		.hardness = 8,
+		.hardness = 9,
 	},
 	// The two CROSS plants. Same flag set and the same reasoning as tall grass at [9], which
 	// world/block.h's blockDropsNothing() note calls out by name: answering from the SHAPE
@@ -272,6 +329,176 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		           BTEX_FERN, BTEX_FERN, BTEX_FERN },
 		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
 		.hardness = 1,
+	},
+	// ── v1.8.8: per-biome timber and flora, ids 15..26 ────────────────────────────────
+	//
+	// Twelve rows. What is NOT here is as deliberate as what is: there is no taiga grass,
+	// no jungle dirt and no desert-tinted anything, because biome COLOUR is a per-vertex
+	// tint applied by the mesher and an id buys nothing a tint does not already give. A
+	// row below exists only where the block draws geometry the tinted original does not
+	// have, or behaves differently:
+	//
+	//   birch / spruce logs      the bark MARKS differ, not the hue. Birch carries
+	//                            horizontal lenticel dashes; spruce carries vertical scaly
+	//                            plates split by fissures. A multiply of tile 6 cannot add
+	//                            a mark that is not in tile 6.
+	//   birch / spruce planks    birch is a near-white board (base 198,186,158) and oak's
+	//                            is mid-brown. A tint MULTIPLIES, so it can only darken:
+	//                            oak can be made into spruce's dark red-brown and can never
+	//                            be made into birch at all. Two of these three boards are
+	//                            unreachable from one tile.
+	//   birch / spruce leaves    a broadleaf clump and a needled speckle carved on the
+	//                            diagonal. Different cutout patterns, so different silhouettes
+	//                            against the sky — the one thing a tint provably cannot change.
+	//   tall_grass_top           BEHAVIOUR: it is the upper half of a two-block clump, placed
+	//                            only above a tall_grass, and its art has to meet that block's
+	//                            blades at the seam.
+	//   poppy/daisy/bluebell/orchid   four different FLOWERS. The petal shape is drawn per
+	//                            bloom kind (cup, disc, bell); the colour is only what makes
+	//                            them recognisable afterwards.
+	//   apple                    BEHAVIOUR: the only new row that is a FULL_CUBE and drops
+	//                            itself. See its own note.
+	//
+	// ── .hardness ──
+	//
+	// Tuned on the toolless scale at the top of this file, and picked against neighbours
+	// rather than copied from them:
+	//
+	//   birch log / planks   36 = 1.80 s   under oak's 40: birch is the light, soft hardwood
+	//   spruce log / planks  44 = 2.20 s   over oak's 40 and just under stone's 45: dense,
+	//                                      resinous conifer timber, the toughest wood here
+	//   birch leaves          3 = 0.15 s   under oak's 4; thin papery broadleaf
+	//   spruce leaves         5 = 0.25 s   over oak's 4; a packed mat of needles
+	//   apple                 2 = 0.10 s   soft fruit — under every leaf, over every plant
+	//   tall_grass_top        1            tall grass's number, because it IS tall grass
+	//   the four flowers      1            the CROSS-plant floor this file already keeps for
+	//                                      tall grass, dead bush and fern. One tick is the
+	//                                      minimum a nonzero hardness can be (mining.c floors
+	//                                      a break at one tick), so "every CROSS plant is
+	//                                      instant" is not a copy-paste — it is the only
+	//                                      value the class can hold, and making a daisy
+	//                                      tougher than a poppy would be inventing a
+	//                                      difference the game does not have.
+	//
+	// Planks deliberately equal their own log, exactly as oak's 40/40 do: a board is the
+	// same timber, sawn.
+	[15] = { // birch log
+		.name  = "birch_log",
+		.tex   = { BTEX_BIRCH_LOG_SIDE, BTEX_BIRCH_LOG_SIDE, BTEX_BIRCH_LOG_TOP,
+		           BTEX_BIRCH_LOG_TOP,  BTEX_BIRCH_LOG_SIDE, BTEX_BIRCH_LOG_SIDE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 36,
+	},
+	[16] = { // birch planks
+		.name  = "birch_planks",
+		.tex   = { BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS,
+		           BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 36,
+	},
+	// The two leaf rows carry oak's flag set exactly — SOLID (fills its cell) and
+	// TRANSPARENT (alpha-0 holes), see [6] — so they self-cull in the deferred pass and
+	// never occlude. Nothing about the canopy path changes for a second species.
+	[17] = { // birch leaves
+		.name  = "birch_leaves",
+		.tex   = { BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES,
+		           BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES },
+		.flags = REG_FLAG_SOLID | REG_FLAG_TRANSPARENT,
+		.hardness = 3,
+	},
+	[18] = { // spruce log
+		.name  = "spruce_log",
+		.tex   = { BTEX_SPRUCE_LOG_SIDE, BTEX_SPRUCE_LOG_SIDE, BTEX_SPRUCE_LOG_TOP,
+		           BTEX_SPRUCE_LOG_TOP,  BTEX_SPRUCE_LOG_SIDE, BTEX_SPRUCE_LOG_SIDE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 44,
+	},
+	[19] = { // spruce planks
+		.name  = "spruce_planks",
+		.tex   = { BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS,
+		           BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 44,
+	},
+	[20] = { // spruce leaves
+		.name  = "spruce_leaves",
+		.tex   = { BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES,
+		           BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES },
+		.flags = REG_FLAG_SOLID | REG_FLAG_TRANSPARENT,
+		.hardness = 5,
+	},
+	// The upper half of the two-block grass clump steve asked for. Its own row and not a
+	// second tall_grass, because the two halves must draw DIFFERENT art — the lower cell
+	// carries blade bases and the upper carries the tips — and the tex byte is per-id.
+	// Placed only directly above a tall_grass by worldgen; it is an ordinary CROSS plant
+	// otherwise, and breaking either half leaves the other standing (there is no
+	// multi-block-structure system in this build, and inventing one is not this rung).
+	[21] = { // tall grass, upper half
+		.name  = "tall_grass_top",
+		.tex   = { BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP,
+		           BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	// The four flowers. Same flag set and the same reasoning as tall grass at [9] and the
+	// two plants at [13]/[14]: CROSS, transparent, not solid, not liquid — so they are
+	// targetable and breakable, walked through freely, and yield nothing (breakComplete()
+	// hands the bag BLOCK_AIR for any CROSS block). All six tex entries carry the same tile
+	// because mesher.c's emitCross takes FACE_EAST's rect for the whole shape.
+	//
+	// Which biome each grows in is worldgen's business, not the registry's — see
+	// worldgenFlora() in world/worldgen.c. Nothing here is biome-aware.
+	[22] = { // poppy — plains and forest
+		.name  = "poppy",
+		.tex   = { BTEX_POPPY, BTEX_POPPY, BTEX_POPPY,
+		           BTEX_POPPY, BTEX_POPPY, BTEX_POPPY },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	[23] = { // daisy — plains
+		.name  = "daisy",
+		.tex   = { BTEX_DAISY, BTEX_DAISY, BTEX_DAISY,
+		           BTEX_DAISY, BTEX_DAISY, BTEX_DAISY },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	[24] = { // bluebell — forest and taiga
+		.name  = "bluebell",
+		.tex   = { BTEX_BLUEBELL, BTEX_BLUEBELL, BTEX_BLUEBELL,
+		           BTEX_BLUEBELL, BTEX_BLUEBELL, BTEX_BLUEBELL },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	[25] = { // orchid — jungle
+		.name  = "orchid",
+		.tex   = { BTEX_ORCHID, BTEX_ORCHID, BTEX_ORCHID,
+		           BTEX_ORCHID, BTEX_ORCHID, BTEX_ORCHID },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.hardness = 1,
+	},
+	// Apple. A FULL_CUBE, and that is the load-bearing decision on this row.
+	//
+	// It has to be a cube because world/block.h's blockDropsNothing() answers from the
+	// SHAPE, and scene/interact.c hands the bag BLOCK_AIR for every CROSS block. A CROSS
+	// apple would break and yield NOTHING, which is precisely the opposite of the thing
+	// steve asked for ("apples ... pickable and functional"). As a cube it is targetable,
+	// its 2-tick timer runs, breakComplete() hands the bag BLOCK_APPLE, and
+	// inventoryCanHold() takes it — defined, not air, not a liquid.
+	//
+	// SOLID and not TRANSPARENT because the art is fully opaque: measured 0 cutout texels
+	// of 256 on slot 30. Claiming TRANSPARENT for opaque art would push it into the
+	// deferred pass and cost the mesher every internal face it has, buying nothing.
+	//
+	// "Functional" here means exactly the three things this build can express: it can be
+	// broken, it can be carried, and it can be placed again from the bag. There is no
+	// hunger system in this codebase — nothing to eat it WITH — so eating is not half-built
+	// here and is not claimed anywhere.
+	[26] = { // apple — grows in oak and birch canopies
+		.name  = "apple",
+		.tex   = { BTEX_APPLE, BTEX_APPLE, BTEX_APPLE,
+		           BTEX_APPLE, BTEX_APPLE, BTEX_APPLE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 2,
 	},
 };
 

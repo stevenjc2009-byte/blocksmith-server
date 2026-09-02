@@ -27,6 +27,11 @@
 #include <stdint.h>
 
 #include "world/block.h"
+// v1.8.8: inventoryCanHold() below asks the registry instead of comparing against a constant,
+// so this header now needs registry.h. No cycle — registry.h includes block.h and knows nothing
+// about inventories — and no new build dependency for the server, which already compiles
+// world/registry.c alongside world/inventory.c.
+#include "world/registry.h"
 
 // ── Item id space ──────────────────────────────────────────────────────────────────────
 
@@ -39,35 +44,94 @@ typedef BlockId ItemId;
 // Whether the inventory is able to carry this id at all — the one home for the item-id
 // ceiling, so the rule is stated once instead of being restated at every call site.
 //
-// The ceiling is BLOCK_COUNT and NOT the registry's full 256-id space, on purpose — but the
-// reason is a WIRE AGREEMENT, not memory safety. Nothing in this client is sized
-// [BLOCK_COUNT]; grep the tree and the only two hits are comments recording bounds that were
-// already widened away (world/mesher.c's rect table and net/networld_test.c's note on it).
-// Every slot-drawing path is registry-backed and bounds-checked: scene/ui.c's iconUv() goes
-// through atlasTile(blockFaceTex(id, FACE_TOP)), blockFaceTex() -> blockInfo() ->
-// registryView() covers the whole 256-id space, and world/atlas_uv.h's atlasRect() clamps an
-// out-of-range tile to ATLAS_TILE_MISSING rather than wrapping. The slot's label is
-// blockInfo(item)->name by that same path. The crafting tables are [RECIPE_COUNT] and are
-// indexed by recipe index, not by item id at all. So a dyn id sitting in a slot would draw
-// the missing-texture marker; it would not read out of bounds.
+// ── v1.8.8: the ceiling is the REGISTRY, not a constant ────────────────────────────────
 //
-// What the ceiling actually buys is agreement across the wire:
-// deps/blocksmith-server/game/bsgame.c mirrors it exactly for BS_INV_OP_PICKUP and
-// BS_INV_OP_CONSUME, and playerstate.c for the armour slots — so a dynamic
-// (server-registered, 0x80..0xFD) id is not carryable on either side yet, and widening here
-// alone would only make this client offer the player a pickup the server then refuses.
+// This used to be `(uint32_t)item < BLOCK_COUNT`, with BLOCK_COUNT == 8. Every core row from
+// water (8) upward therefore answered false, and because scene/interact.c refuses a break
+// whose drop the bag cannot bank, the FULL_CUBE ones among them — snow, ice and cactus —
+// were not merely uncollectable but UNBREAKABLE. steve reported it as the cactus not
+// breaking. Nothing about the id space caused that: ItemId is a BlockId is a uint8_t, and the
+// core span 0x01..0x7F had 112 free rows underneath.
 //
-// ⚠ deps/blocksmith-server/game/validate.h still states the OLD memory-safety rationale for
-// BS_BLOCK_COUNT ("index client-side tables sized BLOCK_COUNT and would read out of bounds on
-// the 3DS"). The ceiling it guards is still correct, so nothing is broken today, but that
-// stated reason no longer holds — do not lean on it when deciding whether the ceiling may
-// move. The wire agreement above is the reason that is still load-bearing.
+// It now asks the REGISTRY: a row this build actually defines, that is not air, and that is
+// not a liquid. The ceiling rises from 8 to every id the registry has a row for (254 at most,
+// 0x01..0xFD less the liquids), and it rises for FREE: no new BlockDef field, no parallel item
+// table, no wider ItemId, no change to InvSlot, and so not one byte added to Inventory, to
+// inventory.dat, or to any packet. A block added in a later version is carryable the moment
+// its registry row exists, with no edit here at all.
 //
-// ⚠ This predicate is also what scene/interact.c refuses a *break* on: a block the bag
-// cannot hold must not be minable, or breaking it deletes it from the world with nothing to
-// show for it. When inventory becomes registry-aware, widening this one function is what
-// lifts both rules at once — and interact.c's guard goes with it.
+//   defined    an id with no registry row is not a block this build knows about, so it cannot
+//              occupy a slot. This is what keeps a corrupt save byte, and a dynamic id from a
+//              server running a newer build, out of the bag — the job the old `< BLOCK_COUNT`
+//              was doing by accident, now done on purpose and without a fixed number.
+//   not air    air is ITEM_NONE. An empty slot is not a carried item, and net/inv_bridge.c
+//              depends on this half being separable (see its applyState loop).
+//   not liquid there is no bucket. This is the one exclusion that is a GAME rule rather than a
+//              data-integrity one, and it is the same REG_FLAG_LIQUID that blockIsTargetable()
+//              reads to keep the crosshair out of a lake, so water stays exactly as unmineable
+//              and unplaceable as world/block.h has always said it must be.
+//
+// Deliberately NOT also `shape == BLOCK_SHAPE_FULL_CUBE`. A CROSS plant is carryable under this
+// rule, and that changes nothing today: scene/interact.c banks a break through
+// blockDropsNothing(), which answers from the SHAPE and hands the bag BLOCK_AIR for a plant, so
+// no plant id reaches a slot however permissive this predicate is. Adding a shape term would
+// fold "what does breaking it yield" back into "what may the bag hold" — the exact conflation
+// v1.7.1 task 47 was written to undo, after it had already cost steve an unbreakable tall
+// grass. Two questions, two functions; that is the whole lesson of task 47.
+//
+// Written over registry.h rather than over world/block.c's blockInfo(), and that is a LINK
+// constraint, not a style choice. This header and inventory.c are mirrored into
+// deps/blocksmith-server and compiled there; block.c is not, and the server's own game/Makefile
+// says why ("block.h has no block.c ... there is no world/block.o"). A predicate reaching
+// through blockInfo() would compile on this client and fail to link the server.
+//
+// Memory safety was never what the old constant bought, and that is worth restating so nobody
+// re-narrows this thinking it was. Nothing in this client is sized [BLOCK_COUNT]. Every
+// slot-drawing path is registry-backed and bounds-checked: scene/ui.c's iconUv() goes through
+// atlasTile(blockFaceTex(id, FACE_TOP)), blockFaceTex() -> blockInfo() -> registryView()
+// covers the whole 256-id space, and world/atlas_uv.h's atlasRect() clamps an out-of-range
+// tile to ATLAS_TILE_MISSING rather than wrapping. The slot's label is blockInfo(item)->name
+// by that same path. The crafting tables are [RECIPE_COUNT] and are indexed by recipe index,
+// not by item id at all.
+//
+// ⚠ This predicate is also what scene/interact.c refuses a *break* on: a block the bag cannot
+// hold must not be minable, or breaking it deletes it from the world with nothing to show for
+// it. Widening this one function is what lifted both rules at once, which is exactly what the
+// old comment here said it would.
 static inline bool inventoryCanHold(ItemId item)
+{
+	return item != ITEM_NONE
+	    && registryIsDefined(item)
+	    && !registryView(item)->liquid;
+}
+
+// The WIRE item span: the ids both ends of a multiplayer session agree are items.
+//
+// This is what `item < BLOCK_COUNT` used to mean when inventoryCanHold() was spelled that way,
+// separated out and given its own name in v1.8.8 because the two questions came apart. The bag
+// is now registry-wide (above); the WIRE is still 8, and it is 8 in a tree this client does not
+// own: deps/blocksmith-server/game/validate.h's BS_BLOCK_COUNT, enforced by game/bsgame.c on
+// BS_INV_OP_PICKUP and BS_INV_OP_CONSUME and by game/playerstate.c on the armour slots.
+//
+// net/inv_bridge.c is the only caller, and it is the send side. What it costs, stated plainly
+// rather than left to be discovered: on a SERVER, breaking a cactus removes the block (the
+// BS_APP_BLOCK_EDIT is below every ceiling — it writes air, id 0), puts it in this console's
+// bag, and tells the server nothing, so the next BS_APP_INV_STATE snapshot overwrites the bag
+// and the cactus is gone. In SINGLE PLAYER, which is what every build since v1.2.5 has actually
+// been played in, none of this is reachable and the cactus simply works.
+//
+// Sending it anyway was considered and is no better: an old server's guard is
+// `if (a < BS_BLOCK_COUNT && ...)` with no else, so the packet is silently dropped — same end
+// state, one wasted datagram, and the divergence hidden instead of named. Kicking is not a risk
+// either way; BS_INV_OP_* rides inside BS_PKT_DATA and no unknown-opcode path is taken.
+//
+// ⚠ This number cannot move on one side alone, in either direction. Raising it here first makes
+// this client send pickups an old server discards (harmless, but pointless); raising it on the
+// server first makes the server accept ids this client will never send. The fix is one change
+// across two repos: BS_BLOCK_COUNT, bsgame.c's two guards, playerstate.c's armour clamp, and
+// this predicate, together — plus a PROTO_COMMIT bump in this repo's Makefile. BS_PROTO_VERSION
+// does NOT move for it: no transport packet type changes, and no new opcode is introduced.
+static inline bool inventoryItemOnWire(ItemId item)
 {
 	return item != ITEM_NONE && (uint32_t)item < BLOCK_COUNT;
 }
@@ -96,10 +160,14 @@ static inline bool inventoryCanHold(ItemId item)
 // the crafting panel and a border, without the UI agent having to fight the inventory grid
 // for space. Three rows (24 main slots) was considered — it still fits, but leaves a
 // crafting panel with less than 100px, which is tight for a small icon list plus an output
-// slot on a 3DS. Total INV_SLOT_COUNT is 24, which comfortably outnumbers the 6 items this
-// game currently has (see block.h): most of a build's worth of any one material fits in a
-// single stack (see INV_STACK_MAX below), so 24 slots is headroom for holding several
-// different materials at once, not a requirement to hold many stacks of one.
+// slot on a 3DS. Total INV_SLOT_COUNT is 24, and 24 is a count of concurrent STACKS, not of
+// item TYPES — most of a build's worth of any one material fits in a single stack (see
+// INV_STACK_MAX below), so this is headroom for holding several different materials at once,
+// not a requirement to hold one stack of everything that exists. That distinction started to
+// matter in v1.8.8, when inventoryCanHold() stopped being a count of eight and became the
+// registry (see below): the number of carryable item types is now open-ended while
+// INV_SLOT_COUNT stays 24, and it stays 24 because the constraint on it is the 320x240 bottom
+// screen, which has not moved.
 #define INV_HOTBAR_SLOTS  8
 #define INV_MAIN_COLS     8
 #define INV_MAIN_ROWS     2
