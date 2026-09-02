@@ -158,6 +158,16 @@ enum {
 	BLOCK_BLUEBELL      = 24,
 	BLOCK_ORCHID        = 25,
 	BLOCK_APPLE         = 26,
+	// ── v1.8.10 "Light": the first light source ────────────────────────────────────────
+	//
+	// A literal, for the same reason as every id above it; the ⚠ note applies unchanged.
+	// docs/plan-1.8.10-light.md §2.3 is the design: BLOCK_SHAPE_CROSS (the shape tall
+	// grass and the four flowers already use), non-solid, luminance set to 14 — the top
+	// of Minecraft's torch range and one below this registry's 4-bit ceiling of 15, kept
+	// off the ceiling only because 14 is the number the ask actually named. §2.3 also
+	// says plainly that nothing in world/mesher.c has to change: emitCross() already
+	// draws any BLOCK_SHAPE_CROSS block, so this is content riding existing geometry.
+	BLOCK_TORCH         = 27,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
@@ -175,6 +185,9 @@ _Static_assert(BLOCK_BIRCH_LOG == 15 && BLOCK_BIRCH_PLANKS == 16 &&
                    BLOCK_BLUEBELL == 24 && BLOCK_ORCHID == 25 && BLOCK_APPLE == 26,
                "v1.8.8's per-biome ids are written into saved chunks and block-edit packets "
                "the moment a server ships them; they must never move");
+_Static_assert(BLOCK_TORCH == 27,
+               "v1.8.10's torch id is written into saved chunks and block-edit packets the "
+               "moment a server ships it; it must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
@@ -217,6 +230,10 @@ enum {
 	BTEX_BLUEBELL,
 	BTEX_ORCHID,
 	BTEX_APPLE,
+	// v1.8.10 "Light", slot 31. Same order as gfx/atlas_tiles.h and as
+	// tools/make_atlas.py's TILES list; world/block_tiles_check.c fails the build if the
+	// two enums disagree.
+	BTEX_TORCH,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

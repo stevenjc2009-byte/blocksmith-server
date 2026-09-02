@@ -495,9 +495,35 @@ static uint32_t g_seen_seed = 0;
  *
  * and all eleven mirrored files were separately confirmed byte-identical with cmp after
  * tools/sync-world-sources.sh ran (it reported block.h and registry.c synced, the other
- * nine unchanged). */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 27u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0xD236u
+ * nine unchanged).
+ *
+ * MOVED A FOURTH TIME 2026-09-02, 0xD236 -> 0x165E, by the client's v1.8.10 "Light", which
+ * appends ONE core row -- torch, id 27 -- the first light source. registryCount() moves
+ * 27 -> 28 with it, Phase-3's shape again: a record APPENDED, not a byte retuned inside an
+ * existing one. torch is BLOCK_SHAPE_CROSS, non-solid (REG_FLAG_TRANSPARENT), luminance 14
+ * (REG_FLAG_LUMINOUS set alongside it, matching the pairing convention every other lit test
+ * row already uses even though light.c reads only the .luminance byte), and .hardness 1 --
+ * the smallest nonzero value the byte allows, since 0 is reserved for "no break time at
+ * all" (air, water) and every other targetable core row is nonzero for the same reason: a
+ * torch must be breakable with its own durability, never instant and never unbreakable.
+ *
+ * Measured the same way as the 0xD236 move above -- probe linking registry.c alone (no
+ * test file, so the golden is not reachable from the binary being measured), compiled once
+ * against the client's source/world/registry.c and once against this repo's own
+ * game/world/registry.c after tools/sync-world-sources.sh ran (it reported block.h and
+ * registry.c synced, the other nine unchanged, and diff -q confirmed both copies
+ * byte-identical). Both printed
+ *
+ *     count=28 crc16=0x165E rev=1
+ *     id27: name=torch hardness=1 luminance=14 flags=0x2A tex0=31
+ *
+ * The lockstep rule is unchanged and points the same way: this row is a defined, breakable,
+ * light-emitting block a v1.8.9 client has never heard of, so the SERVER SHIPS FIRST -- a
+ * v1.8.9 client joining a v1.8.10 server fails registryMatchesInfo() on both halves and
+ * refuses the join (loud, recoverable); the reverse would render every torch as an
+ * unnamed hole. BS_PROTO_VERSION stays 1: nothing about transport packet types changed. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 28u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x165Eu
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -505,9 +531,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 27");
+          "core-only registryCount() matches the pinned golden 28");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0xD236");
+          "core-only registryCrc16() matches the pinned golden 0x165E");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }
@@ -1821,24 +1847,29 @@ static void test_inv_pickup_out_of_range_item_refused(void)
 }
 
 /* The id-space half of the ceiling, kept separate from the liquid exclusion
- * above for the reason stated there. 27 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
+ * above for the reason stated there. 28 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
  * (test_registry_core_pinned_to_golden()'s golden, this same file) and the daemon
  * has registered no dynamic ids at the point this runs — the FETCH/DEFS batching
  * scenario that registers 40 of them runs last in main(), deliberately after this
- * — so registryIsDefined(27) is false here and inventoryCanHold(27) refuses it on
- * that ground, not on a liquid flag. Goes red the day the registry grows to 28
+ * — so registryIsDefined(28) is false here and inventoryCanHold(28) refuses it on
+ * that ground, not on a liquid flag. Goes red the day the registry grows to 29
  * core rows without this test moving — which is the point: it is meant to be
- * touched the next time a block is added, not to run forever unexamined. */
+ * touched the next time a block is added, not to run forever unexamined.
+ *
+ * MOVED 2026-09-02 from 27 to 28 by v1.8.10's torch (BLOCK_TORCH = 27): the id this
+ * test relied on being undefined is now a defined, breakable, non-liquid core row,
+ * so the literal has to follow BS_REGISTRY_CORE_COUNT_GOLDEN's move from 27 to 28
+ * exactly as this comment always said it would. */
 static void test_inv_pickup_undefined_core_id_refused(void)
 {
-    puts("end-to-end: PICKUP of an undefined core id (27, one past the golden count) is refused, not kicked");
+    puts("end-to-end: PICKUP of an undefined core id (28, one past the golden count) is refused, not kicked");
     drain();
 
     send_join(0xF2A50011u, "nadia");
     msleep(100);
     drain();
 
-    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 27, 1, 0);
+    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 28, 1, 0);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A50011u, out, sizeof out, 500);

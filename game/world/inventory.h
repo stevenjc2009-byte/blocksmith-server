@@ -131,9 +131,41 @@ static inline bool inventoryCanHold(ItemId item)
 // across two repos: BS_BLOCK_COUNT, bsgame.c's two guards, playerstate.c's armour clamp, and
 // this predicate, together — plus a PROTO_COMMIT bump in this repo's Makefile. BS_PROTO_VERSION
 // does NOT move for it: no transport packet type changes, and no new opcode is introduced.
+//
+// ── 2026-09-02, v1.8.10: BOTH HALVES HAVE NOW SHIPPED ──────────────────────────────────
+//
+// Everything above this line describes the OLD behaviour and is kept as the record of why the
+// gap existed and what it cost. The gap is closed; the predicate below delegates to the bag's
+// own ceiling, so the two can no longer drift.
+//
+// blocksmith-server v1.9.1 is published. Its PICKUP/CONSUME/armour guards now resolve the id
+// through the server's own registry instead of comparing against BS_BLOCK_COUNT, so the server
+// already accepts every id its registry defines — a superset of what this predicate can send.
+// BS_BLOCK_COUNT stays 8 over there deliberately: game/validate.c:146 _Static_assert-ties it to
+// this client's wire span, and it is the SPAN being widened, not that constant.
+//
+// The server side was verified by reading it rather than trusting the release note:
+// bsgame.c:1339 states the item-id guard is inventoryCanHold(a) and not `a < BS_BLOCK_COUNT`,
+// and bsgame_test.c carries an end-to-end check that a PICKUP of an item id past the old
+// BS_BLOCK_COUNT ceiling is credited rather than dropped.
+//
+// The matching assertions moved with this change, in scene/interact_test.c and
+// world/inventory_test.c. Both now pin the widening BOTH ways — the ids that are newly on the
+// wire, and the undefined and reserved ids that still are not — because pinning only the first
+// would be satisfied by a `return true;`.
+//
+// Two compatibility corners were checked in the code, not assumed, and both are clear:
+//   NEW client / OLD server — registryCrc16() (0x165E, count 28) is a join-time lockstep, so an
+//     old server is refused outright and never sees a widened send.
+//   OLD client / NEW server — net/inv_bridge.c's invBridgeApplyState() validates every slot
+//     against inventoryCanHold() before writing ANY of them, all-or-nothing, so an old client
+//     cleanly refuses a high id rather than misparsing it.
+//
+// Until the test pins can move, the cactus still vanishes on a multiplayer rejoin. Single player
+// is unaffected, as above.
 static inline bool inventoryItemOnWire(ItemId item)
 {
-	return item != ITEM_NONE && (uint32_t)item < BLOCK_COUNT;
+	return inventoryCanHold(item);
 }
 
 // ── Slot layout ────────────────────────────────────────────────────────────────────────

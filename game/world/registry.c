@@ -39,6 +39,20 @@
 //      Art is generated, never borrowed. A missing tile renders ATLAS_TILE_MISSING.
 //   5. world/block.h's _Static_assert list — pin the new id's number, so a later append
 //      cannot slide it.
+//   6. THE MIRRORED TEST PINS — a fifth place beyond the four above, and it bites exactly
+//      like #1 does: nothing here fails to COMPILE, the host suite fails to PASS.
+//      world/registry_test.c's REGISTRY_FULL_COUNT_PIN, the "27 core blocks" literal in
+//      testRegistryRoundTrip(), the pinned CRC in testRegistryCrcStability(), the row count
+//      in coreHardnessIsDeclared(), and REGISTRY_TEST_EXPECTED_CHECKS all move together —
+//      count and check-count by exactly one, the CRC to a new value you must COMPUTE (a
+//      scratchpad probe linking the real registry.c/block.c and printing registryCrc16(),
+//      never hand-fit to whatever makes the test pass). world/mining_test.c's matching row
+//      count and its own named CHECK for the new block's break time move with it. And
+//      deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_COUNT_GOLDEN /
+//      BS_REGISTRY_CORE_CRC16_GOLDEN, in the repo tools/sync-world-sources.sh vendors this
+//      table into, move too — computed the same way, not guessed, and shipped server-first.
+//      tools/run_host_tests.sh runs under `set -e`, so a stale pin here does not just fail
+//      loudly, it aborts the whole host suite at this file and skips every test after it.
 //
 // Nothing in step 1 needs an inventory or interact.c edit any more. That was the point of
 // v1.8.8: the bag reads the registry, so a correct row IS a carryable, breakable block.
@@ -499,6 +513,42 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		           BTEX_APPLE, BTEX_APPLE, BTEX_APPLE },
 		.flags = REG_FLAG_SOLID,
 		.hardness = 2,
+	},
+	// ── v1.8.10 "Light": the torch ──────────────────────────────────────────────────────
+	//
+	// The first block in the game with luminance > 0. docs/plan-1.8.10-light.md §2.3 is the
+	// design this row follows exactly: BLOCK_SHAPE_CROSS (the shape tall grass and the four
+	// flowers already use — world/block.h:250-253), non-solid, TRANSPARENT for the same
+	// reason every other CROSS row is, and luminance 14. That plan's own words: "luminance
+	// set high (14 or 15, the top of the 4-bit scale)" — 14 and not 15 because that is
+	// Minecraft's own torch light level and the ask names no reason to go past it; 15 is
+	// still one step of headroom above every light source this game will ever have added,
+	// unclaimed rather than spent here.
+	//
+	// LUMINOUS is set alongside .luminance for the same reason world_test.c's own probe
+	// pairs the two (world/world_test.c:7177-7178): world/light.c's syncLuminance() only
+	// ever reads the .luminance BYTE (registryGet(id)->luminance, light.c:350) — the flag
+	// is not consumed by the lighting engine and gates nothing — but every existing test
+	// that declares a luminous block sets both, and there is no reason for the one live
+	// content row to be the first to diverge from that pairing.
+	//
+	// .hardness — a torch shatters instantly in Minecraft, and this schema's floor for
+	// "instant but still has SOME durability" is 1 tick (0.05 s): world/mining.c's
+	// breakTicksRequired() treats hardness 0 as "no break time at all" (air, water — see
+	// its own comment), which is a block with NO durability, the exact defect this file's
+	// header note exists to prevent. 1 is also not a special case invented for the torch —
+	// it is the same number every BLOCK_SHAPE_CROSS row in this table already carries
+	// (tall grass [9], dead bush/fern [13]/[14], tall_grass_top/the four flowers
+	// [21]-[25]), so the torch reads as "instant, like every other plant" rather than as a
+	// block that was never considered.
+	[27] = { // torch — the first light source; docs/plan-1.8.10-light.md §2.3
+		.name  = "torch",
+		.tex   = { BTEX_TORCH, BTEX_TORCH, BTEX_TORCH,
+		           BTEX_TORCH, BTEX_TORCH, BTEX_TORCH },
+		.flags = REG_FLAG_TRANSPARENT | REG_FLAG_LUMINOUS |
+		         REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS),
+		.luminance = 14,
+		.hardness  = 1,
 	},
 };
 
