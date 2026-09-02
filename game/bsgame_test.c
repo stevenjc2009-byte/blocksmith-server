@@ -858,7 +858,13 @@ static void test_invalid_block_id_rejected(void)
  * the line now, and test_dyn_range_block_ids_accepted() below is where it is
  * checked. BS_BLOCK_COUNT's own "one past the end is refused" boundary did not
  * go untested with it: it moved to the path that still enforces it, the ITEM id
- * in test_inv_pickup_out_of_range_item_refused(). */
+ * side. v1.9.1: that boundary itself moved again, off BS_BLOCK_COUNT and onto
+ * the registry's own core count, when the item-id guard became
+ * inventoryCanHold() — see test_inv_pickup_undefined_core_id_refused() for
+ * the current "one past the end is refused" item-id check;
+ * test_inv_pickup_out_of_range_item_refused() still exists but now checks a
+ * different thing (a defined id refused for being a liquid, not for being
+ * out of range) — see that test's own comment. */
 static void test_highest_block_id_is_accepted(void)
 {
     puts("end-to-end: the highest legal core block id is accepted");
@@ -1776,23 +1782,33 @@ static void test_inv_pickup_credits_item(void)
     }
 }
 
+/* v1.9.1: this used to be "past BS_BLOCK_COUNT", full stop. The guard is
+ * inventoryCanHold(a) now (see bsgame.c's comment on the change), and water
+ * (id 8) is still refused under it, but for a DIFFERENT reason than before —
+ * it is a defined core row, so it is not the id-space check this test used to
+ * exercise. It is refused because REG_FLAG_LIQUID excludes it: there is no
+ * bucket, world/inventory.h says so in as many words. Picked deliberately, not
+ * left over: an id that is refused for the OLD reason (past the id space)
+ * would stop testing anything the moment the registry grew past 8, and 8 is
+ * exactly that id. test_inv_pickup_undefined_core_id_refused() below is where
+ * the id-space boundary itself is checked. */
 static void test_inv_pickup_out_of_range_item_refused(void)
 {
-    puts("end-to-end: PICKUP with an item id past BS_BLOCK_COUNT is refused, not kicked");
+    puts("end-to-end: PICKUP of a liquid (water, id 8) is refused, not kicked");
     drain();
 
     send_join(0xF2A5000Du, "jack");
     msleep(100);
     drain();
 
-    send_inv_action(0xF2A5000Du, BS_INV_OP_PICKUP, (uint8_t)BS_BLOCK_COUNT, 1, 0);
+    send_inv_action(0xF2A5000Du, BS_INV_OP_PICKUP, 8 /* BLOCK_WATER */, 1, 0);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A5000Du, out, sizeof out, 500);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
-          "an out-of-range PICKUP still gets an INV_STATE back, not a KICK");
+          "a refused PICKUP still gets an INV_STATE back, not a KICK");
     if (n == (ssize_t)BS_INV_STATE_BYTES) {
-        check(inv_state_is_empty(out), "the out-of-range item id was never applied");
+        check(inv_state_is_empty(out), "the liquid was never applied");
     }
 
     /* Prove the session is still alive, not just that this one packet wasn't
@@ -1802,6 +1818,91 @@ static void test_inv_pickup_out_of_range_item_refused(void)
     n = recv_app_for(0xF2A5000Du, out, sizeof out, 500);
     check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE && inv_state_total(out, 3) == 1,
           "jack's session still answers a valid PICKUP after the refused one");
+}
+
+/* The id-space half of the ceiling, kept separate from the liquid exclusion
+ * above for the reason stated there. 27 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
+ * (test_registry_core_pinned_to_golden()'s golden, this same file) and the daemon
+ * has registered no dynamic ids at the point this runs — the FETCH/DEFS batching
+ * scenario that registers 40 of them runs last in main(), deliberately after this
+ * — so registryIsDefined(27) is false here and inventoryCanHold(27) refuses it on
+ * that ground, not on a liquid flag. Goes red the day the registry grows to 28
+ * core rows without this test moving — which is the point: it is meant to be
+ * touched the next time a block is added, not to run forever unexamined. */
+static void test_inv_pickup_undefined_core_id_refused(void)
+{
+    puts("end-to-end: PICKUP of an undefined core id (27, one past the golden count) is refused, not kicked");
+    drain();
+
+    send_join(0xF2A50011u, "nadia");
+    msleep(100);
+    drain();
+
+    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 27, 1, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A50011u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "a PICKUP of an undefined id still gets an INV_STATE back, not a KICK");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_is_empty(out), "the undefined id was never applied");
+    }
+}
+
+/* The success criterion this release exists for, stated as a check rather than
+ * as a constant: an item id past the OLD ceiling (BS_BLOCK_COUNT, 8) really
+ * does survive the real PICKUP -> inventoryAdd() -> INV_STATE path now, not
+ * merely "the guard reads a bigger number". Two ids, not one:
+ *
+ *   12 (BLOCK_CACTUS)      steve's literal report -- a cactus, picked up on a
+ *                          server, used to vanish on the next INV_STATE
+ *                          because the server refused the PICKUP silently.
+ *   26 (BLOCK_APPLE)       the highest id v1.8.8 added, proving this is the
+ *                          whole widened registry and not a one-off carve-out
+ *                          for cactus alone.
+ *
+ * Both are FULL_CUBE, non-liquid, defined core rows -- exactly the shape
+ * inventoryCanHold() was written to admit. */
+static void test_inv_pickup_past_old_wire_ceiling_now_credited(void)
+{
+    puts("end-to-end: PICKUP of an item id past the old BS_BLOCK_COUNT ceiling is credited, not dropped");
+    drain();
+
+    send_join(0xF2A50012u, "opal");
+    msleep(100);
+    drain();
+
+    /* Picked up TWO, not one: a CONSUME of 1 afterward has to land on a
+     * distinguishing count (2 -> 1). Consuming the only one held (1 -> 0)
+     * would read identically whether CONSUME actually ran or was silently
+     * refused, because a never-credited item is also stuck at 0 -- that
+     * shape was tried first and caught by the sabotage arm below: PICKUP
+     * failing under the reverted guard left both branches at zero and the
+     * CONSUME check passed for the wrong reason. */
+    send_inv_action(0xF2A50012u, BS_INV_OP_PICKUP, 12 /* BLOCK_CACTUS */, 2, 0);
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0xF2A50012u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "PICKUP of the cactus id is answered with an INV_STATE");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(out, 12) == 2,
+              "the cactus really is in the bag afterward -- this is the rejoin bug, fixed server-side");
+    }
+
+    send_inv_action(0xF2A50012u, BS_INV_OP_PICKUP, 26 /* BLOCK_APPLE */, 4, 0);
+    n = recv_app_for(0xF2A50012u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE && inv_state_total(out, 26) == 4,
+          "the highest id v1.8.8 added (apple, 26) is credited too, not just cactus");
+
+    /* CONSUME exercises the same guard on the other of the two operations it
+     * gates; PICKUP alone would leave handle_inv_action()'s CONSUME arm
+     * unexercised by anything past the old ceiling. Checked against 1, not 0
+     * -- see the comment above the PICKUP that primed this slot with 2. */
+    send_inv_action(0xF2A50012u, BS_INV_OP_CONSUME, 12 /* BLOCK_CACTUS */, 1, 0);
+    n = recv_app_for(0xF2A50012u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE && inv_state_total(out, 12) == 1,
+          "CONSUME of the same past-ceiling id is honoured too, not just PICKUP");
 }
 
 static void test_inv_consume_of_unheld_item_removes_nothing(void)
@@ -2381,12 +2482,16 @@ static void test_ps_bad_checksum_dat_degrades_to_fresh_spawn(void)
 }
 
 /* S4: armour ids and counts are validated on exactly the terms the
- * inventory path validates PICKUP/CONSUME on (`a < BS_BLOCK_COUNT`,
- * `b >= 1 && b <= BS_INV_STACK_MAX`, bsgame.c) — same id space, so an
- * armour slot may not hold an id the inventory would have refused. The
- * policy is playerstate.h's documented per-field one: the offending SLOT is
- * dropped to empty, exactly as a broken item/count pairing already is,
- * while every well-formed slot beside it survives. */
+ * inventory path validates PICKUP/CONSUME on (`inventoryCanHold(a)`,
+ * `b >= 1 && b <= BS_INV_STACK_MAX`, bsgame.c) — same id space, same
+ * predicate, so an armour slot may not hold an id the inventory would have
+ * refused. v1.9.1: that predicate moved from `a < BS_BLOCK_COUNT` to
+ * inventoryCanHold() (registry-driven — see validate.h and bsgame.c's
+ * comment on the same move); 200 is still refused because it is undefined,
+ * not because of where BS_BLOCK_COUNT sits. The policy is playerstate.h's
+ * documented per-field one: the offending SLOT is dropped to empty, exactly
+ * as a broken item/count pairing already is, while every well-formed slot
+ * beside it survives. */
 static void test_ps_report_out_of_range_armour_is_dropped(void)
 {
     puts("end-to-end: out-of-range armour ids and counts are dropped per-slot, neighbours kept");
@@ -2394,13 +2499,16 @@ static void test_ps_report_out_of_range_armour_is_dropped(void)
 
     join_expect_fresh_player_state(0x50A00013u, "psi");
 
-    /* head: id 200, far past BS_BLOCK_COUNT — the out-of-bounds index the
+    /* head: id 200, undefined in the registry — the out-of-bounds index the
      * 3DS client would later use to look up a block.
      * chest: legal id, count 200, past BS_INV_STACK_MAX.
      * legs: entirely legal, the control that proves this is validation and
      *       not a blanket wipe.
-     * feet: the exact boundary pair — highest legal id, highest legal count
-     *       — which must be kept, or the bound is off by one. */
+     * feet: the exact old-ceiling boundary pair — highest id BS_BLOCK_COUNT
+     *       ever gated, highest legal count — kept for the same reason
+     *       test_inv_pickup_past_old_wire_ceiling_now_credited() exists: the
+     *       old boundary is still legal under the new predicate, not just
+     *       the new ids past it. */
     const uint8_t armor[8] = {
         200, 1,
         5,   200,
@@ -2424,13 +2532,13 @@ static void test_ps_report_out_of_range_armour_is_dropped(void)
     if (!got) return;
 
     check(back[0] == 0 && back[1] == 0,
-          "an armour id past BS_BLOCK_COUNT is dropped to an empty slot");
+          "an undefined armour id is dropped to an empty slot");
     check(back[2] == 0 && back[3] == 0,
           "an armour count past BS_INV_STACK_MAX is dropped to an empty slot");
     check(back[4] == 5 && back[5] == 3,
           "the legal slot beside them is untouched — this is validation, not a wipe");
     check(back[6] == (uint8_t)(BS_BLOCK_COUNT - 1) && back[7] == (uint8_t)BS_INV_STACK_MAX,
-          "the highest legal id/count pair is kept — the bound is not off by one");
+          "the old ceiling's highest id/count pair is still kept — the old boundary did not become illegal");
     check(xp_level == 2u && prog == 0.5f && hp == 10.0f && hunger == 9.0f,
           "and the meters in the same report are unaffected by the armour fix-ups");
 
@@ -2833,6 +2941,8 @@ int main(void)
     test_inv_pickup_then_craft_spends_wood();
     test_inv_pickup_credits_item();
     test_inv_pickup_out_of_range_item_refused();
+    test_inv_pickup_undefined_core_id_refused();
+    test_inv_pickup_past_old_wire_ceiling_now_credited();
     test_inv_consume_of_unheld_item_removes_nothing();
     test_inv_action_wrong_length_refused_not_kicked();
     test_inv_action_out_of_range_slot_refused_not_kicked();

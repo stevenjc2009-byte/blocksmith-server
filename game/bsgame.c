@@ -1334,15 +1334,28 @@ static void handle_inv_action(struct bs_game *g, BsPlayer *p, const uint8_t *msg
         }
         break;
 
-    /* Taken on trust — see this function's header comment. */
+    /* Taken on trust — see this function's header comment.
+     *
+     * v1.9.1: the item-id guard is inventoryCanHold(a), not `a < BS_BLOCK_COUNT`.
+     * world/inventory.h's inventoryCanHold() is registry-driven since the client's
+     * v1.8.8 (defined, not air, not a liquid) and this file already links
+     * world/inventory.c and world/registry.c (WORLD_OBJS in game/Makefile), so the
+     * same predicate the client's bag now uses is available here unchanged --
+     * reused, not reimplemented. BS_BLOCK_COUNT is unaffected and stays 8: it is
+     * still the WIRE item span the client's own inventoryItemOnWire() checks (see
+     * validate.h), and this client (v1.8.8) does not yet send anything past it. This
+     * is the server-side half only, done ahead of that client change because it is
+     * strictly more permissive -- an old client's PICKUP/CONSUME never names an id
+     * this predicate would have refused that `a < BS_BLOCK_COUNT` did not also
+     * refuse, since ids 0..7 are all core, defined and non-liquid. */
     case BS_INV_OP_PICKUP:
-        if (a < BS_BLOCK_COUNT && b >= 1 && b <= BS_INV_STACK_MAX && c == 0) {
+        if (inventoryCanHold(a) && b >= 1 && b <= BS_INV_STACK_MAX && c == 0) {
             changed = inventoryAdd(&p->inv, a, b, NULL) != INV_ADD_REFUSED;
         }
         break;
 
     case BS_INV_OP_CONSUME:
-        if (a < BS_BLOCK_COUNT && b >= 1 && b <= BS_INV_STACK_MAX && c == 0) {
+        if (inventoryCanHold(a) && b >= 1 && b <= BS_INV_STACK_MAX && c == 0) {
             changed = inventoryRemove(&p->inv, a, b) > 0;
         }
         break;

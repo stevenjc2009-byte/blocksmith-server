@@ -11,8 +11,9 @@
 #include <unistd.h>
 
 #include "../proto/bs_proto.h"
-#include "validate.h"      /* BS_BLOCK_COUNT — armour ids share the block id space */
+#include "validate.h"      /* BS_INV_STACK_MAX — armour counts share the inventory cap */
 #include "world/crc32.h"
+#include "world/inventory.h"  /* inventoryCanHold() — armour ids share the block id space */
 
 /* On-disk format: a 20-byte header, then exactly the BS_APP_PLAYER_STATE
  * wire body (the packet minus its type byte) as the payload —
@@ -139,12 +140,19 @@ void playerStateEncodeBody(uint8_t out[BS_PLAYER_STATE_BODY_BYTES],
  *     which holds here too: count 0 if and only if item 0. Anything else is
  *     a half-written pair.
  *   - the range rule handle_inv_action() already enforces on PICKUP and
- *     CONSUME (`a < BS_BLOCK_COUNT && b >= 1 && b <= BS_INV_STACK_MAX`,
+ *     CONSUME (`inventoryCanHold(a) && b >= 1 && b <= BS_INV_STACK_MAX`,
  *     bsgame.c). Armour ids are the SAME id space as inventory item ids, so
  *     a slot may not hold an id the inventory path would have refused. This
- *     is the check that stops a modified client persisting armour id 255,
- *     which comes back at the next join and is then used to index a block
- *     table with BS_BLOCK_COUNT entries on the 3DS.
+ *     is the check that stops a modified client persisting an id this build
+ *     does not carry, which comes back at the next join and would otherwise
+ *     be trusted at face value.
+ *
+ *     v1.9.1: that range rule moved from `*item >= BS_BLOCK_COUNT` to
+ *     `!inventoryCanHold(*item)`, in step with handle_inv_action()'s PICKUP
+ *     and CONSUME guards — see bsgame.c's comment on that move for the full
+ *     reasoning. inventoryCanHold(0) is false (0 is ITEM_NONE), so this still
+ *     needs the pairing rule below to run first for a legitimate empty slot;
+ *     it already does.
  *
  * The pairing rule runs first so that a legitimate empty slot (0, 0) reaches
  * the range rule already normalised and passes it, rather than the range
@@ -152,7 +160,7 @@ void playerStateEncodeBody(uint8_t out[BS_PLAYER_STATE_BODY_BYTES],
 static void sanitise_armor_pair(uint8_t *item, uint8_t *count)
 {
     if ((*item == 0) != (*count == 0)
-        || *item >= BS_BLOCK_COUNT
+        || !inventoryCanHold(*item)
         || (unsigned)*count > BS_INV_STACK_MAX) {
         *item  = 0;
         *count = 0;

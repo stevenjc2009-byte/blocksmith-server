@@ -46,10 +46,10 @@
  * against — the master block registry made ids up to REG_ID_DYN_HI (0x80..0xFD)
  * legal on the wire, so validate.c reads that ceiling straight out of the
  * vendored world/registry.h instead. BS_BLOCK_COUNT stays, and stays asserted
- * against the client's BLOCK_COUNT, because it is still the bound for the ids
- * that are NOT block placements: the ITEM ids in INV_OP_PICKUP/INV_OP_CONSUME
- * (bsgame.c) and in the armour slots (playerstate.c). Two different ceilings
- * because they guard two different things; do not collapse them.
+ * against the client's BLOCK_COUNT (validate.c), because that assert is what
+ * catches this constant drifting from the one truth that still needs it: the
+ * client's own inventoryItemOnWire() (world/inventory.h), the WIRE item span
+ * both ends currently agree on for an inventory op.
  *
  * v1.8.2 correction. This note used to say those item ids index client-side
  * tables sized BLOCK_COUNT and would read OUT OF BOUNDS on the 3DS if a dyn id
@@ -61,12 +61,32 @@
  * missing-texture marker rather than reading past anything. Crafting is
  * [RECIPE_COUNT], indexed by recipe, not by item id.
  *
- * The real reason this ceiling must hold is a WIRE AGREEMENT: both ends have to
+ * v1.9.1: BS_BLOCK_COUNT is NOT what gates INV_OP_PICKUP/INV_OP_CONSUME
+ * (bsgame.c) or the armour slots (playerstate.c) any more. Both moved to
+ * world/inventory.h's inventoryCanHold() — registry-driven since the client's
+ * v1.8.8 (defined, not air, not a liquid) — the same predicate the client's
+ * own bag now uses, reused rather than reimplemented, because this repo
+ * already vendors and compiles world/inventory.c and world/registry.c
+ * (game/Makefile's WORLD_OBJS). That is a strictly MORE PERMISSIVE server-side
+ * acceptance than `< BS_BLOCK_COUNT` was, done ahead of the client on purpose:
+ * an old client's PICKUP/CONSUME/armour report only ever names an id 0..7, and
+ * every one of those is core, defined and non-liquid, so nothing an old client
+ * sends is treated differently. This client (v1.8.8) does not yet SEND
+ * anything past BS_BLOCK_COUNT — inventoryItemOnWire() still stops at 8 — so
+ * BS_BLOCK_COUNT is left exactly where it is, still true, still asserted, and
+ * still the number that would have to move in lockstep with a future client's
+ * inventoryItemOnWire() (world/inventory.h names the two guards and the
+ * armour clamp that number's move would touch). Widening the ACCEPTING side
+ * alone is safe for exactly the reason widening the SENDING side alone is
+ * not — see world/inventory.h's note on inventoryItemOnWire().
+ *
+ * The real reason this ceiling mattered is a WIRE AGREEMENT: both ends have to
  * agree on which ids are legal in an inventory op, and the client refuses to
- * hold anything at or above BLOCK_COUNT (world/inventory.h). A mismatch loses
- * the player's item, it does not corrupt their console. Recorded because the
- * memory-safety wording made this look like a hard safety bound, and the next
- * person weighing the item-ceiling lift would have priced it far too high. */
+ * SEND anything at or above BLOCK_COUNT (world/inventory.h's
+ * inventoryItemOnWire()). A mismatch loses the player's item, it does not
+ * corrupt their console. Recorded because the memory-safety wording made this
+ * look like a hard safety bound, and the next person weighing the item-ceiling
+ * lift would have priced it far too high. */
 
 /* True if (x, y, z, block) is an edit bsgame may apply. */
 bool bsEditValid(int32_t x, int32_t y, int32_t z, uint8_t block);

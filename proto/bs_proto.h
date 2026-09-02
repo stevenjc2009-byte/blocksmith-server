@@ -538,14 +538,17 @@ enum bs_inv_op {
      * a consume against anything it owns, full stop — see the longer version
      * of this reasoning at the BS_INV_OP_PICKUP/BS_INV_OP_CONSUME case in
      * bsgame.c's handle_inv_action(), which is where it actually matters. */
-    BS_INV_OP_PICKUP  = 0x05, /* a = item id (< BS_BLOCK_COUNT), b = count
+    BS_INV_OP_PICKUP  = 0x05, /* a = item id (inventoryCanHold(a), the block
+                                * registry -- game/validate.h), b = count
                                 * (1..BS_INV_STACK_MAX), c unused. The client
                                 * reports what a block break just put in its
-                                * hand.                                       */
-    BS_INV_OP_CONSUME = 0x06, /* a = item id (< BS_BLOCK_COUNT), b = count
+                                * hand. v1.9.1: the guard used to be
+                                * `< BS_BLOCK_COUNT`; see validate.h.          */
+    BS_INV_OP_CONSUME = 0x06, /* a = item id (inventoryCanHold(a), the block
+                                * registry -- game/validate.h), b = count
                                 * (1..BS_INV_STACK_MAX), c unused. The client
                                 * reports what a placement just took out of
-                                * it.                                         */
+                                * it. v1.9.1: same guard as PICKUP above.      */
     BS_INV_OP_COUNT
 };
 
