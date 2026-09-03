@@ -90,6 +90,43 @@
 //     redundant rather than wrong: dirt sits directly beneath the grass layer on every
 //     column, so a player who wants dirt back from a grass block already has it one block
 //     down without spending anything on a recipe.
+//
+// ── v1.8.15 "Furnace": 8 stone -> 1 furnace, and why this row is not optional ───────────
+//
+//   RECIPE_STONE_TO_FURNACE exists because without it BLOCK_FURNACE (world/block.h, id 42)
+//   is UNOBTAINABLE. That is not a balance opinion, it is a reachability fact, and it was
+//   found by asking where blocks enter the bag rather than by playing: there are exactly
+//   three routes — invBridgeAdd() from an entity drop (main.c:5809), invBridgeAdd() from a
+//   block the player broke (main.c:5893), and the crafting/withdraw path in scene/ui.c:324.
+//   Worldgen places no furnace anywhere, so route two never yields one; no entity drops one,
+//   so route one never does either. Route three was the only one left, and until this row
+//   landed it did not carry a furnace. v1.8.15 would have shipped a version named after a
+//   block, with the block registered, textured, tick-driven, save-persisted, tested by its
+//   own 159-check suite — and unreachable by any player. That is the exact failure the vault
+//   records as "a feature can land UNREACHABLE": every part green, the payoff absent.
+//
+//   8 stone is Minecraft's own cost for a furnace (eight cobblestone ringing an empty
+//   centre) taken as a REFERENCE for the magnitude, not as a shape: this file has no grid to
+//   arrange them in and does not want one, so it is spent here as a plain count. Eight is
+//   also the largest input_count in the table by a factor of two, which is deliberate — the
+//   furnace is the first crafted block that unlocks a whole system rather than converting
+//   one material into another, and it should read as a project rather than a tap.
+//
+//   Stone is already RECIPE_STONE_TO_SAND's input at a different count, so this is the first
+//   time two recipes share an input material. The header's argument for rejecting a shaped
+//   grid said a grid earns its keep by disambiguating same-ingredient recipes; that argument
+//   is untouched here, because these two are never ambiguous. The player picks a recipe by
+//   tapping its own row in the panel — the recipe is chosen first and the ingredients spent
+//   afterwards — so there is no matching step in which 8 stone and 4 stone could be confused.
+//   Had ingredients been matched against a grid, this pair is exactly where a grid would have
+//   become necessary; they are not, so it still is not.
+//
+//   Note for whoever reads the "what is deliberately absent" list above: its rejection of
+//   charcoal rested on "it would need a fuel and burning system that does not exist". That
+//   premise expired with this version — world/furnace.h now has both, with furnaceIsFuel()
+//   and a burn clock. Charcoal is still absent, but it is now absent because nobody has
+//   asked for it, NOT because the engine cannot express it. Left in place rather than
+//   quietly deleted, because a rejection whose reason has expired is worth seeing.
 const CraftRecipe CRAFT_RECIPES[RECIPE_COUNT] = {
 	[RECIPE_DIRT_TO_GRASS] = {
 		.name = "Dirt -> Grass",
@@ -115,6 +152,15 @@ const CraftRecipe CRAFT_RECIPES[RECIPE_COUNT] = {
 		.name = "Coal Ore -> Torch",
 		.input_item = BLOCK_COAL_ORE, .input_count = 1,
 		.output_item = BLOCK_TORCH, .output_count = 4,
+	},
+	// Appended at the END of the enum on purpose: net/bsgame.c indexes recipes by their
+	// position over the wire (bsgame.c:1332 bounds an incoming index against RECIPE_COUNT),
+	// so inserting this anywhere but last would silently renumber every recipe above it and
+	// leave an old client crafting the wrong thing against a new server.
+	[RECIPE_STONE_TO_FURNACE] = {
+		.name = "Stone -> Furnace",
+		.input_item = BLOCK_STONE, .input_count = 8,
+		.output_item = BLOCK_FURNACE, .output_count = 1,
 	},
 };
 

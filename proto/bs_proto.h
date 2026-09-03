@@ -488,7 +488,7 @@ static inline int32_t bs_col_of(int32_t block_coord)
 #define BS_INV_SLOT_COUNT   24u   /* mirrors INV_SLOT_COUNT   */
 #define BS_INV_HOTBAR_SLOTS  8u   /* mirrors INV_HOTBAR_SLOTS */
 #define BS_INV_STACK_MAX    99u   /* mirrors INV_STACK_MAX    */
-#define BS_RECIPE_COUNT      5u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+#define BS_RECIPE_COUNT      6u   /* mirrors RECIPE_COUNT (world/crafting.h) */
 
 /* 4u -> 5u on 2026-09-03, client v1.8.12's RECIPE_COAL_ORE_TO_TORCH (one coal ore -> four
  * torches). Bumped here and not by tools/sync-world-sources.sh, because this file is NOT one
@@ -522,7 +522,26 @@ static inline int32_t bs_col_of(int32_t block_coord)
  * silence, with no refusal packet and nothing for the player to see except a recipe that does
  * nothing when tapped. The one recipe this release is named for is the one that fails, and it
  * fails invisibly. So the server ships alongside the client for v1.8.12; that is not optional
- * and not deferrable to a later server release. */
+ * and not deferrable to a later server release.
+ *
+ * 5u -> 6u on 2026-09-03, client v1.8.15 "Furnace"'s RECIPE_STONE_TO_FURNACE (8 stone -> 1
+ * furnace), appended LAST in the enum on purpose — see world/crafting.h's own comment and
+ * game/bsgame.c:1332, which bounds an incoming wire recipe index against RECIPE_COUNT, so
+ * inserting it anywhere else would have silently renumbered every recipe above it. Same
+ * mechanism as the 4->5 bump above, and it failed the same way for the same reason: the sync
+ * script carried crafting.h/crafting.c across (reported `synced`, not `unchanged`, exit 0)
+ * while this restatement did not follow by itself, and the host suite caught it at the same
+ * line, `validate.c:57:1: error: static assertion failed: "recipe count must track
+ * world/crafting.h"`, MAKE_TEST_EXIT=2, before this line moved.
+ *
+ * The deployment consequence is sharper here than for the torch, not milder: without this row,
+ * BLOCK_FURNACE (world/block.h id 42, already shipped in v1.9.5's registry sync) is not just a
+ * recipe that silently no-ops — see world/crafting.c's own comment for why it is the block's
+ * ONLY reachability path, since worldgen never places one and no entity drops one. A v1.8.15
+ * client on a server still pinned at RECIPE_COUNT == 5 can place and mine every v1.8.15 block
+ * except the one the release is named for, and craft nothing that produces it — not a fallback,
+ * a dead end. So this server ships alongside the client for v1.8.15's furnace recipe, same as
+ * the registry rows did for the furnace block itself in v1.9.5. */
 
 /* The operations a client may ask for. The first five are deliberately the
  * same primitives world/inventory.h and world/crafting.h already expose, one
