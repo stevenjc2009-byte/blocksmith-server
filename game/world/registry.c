@@ -550,6 +550,78 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		.luminance = 14,
 		.hardness  = 1,
 	},
+	// ── v1.8.12 "Ores": six ore rows, ids 28..33 ────────────────────────────────────────
+	//
+	// docs/plan-1.8.12-ores.md is the design. All six SOLID and FULL_CUBE, none TRANSPARENT:
+	// tools/make_atlas.py paints each as tile_stone(rng) with mineral flecks embedded, so
+	// the art is fully opaque and claiming TRANSPARENT would push six cube blocks into the
+	// mesher's deferred pass and cost every internal face of a vein for nothing — the same
+	// argument the apple row above makes.
+	//
+	// No tool-tier gate in this version (see world/block.h's note by the ids): every ore is
+	// breakable by hand. What every ore drops is ITSELF — world/inventory.h's ItemId IS
+	// BlockId, there is no item registry yet, so "1 coal item" or "4 redstone dust" cannot
+	// exist here; the furnace that turns an ore into something else is v1.8.15.
+	//
+	// ── .hardness: SIX DISTINCT VALUES, and that is the point ──────────────────────────
+	//
+	// A flat value across all six is rejected, and the reason is written down one file
+	// over: world/registry_test.c's coreHardnessIsDeclared() says "A row must have its OWN
+	// number, not a neighbour's. The loop above is satisfied by a table where every
+	// hardness is 9, which is exactly the failure mode 'make sure every block is breakable
+	// with its own durability' is guarding against." Six rows all reading the same value is
+	// that shape exactly.
+	//
+	// The ladder instead rises with depth, every value above stone's 45, and is PINNED as a
+	// ladder by registry_test.c so a later edit cannot flatten it back:
+	//
+	//   coal 60 (3.00 s)  iron 70 (3.50 s)  lapis 80 (4.00 s)
+	//   gold 85 (4.25 s)  redstone 90 (4.50 s)  diamond 100 (5.00 s)
+	//
+	// Bare-hand seconds at 20 TPS (mining.h's MINING_SPEED_ONE, 1x — this version has no
+	// faster tier).
+	[28] = { // coal ore — atlas slot 32
+		.name  = "coal_ore",
+		.tex   = { BTEX_COAL_ORE, BTEX_COAL_ORE, BTEX_COAL_ORE,
+		           BTEX_COAL_ORE, BTEX_COAL_ORE, BTEX_COAL_ORE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 60,
+	},
+	[29] = { // iron ore — atlas slot 33
+		.name  = "iron_ore",
+		.tex   = { BTEX_IRON_ORE, BTEX_IRON_ORE, BTEX_IRON_ORE,
+		           BTEX_IRON_ORE, BTEX_IRON_ORE, BTEX_IRON_ORE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 70,
+	},
+	[30] = { // gold ore — atlas slot 34
+		.name  = "gold_ore",
+		.tex   = { BTEX_GOLD_ORE, BTEX_GOLD_ORE, BTEX_GOLD_ORE,
+		           BTEX_GOLD_ORE, BTEX_GOLD_ORE, BTEX_GOLD_ORE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 85,
+	},
+	[31] = { // redstone ore — atlas slot 35
+		.name  = "redstone_ore",
+		.tex   = { BTEX_REDSTONE_ORE, BTEX_REDSTONE_ORE, BTEX_REDSTONE_ORE,
+		           BTEX_REDSTONE_ORE, BTEX_REDSTONE_ORE, BTEX_REDSTONE_ORE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 90,
+	},
+	[32] = { // lapis ore — atlas slot 36
+		.name  = "lapis_ore",
+		.tex   = { BTEX_LAPIS_ORE, BTEX_LAPIS_ORE, BTEX_LAPIS_ORE,
+		           BTEX_LAPIS_ORE, BTEX_LAPIS_ORE, BTEX_LAPIS_ORE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 80,
+	},
+	[33] = { // diamond ore — atlas slot 37
+		.name  = "diamond_ore",
+		.tex   = { BTEX_DIAMOND_ORE, BTEX_DIAMOND_ORE, BTEX_DIAMOND_ORE,
+		           BTEX_DIAMOND_ORE, BTEX_DIAMOND_ORE, BTEX_DIAMOND_ORE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 100,
+	},
 };
 
 // The table itself. s_defs holds the authoritative bytes; s_view is the derived

@@ -168,6 +168,31 @@ enum {
 	// says plainly that nothing in world/mesher.c has to change: emitCross() already
 	// draws any BLOCK_SHAPE_CROSS block, so this is content riding existing geometry.
 	BLOCK_TORCH         = 27,
+	// ── v1.8.12 "Ores": six ores, ids 28..33 ───────────────────────────────────────────
+	//
+	// Literals, for the same reason as every id above them; the WARNING note at the top of
+	// this comment block applies unchanged — do NOT tidy these into BLOCK_COUNT + n.
+	//
+	// docs/plan-1.8.12-ores.md is the design. All six are FULL_CUBE and SOLID: an ore is
+	// stone with mineral in it, not a plant and not a light. Their art is tile_stone(rng)
+	// itself with flecks embedded over it (tools/make_atlas.py), which is what makes an
+	// ore block provably the same rock the plain stone block is.
+	//
+	// ⚠ THE ID AND THE ATLAS SLOT ARE NOT THE SAME NUMBER AND THEY ARE FOUR APART.
+	// BLOCK_COAL_ORE is id 28 and its tile is slot 32; BLOCK_LAPIS_ORE is id 32 and its
+	// tile is slot 36. world/block_tiles_check.c and the registry rows are what make a
+	// transposition fail the build instead of shipping as six blocks wearing each other's
+	// rock.
+	//
+	// No tool-tier gate in this version: every ore is breakable by hand, each with its own
+	// hardness. world/mining.h's empty multiplier table stays empty on purpose — see its
+	// own comment — so a real tool can arrive later without a call site moving.
+	BLOCK_COAL_ORE      = 28,
+	BLOCK_IRON_ORE      = 29,
+	BLOCK_GOLD_ORE      = 30,
+	BLOCK_REDSTONE_ORE  = 31,
+	BLOCK_LAPIS_ORE     = 32,
+	BLOCK_DIAMOND_ORE   = 33,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
@@ -188,6 +213,11 @@ _Static_assert(BLOCK_BIRCH_LOG == 15 && BLOCK_BIRCH_PLANKS == 16 &&
 _Static_assert(BLOCK_TORCH == 27,
                "v1.8.10's torch id is written into saved chunks and block-edit packets the "
                "moment a server ships it; it must never move");
+_Static_assert(BLOCK_COAL_ORE == 28 && BLOCK_IRON_ORE == 29 && BLOCK_GOLD_ORE == 30 &&
+                   BLOCK_REDSTONE_ORE == 31 && BLOCK_LAPIS_ORE == 32 &&
+                   BLOCK_DIAMOND_ORE == 33,
+               "v1.8.12's ore ids are written into saved chunks and block-edit packets the "
+               "moment a server ships them; they must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
@@ -234,6 +264,15 @@ enum {
 	// tools/make_atlas.py's TILES list; world/block_tiles_check.c fails the build if the
 	// two enums disagree.
 	BTEX_TORCH,
+	// v1.8.12 "Ores", slots 32..37. Same order as gfx/atlas_tiles.h and as
+	// tools/make_atlas.py's TILES list; world/block_tiles_check.c fails the build if the
+	// two enums disagree.
+	BTEX_COAL_ORE,
+	BTEX_IRON_ORE,
+	BTEX_GOLD_ORE,
+	BTEX_REDSTONE_ORE,
+	BTEX_LAPIS_ORE,
+	BTEX_DIAMOND_ORE,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

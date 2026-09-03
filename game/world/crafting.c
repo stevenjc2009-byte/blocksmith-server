@@ -36,6 +36,20 @@
 //   cave with no soil underfoot and no easy way back to the surface. Lossy (4:1) for the
 //   same reason as the stone recipe: still worse than just digging dirt where it exists.
 //
+// RECIPE_COAL_ORE_TO_TORCH (1 coal ore -> 4 torches)
+//   Coal ore (BLOCK_COAL_ORE, v1.8.12 "Ores") is the only fuel-shaped block in the game and
+//   the torch (BLOCK_TORCH, v1.8.10 "Light") is the only light source — before this recipe
+//   the torch had a full registry row, an atlas tile and working smooth lighting, but no
+//   generator places one and no recipe produced one, so a player could never actually get
+//   one. There are no sticks in this game and none planned (ItemId is a typedef of BlockId,
+//   world/inventory.h, so a non-block item would force a type split across eleven mirrored
+//   files, out of scope here), so the recipe has to be struck from coal ore alone rather
+//   than from coal ore plus a shaft material the block list does not have. Four is chosen to
+//   match the ratio players expect from the genre, same reasoning as RECIPE_WOOD_TO_PLANKS's
+//   four. Lossless in the sense that a mined ore becomes several torches rather than being
+//   destroyed for one — a torch is cheap once the ore is in hand, which is the point: light
+//   should not be rarer than the ore that makes it.
+//
 // RECIPE_WOOD_TO_PLANKS (1 wood -> 4 planks)
 //   The one recipe here that *gains* material, and the only one that should. The three
 //   above are all conversions between raw blocks the world already hands out, so making
@@ -96,6 +110,11 @@ const CraftRecipe CRAFT_RECIPES[RECIPE_COUNT] = {
 		.name = "Wood -> Planks",
 		.input_item = BLOCK_WOOD, .input_count = 1,
 		.output_item = BLOCK_PLANKS, .output_count = 4,
+	},
+	[RECIPE_COAL_ORE_TO_TORCH] = {
+		.name = "Coal Ore -> Torch",
+		.input_item = BLOCK_COAL_ORE, .input_count = 1,
+		.output_item = BLOCK_TORCH, .output_count = 4,
 	},
 };
 

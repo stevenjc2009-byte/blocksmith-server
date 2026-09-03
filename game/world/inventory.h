@@ -8,8 +8,25 @@
 //
 // This header is the contract for whoever builds the touchscreen UI on top of it (a
 // separate step) and for whoever wires interact.c's block-break to it (also a separate
-// step, see the comment on inventoryAdd). Neither of those exists yet, so nothing here
-// depends on scene/ or gfx/.
+// step, see the comment on inventoryAdd). Nothing here depends on scene/ or gfx/.
+//
+// ── 2026-09-03: the paragraph above is HISTORY, not the current state ───────────────────
+//
+// It used to end "Neither of those exists yet", written when neither did. BOTH exist now:
+// the touchscreen UI is built, and the block-break path is wired. That path is split, and
+// the split is worth knowing before you go looking for it — scene/interact.c REFUSES a
+// break whose drop the bag could not hold (inventoryCanHold, interact.c:348), and main.c
+// is what actually calls inventoryAdd. So a grep for inventoryAdd in interact.c comes back
+// empty even though interact.c is the file the rule is enforced in. That gate is exactly
+// why the v1.8.8 ceiling bug below made cactus UNBREAKABLE rather than merely
+// uncollectable — a chain that only makes sense if the wiring is real.
+//
+// Said plainly because two separate readers took that sentence as current and planned
+// around work that was already done. The last clause is the part that is still true and is
+// the reason the paragraph is worth keeping at all: this header depends on no scene/ or
+// gfx/ code, which is what lets the host suite compile it in a second. That independence is
+// a live constraint — do not add such an include — while "neither exists yet" was a
+// statement about a date.
 //
 // ── Item space ─────────────────────────────────────────────────────────────────────────
 //

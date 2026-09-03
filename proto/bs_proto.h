@@ -488,7 +488,41 @@ static inline int32_t bs_col_of(int32_t block_coord)
 #define BS_INV_SLOT_COUNT   24u   /* mirrors INV_SLOT_COUNT   */
 #define BS_INV_HOTBAR_SLOTS  8u   /* mirrors INV_HOTBAR_SLOTS */
 #define BS_INV_STACK_MAX    99u   /* mirrors INV_STACK_MAX    */
-#define BS_RECIPE_COUNT      4u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+#define BS_RECIPE_COUNT      5u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+
+/* 4u -> 5u on 2026-09-03, client v1.8.12's RECIPE_COAL_ORE_TO_TORCH (one coal ore -> four
+ * torches). Bumped here and not by tools/sync-world-sources.sh, because this file is NOT one
+ * of the eleven mirrored sources — the sync copies world/crafting.h into game/world/ byte for
+ * byte and then the assert at game/validate.c:57 catches the fact that this restatement did
+ * not follow. Which is exactly the job that assert exists to do, and it did it: the client-side
+ * change synced clean, every one of the eleven files reported identical, and the whole host
+ * suite still went red here at
+ *
+ *   validate.c:57:1: error: static assertion failed: "recipe count must track world/crafting.h"
+ *
+ * with SUITE_EXIT=2. Worth writing down because "the mirror script said unchanged/synced and
+ * exited 0" is not the same statement as "client and server agree", and this is the second
+ * pin in this tree to prove that (the first being the registry wire record size, described in
+ * validate.c's own comment a few lines below the assert).
+ *
+ * One correction to the obvious reading of this constant, checked rather than assumed, because
+ * the obvious reading is wrong and would misdirect whoever moves it next. BS_RECIPE_COUNT does
+ * NOT gate anything at runtime. Grepping the whole server tree for it returns five lines and
+ * exactly ONE that is code: this definition, the assert at game/validate.c:57, and three
+ * mentions in prose (game/validate.c:3, this paragraph, and the BS_INV_OP_CRAFT row below).
+ * The actual runtime bound is game/bsgame.c:1332, `if (a < RECIPE_COUNT)`
+ * — the MIRRORED client constant out of world/crafting.h, which the sync script does carry. So
+ * this line is a pin, not a gate: its whole job is to fail the build when the two drift, which
+ * is what it just did.
+ *
+ * The deployment consequence is the same either way, and it is the one that matters for a
+ * release. A server DAEMON already running was compiled with RECIPE_COUNT == 4 baked in, and no
+ * amount of client-side correctness reaches it. A v1.8.12 client on that daemon can craft
+ * everything EXCEPT the torch, and bsgame.c's `if` has no else — the request is dropped in
+ * silence, with no refusal packet and nothing for the player to see except a recipe that does
+ * nothing when tapped. The one recipe this release is named for is the one that fails, and it
+ * fails invisibly. So the server ships alongside the client for v1.8.12; that is not optional
+ * and not deferrable to a later server release. */
 
 /* The operations a client may ask for. The first five are deliberately the
  * same primitives world/inventory.h and world/crafting.h already expose, one

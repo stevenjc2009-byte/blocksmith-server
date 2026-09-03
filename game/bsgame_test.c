@@ -521,9 +521,62 @@ static uint32_t g_seen_seed = 0;
  * light-emitting block a v1.8.9 client has never heard of, so the SERVER SHIPS FIRST -- a
  * v1.8.9 client joining a v1.8.10 server fails registryMatchesInfo() on both halves and
  * refuses the join (loud, recoverable); the reverse would render every torch as an
- * unnamed hole. BS_PROTO_VERSION stays 1: nothing about transport packet types changed. */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 28u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x165Eu
+ * unnamed hole. BS_PROTO_VERSION stays 1: nothing about transport packet types changed.
+ *
+ * MOVED A FIFTH TIME 2026-09-02/03, 0x165E -> 0xE15E, by the client's v1.8.12 "Ores", which
+ * appends SIX core rows -- coal_ore/iron_ore/gold_ore/redstone_ore/lapis_ore/diamond_ore,
+ * ids 28..33. registryCount() moves 28 -> 34, Phase-3's shape again: six records APPENDED,
+ * nothing renumbered. All six are FULL_CUBE, SOLID (not TRANSPARENT: the art is fully
+ * opaque), and each carries its OWN hardness rather than a flat value -- a six-step ladder,
+ * coal 60 < iron 70 < lapis 80 < gold 85 < redstone 90 < diamond 100, every step above
+ * stone's 45. No tool-tier gate in this client version: every ore is breakable by hand.
+ *
+ * Measured the same way as every move above -- a probe linking registry.c alone (no test
+ * file, so the golden is not reachable from the binary being measured), compiled once
+ * against the client's source/world/registry.c and once against this repo's own
+ * game/world/registry.c (block.h and registry.c copied byte-for-byte from the client tree;
+ * `cmp` on all eleven mirrored files confirmed the other nine untouched and these two
+ * identical).
+ *
+ * Corrected 2026-09-03: this parenthesis used to claim "there is no
+ * tools/sync-world-sources.sh in this repo despite this comment block's earlier entries
+ * assuming one." That was wrong, and it was wrong in the one place it is most misleading --
+ * THIS repo is the repo the script lives in. It sits at tools/sync-world-sources.sh relative
+ * to the root of the repository containing this file, which is exactly what every earlier
+ * entry meant. Run from that root it reported all eleven mirrored files `unchanged`,
+ * "game/world/ was already in sync", exit 0. game/Makefile's `check-world-drift` target names
+ * it as the fix when the two trees diverge, so a reader who believes it does not exist
+ * hand-copies the mirror instead -- which is precisely how eleven files that must stay
+ * byte-identical drift apart.
+ *
+ * Both printed
+ *
+ *     count=34 crc=0xE15E
+ *     id=28 name=coal_ore     hardness= 60 flags=0x01 tex0=32
+ *     id=29 name=iron_ore     hardness= 70 flags=0x01 tex0=33
+ *     id=30 name=gold_ore     hardness= 85 flags=0x01 tex0=34
+ *     id=31 name=redstone_ore hardness= 90 flags=0x01 tex0=35
+ *     id=32 name=lapis_ore    hardness= 80 flags=0x01 tex0=36
+ *     id=33 name=diamond_ore  hardness=100 flags=0x01 tex0=37
+ *     zero-hardness-count=0
+ *
+ * The lockstep rule is unchanged and points the same way: these six rows are defined,
+ * breakable blocks a v1.8.11 client has never heard of, so the SERVER SHIPS FIRST -- a
+ * v1.8.11 client joining a v1.8.12 server fails registryMatchesInfo() on both halves and
+ * refuses the join (loud, recoverable); the reverse would render every ore as an unnamed
+ * hole. BS_PROTO_VERSION stays 1: nothing about transport packet types changed. REGISTRY_REV
+ * stays 1: appending rows is not a change in the MEANING of existing fields.
+ *
+ * NOT MOVED WITH THIS RELEASE, and flagged rather than fixed here: test_registry_core...
+ * pins only count/crc/rev. A SEPARATE test in this same file,
+ * test_inv_pickup_undefined_core_id_refused(), relies on core id 28 being UNDEFINED (its own
+ * comment: "Goes red the day the registry grows to 29 core rows without this test moving --
+ * which is the point"). Id 28 is now BLOCK_COAL_ORE, a defined row, so that test's premise no
+ * longer holds and it needs its literal moved from 28 to 34 (one past this new golden) by
+ * whoever lands this alongside a full server-suite run. That edit is test LOGIC, not a
+ * golden, and is out of this lane's scope. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 34u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0xE15Eu
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -531,9 +584,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 28");
+          "core-only registryCount() matches the pinned golden 34");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0x165E");
+          "core-only registryCrc16() matches the pinned golden 0xE15E");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }
@@ -1847,29 +1900,38 @@ static void test_inv_pickup_out_of_range_item_refused(void)
 }
 
 /* The id-space half of the ceiling, kept separate from the liquid exclusion
- * above for the reason stated there. 28 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
+ * above for the reason stated there. 34 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
  * (test_registry_core_pinned_to_golden()'s golden, this same file) and the daemon
  * has registered no dynamic ids at the point this runs — the FETCH/DEFS batching
  * scenario that registers 40 of them runs last in main(), deliberately after this
- * — so registryIsDefined(28) is false here and inventoryCanHold(28) refuses it on
- * that ground, not on a liquid flag. Goes red the day the registry grows to 29
+ * — so registryIsDefined(34) is false here and inventoryCanHold(34) refuses it on
+ * that ground, not on a liquid flag. Goes red the day the registry grows to 35
  * core rows without this test moving — which is the point: it is meant to be
  * touched the next time a block is added, not to run forever unexamined.
  *
  * MOVED 2026-09-02 from 27 to 28 by v1.8.10's torch (BLOCK_TORCH = 27): the id this
  * test relied on being undefined is now a defined, breakable, non-liquid core row,
  * so the literal has to follow BS_REGISTRY_CORE_COUNT_GOLDEN's move from 27 to 28
- * exactly as this comment always said it would. */
+ * exactly as this comment always said it would.
+ *
+ * MOVED AGAIN 2026-09-02/03 from 28 to 34 by v1.8.12 "Ores"'s six ore rows (ids
+ * 28..33: coal/iron/gold/redstone/lapis/diamond, ORE-BLOCKS lane). Id 28 is now
+ * BLOCK_COAL_ORE, a defined, breakable, non-liquid core row, so this test's premise
+ * again no longer held — following BS_REGISTRY_CORE_COUNT_GOLDEN's move from 28 to
+ * 34 (this same file, just above) exactly as this comment says it must. Fixed by
+ * the ORE-PINS lane, which ORE-BLOCKS explicitly left this literal for: it landed
+ * the registry rows and the golden but declined to touch this test's LOGIC, out of
+ * its ownership. */
 static void test_inv_pickup_undefined_core_id_refused(void)
 {
-    puts("end-to-end: PICKUP of an undefined core id (28, one past the golden count) is refused, not kicked");
+    puts("end-to-end: PICKUP of an undefined core id (34, one past the golden count) is refused, not kicked");
     drain();
 
     send_join(0xF2A50011u, "nadia");
     msleep(100);
     drain();
 
-    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 28, 1, 0);
+    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 34, 1, 0);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A50011u, out, sizeof out, 500);
