@@ -622,6 +622,77 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		.flags = REG_FLAG_SOLID,
 		.hardness = 100,
 	},
+	// ── v1.8.14 "Animals": four raw meat rows, ids 34..37 ───────────────────────────────
+	//
+	// The drop from a pig, a cow, a chicken and a sheep. ⚠ 34..37 AND NOT 27..30:
+	// docs/plan-1.8.14-animals.md names 27..30, and that document predates v1.8.10's torch
+	// (which took 27) and v1.8.12's six ores (28..33). world/block.h's ids carry the same
+	// warning; the first free id was read off BLOCK_DIAMOND_ORE == 33, not off the plan.
+	//
+	// ── Why these are FULL_CUBE and SOLID, like the apple and unlike every plant ────────
+	//
+	// The apple row above states the argument in full and it transfers unchanged. Briefly:
+	// world/block.h's blockDropsNothing() answers from the SHAPE, and scene/interact.c hands
+	// the bag BLOCK_AIR for every BLOCK_SHAPE_CROSS block. Meat that a player kills an animal
+	// for and then cannot pick up is not meat. As cubes they are targetable, breakable,
+	// carryable, placeable and — new in this version — EATABLE.
+	//
+	// Not TRANSPARENT, for the apple's reason: the art is fully opaque, and claiming
+	// TRANSPARENT would push four cube rows into world/mesher.c's deferred pass and cost
+	// every internal face they have, buying nothing.
+	//
+	// ── .hardness: FOUR DISTINCT VALUES, and that is the point ──────────────────────────
+	//
+	// A flat value across all four is exactly the failure mode world/registry_test.c's
+	// coreHardnessIsDeclared() exists to catch — its own words: "A row must have its OWN
+	// number, not a neighbour's. The loop above is satisfied by a table where every hardness
+	// is 9." Four identical bytes are that shape. So a four-step ladder, ordered by the size
+	// of the animal the meat comes off:
+	//
+	//   chicken 3 (0.15 s)  porkchop 4 (0.20 s)  mutton 5 (0.25 s)  beef 6 (0.30 s)
+	//
+	// Every step is nonzero (0 means "no break time at all" — see this file's header note and
+	// world/mining.c's breakTicksRequired(); it is reserved for water) and every step clears
+	// the 1-tick floor the plants sit at, because a dropped joint of meat should not come up
+	// quite as instantly as a blade of grass. All four sit far under stone's 45: this is soft
+	// material and the numbers say so. Pinned as a ladder by registry_test.c and named
+	// one-per-line by mining_test.c, so a later edit cannot flatten it back.
+	//
+	// ── Food ────────────────────────────────────────────────────────────────────────────
+	//
+	// world/survival.c's kFoods[] carries the hunger value for each of these, and the raw
+	// values are deliberately LOW (chicken 2, porkchop 3, beef 3, mutton 2, against the
+	// apple's 4) so that v1.8.15's furnace has real headroom: a cooked cut must restore
+	// strictly more than the raw one it came from, or cooking is a ritual with no reward.
+	// That file's own table is where those numbers live and where they are tested.
+	[34] = { // raw porkchop — atlas slot 38
+		.name  = "raw_porkchop",
+		.tex   = { BTEX_RAW_PORKCHOP, BTEX_RAW_PORKCHOP, BTEX_RAW_PORKCHOP,
+		           BTEX_RAW_PORKCHOP, BTEX_RAW_PORKCHOP, BTEX_RAW_PORKCHOP },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 4,
+	},
+	[35] = { // raw beef — atlas slot 39
+		.name  = "raw_beef",
+		.tex   = { BTEX_RAW_BEEF, BTEX_RAW_BEEF, BTEX_RAW_BEEF,
+		           BTEX_RAW_BEEF, BTEX_RAW_BEEF, BTEX_RAW_BEEF },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 6,
+	},
+	[36] = { // raw chicken — atlas slot 40
+		.name  = "raw_chicken",
+		.tex   = { BTEX_RAW_CHICKEN, BTEX_RAW_CHICKEN, BTEX_RAW_CHICKEN,
+		           BTEX_RAW_CHICKEN, BTEX_RAW_CHICKEN, BTEX_RAW_CHICKEN },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 3,
+	},
+	[37] = { // raw mutton — atlas slot 41
+		.name  = "raw_mutton",
+		.tex   = { BTEX_RAW_MUTTON, BTEX_RAW_MUTTON, BTEX_RAW_MUTTON,
+		           BTEX_RAW_MUTTON, BTEX_RAW_MUTTON, BTEX_RAW_MUTTON },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 5,
+	},
 };
 
 // The table itself. s_defs holds the authoritative bytes; s_view is the derived

@@ -574,9 +574,60 @@ static uint32_t g_seen_seed = 0;
  * which is the point"). Id 28 is now BLOCK_COAL_ORE, a defined row, so that test's premise no
  * longer holds and it needs its literal moved from 28 to 34 (one past this new golden) by
  * whoever lands this alongside a full server-suite run. That edit is test LOGIC, not a
- * golden, and is out of this lane's scope. */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 34u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0xE15Eu
+ * golden, and is out of this lane's scope.
+ *
+ * MOVED A SIXTH TIME 2026-09-03, 0xE15E -> 0x9610, by the client's v1.8.14 "Animals", which
+ * appends FOUR core rows -- raw_porkchop/raw_beef/raw_chicken/raw_mutton, ids 34..37.
+ * registryCount() moves 34 -> 38, the same shape as every move above: four records APPENDED,
+ * nothing renumbered.
+ *
+ * ⚠ 34..37 AND NOT 27..30. The client's docs/plan-1.8.14-animals.md names 27..30 for these
+ * rows and it is STALE -- it was written before v1.8.10's torch took 27 and before v1.8.12's
+ * six ores took 28..33. The first free core id was read off BLOCK_DIAMOND_ORE == 33 in the
+ * live tree, not off the plan. Recording it here because a reader who trusts that document
+ * over this table renumbers four ids that are already on players' SD cards.
+ *
+ * All four are FULL_CUBE and SOLID, not TRANSPARENT -- the art is fully opaque, and the same
+ * argument the ore rows make applies: claiming TRANSPARENT would push four cube rows into the
+ * client mesher's deferred pass and cost every internal face they have for nothing. They
+ * follow the BLOCK_APPLE mould rather than the plant mould deliberately: the client's
+ * blockDropsNothing() answers from the SHAPE and hands the bag BLOCK_AIR for every CROSS
+ * block, so a CROSS meat row would be an animal you kill and get nothing from.
+ *
+ * Each carries its OWN hardness rather than a flat value -- a four-step ladder ordered by the
+ * size of the animal, chicken 3 < porkchop 4 < mutton 5 < beef 6, every step above the
+ * 1-tick floor the plants sit at and every step far under stone's 45 (this is soft material).
+ * A flat value across all four is the exact failure mode the client's coreHardnessIsDeclared()
+ * exists to catch.
+ *
+ * Measured the same way as every move above -- a probe (animb_meat_crc_probe.c) linking
+ * registry.c alone, no test file, so the golden below is not reachable from the binary being
+ * measured. Compiled once against the client's source/world/registry.c and once against this
+ * repo's own game/world/registry.c after tools/sync-world-sources.sh ran (it reported block.h
+ * and registry.c `synced` and the other nine `unchanged`; `cmp` on all eleven then reported
+ * every one identical). Both printed
+ *
+ *     count=38 crc=0x9610 rev=1
+ *     id=34 name=raw_porkchop  hardness=  4 flags=0x01 tex0=38 solid=1 liquid=0
+ *     id=35 name=raw_beef      hardness=  6 flags=0x01 tex0=39 solid=1 liquid=0
+ *     id=36 name=raw_chicken   hardness=  3 flags=0x01 tex0=40 solid=1 liquid=0
+ *     id=37 name=raw_mutton    hardness=  5 flags=0x01 tex0=41 solid=1 liquid=0
+ *     targetable-rows=36 zero-hardness-count=0
+ *
+ * The lockstep rule is unchanged and points the same way: these four rows are defined,
+ * breakable, carryable blocks a v1.8.13 client has never heard of, so the SERVER SHIPS FIRST
+ * -- a v1.8.13 client joining a v1.8.14 server fails registryMatchesInfo() on both halves and
+ * refuses the join (loud, recoverable); the reverse would hand a player meat the client cannot
+ * name. BS_PROTO_VERSION stays 1: nothing about transport packet types changed. REGISTRY_REV
+ * stays 1: appending rows is not a change in the MEANING of existing fields.
+ *
+ * MOVED WITH THIS RELEASE, unlike last time: test_inv_pickup_undefined_core_id_refused()'s
+ * literal goes 34 -> 38, because id 34 is now BLOCK_RAW_PORKCHOP and that test's whole premise
+ * is an id that is NOT defined. The previous entry left that edit for a following lane and
+ * said so; this one does it in the same commit, because a golden that moves without it leaves
+ * the suite red for a reason unrelated to the golden. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 38u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x9610u
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -584,9 +635,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 34");
+          "core-only registryCount() matches the pinned golden 38");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0xE15E");
+          "core-only registryCrc16() matches the pinned golden 0x9610");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }
@@ -1900,12 +1951,12 @@ static void test_inv_pickup_out_of_range_item_refused(void)
 }
 
 /* The id-space half of the ceiling, kept separate from the liquid exclusion
- * above for the reason stated there. 34 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
+ * above for the reason stated there. 38 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
  * (test_registry_core_pinned_to_golden()'s golden, this same file) and the daemon
  * has registered no dynamic ids at the point this runs — the FETCH/DEFS batching
  * scenario that registers 40 of them runs last in main(), deliberately after this
- * — so registryIsDefined(34) is false here and inventoryCanHold(34) refuses it on
- * that ground, not on a liquid flag. Goes red the day the registry grows to 35
+ * — so registryIsDefined(38) is false here and inventoryCanHold(38) refuses it on
+ * that ground, not on a liquid flag. Goes red the day the registry grows to 39
  * core rows without this test moving — which is the point: it is meant to be
  * touched the next time a block is added, not to run forever unexamined.
  *
@@ -1921,17 +1972,26 @@ static void test_inv_pickup_out_of_range_item_refused(void)
  * 34 (this same file, just above) exactly as this comment says it must. Fixed by
  * the ORE-PINS lane, which ORE-BLOCKS explicitly left this literal for: it landed
  * the registry rows and the golden but declined to touch this test's LOGIC, out of
- * its ownership. */
+ * its ownership.
+ *
+ * MOVED A THIRD TIME 2026-09-03 from 34 to 38 by v1.8.14 "Animals"'s four raw meat rows (ids
+ * 34..37: raw_porkchop/raw_beef/raw_chicken/raw_mutton). Id 34 is now BLOCK_RAW_PORKCHOP, a
+ * defined, breakable, non-liquid core row, so this test's premise once more no longer held —
+ * following BS_REGISTRY_CORE_COUNT_GOLDEN's move from 34 to 38 (this same file, above)
+ * exactly as this comment says it must. Unlike the previous move this one lands in the SAME
+ * commit as the golden, rather than being handed to a following lane: the golden and this
+ * literal go red together, so splitting them leaves a red suite whose failure has nothing to
+ * do with the change that caused it. */
 static void test_inv_pickup_undefined_core_id_refused(void)
 {
-    puts("end-to-end: PICKUP of an undefined core id (34, one past the golden count) is refused, not kicked");
+    puts("end-to-end: PICKUP of an undefined core id (38, one past the golden count) is refused, not kicked");
     drain();
 
     send_join(0xF2A50011u, "nadia");
     msleep(100);
     drain();
 
-    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 34, 1, 0);
+    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 38, 1, 0);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A50011u, out, sizeof out, 500);

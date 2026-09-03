@@ -193,6 +193,40 @@ enum {
 	BLOCK_REDSTONE_ORE  = 31,
 	BLOCK_LAPIS_ORE     = 32,
 	BLOCK_DIAMOND_ORE   = 33,
+	// ── v1.8.14 "Animals": four raw meats, ids 34..37 ──────────────────────────────────
+	//
+	// Literals, for the same reason as every id above them; the WARNING note at the top of
+	// this comment block applies unchanged — do NOT tidy these into BLOCK_COUNT + n.
+	//
+	// ⚠ 34..37 AND NOT 27..30. docs/plan-1.8.14-animals.md and docs/plan-1.8.15-furnace.md
+	// both name 27..30 for these rows. Both documents were written before v1.8.10's torch
+	// took 27 and before v1.8.12's six ores took 28..33, and both are stale on this point.
+	// The first free core id in this tree is 34, read off BLOCK_DIAMOND_ORE == 33 directly
+	// rather than off either plan.
+	//
+	// These are the drop from an animal, and they are FOOD — world/survival.c's kFoods[]
+	// carries a hunger value for each. They follow the BLOCK_APPLE mould exactly, which is
+	// a deliberate choice and not an accident of copying: FULL_CUBE and SOLID, because
+	// world/block.h's blockDropsNothing() answers from the SHAPE and scene/interact.c hands
+	// the bag BLOCK_AIR for every CROSS block. A CROSS meat row would break and yield
+	// nothing, i.e. an animal you kill and get nothing from, which is the opposite of the
+	// point. As cubes they are targetable, carryable, eatable and re-placeable, exactly as
+	// the apple has been since v1.8.8.
+	//
+	// ⚠ THE ID AND THE ATLAS SLOT ARE FOUR APART HERE TOO, exactly as they are for the ores
+	// directly above: BLOCK_RAW_PORKCHOP is id 34 and its tile is slot 38;
+	// BLOCK_RAW_MUTTON is id 37 and its tile is slot 41. world/block_tiles_check.c and the
+	// registry rows are what make a transposition fail the build instead of shipping as four
+	// meats wearing each other's art.
+	//
+	// v1.8.15's furnace adds the four COOKED rows; they are a separate span of ids appended
+	// after these, and each cooked row restores strictly more hunger than the raw one it
+	// comes from. Nothing here reserves ids for them — the next version reads the first free
+	// id off this list the same way this version did.
+	BLOCK_RAW_PORKCHOP  = 34,
+	BLOCK_RAW_BEEF      = 35,
+	BLOCK_RAW_CHICKEN   = 36,
+	BLOCK_RAW_MUTTON    = 37,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
@@ -218,6 +252,11 @@ _Static_assert(BLOCK_COAL_ORE == 28 && BLOCK_IRON_ORE == 29 && BLOCK_GOLD_ORE ==
                    BLOCK_DIAMOND_ORE == 33,
                "v1.8.12's ore ids are written into saved chunks and block-edit packets the "
                "moment a server ships them; they must never move");
+_Static_assert(BLOCK_RAW_PORKCHOP == 34 && BLOCK_RAW_BEEF == 35 &&
+                   BLOCK_RAW_CHICKEN == 36 && BLOCK_RAW_MUTTON == 37,
+               "v1.8.14's raw meat ids are written into saved chunks, into block-edit packets "
+               "and into every inventory slot on an SD card the moment a server ships them; "
+               "they must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
@@ -273,6 +312,13 @@ enum {
 	BTEX_REDSTONE_ORE,
 	BTEX_LAPIS_ORE,
 	BTEX_DIAMOND_ORE,
+	// v1.8.14 "Animals", slots 38..41. Same order as gfx/atlas_tiles.h and as
+	// tools/make_atlas.py's TILES list; world/block_tiles_check.c fails the build if the
+	// two enums disagree.
+	BTEX_RAW_PORKCHOP,
+	BTEX_RAW_BEEF,
+	BTEX_RAW_CHICKEN,
+	BTEX_RAW_MUTTON,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is
