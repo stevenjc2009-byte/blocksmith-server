@@ -625,9 +625,58 @@ static uint32_t g_seen_seed = 0;
  * literal goes 34 -> 38, because id 34 is now BLOCK_RAW_PORKCHOP and that test's whole premise
  * is an id that is NOT defined. The previous entry left that edit for a following lane and
  * said so; this one does it in the same commit, because a golden that moves without it leaves
- * the suite red for a reason unrelated to the golden. */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 38u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x9610u
+ * the suite red for a reason unrelated to the golden.
+ *
+ * MOVED A SEVENTH TIME 2026-09-03, 0x9610 -> 0xE486, by the client's v1.8.15 "Furnace", which
+ * appends FIVE core rows -- cooked_porkchop/cooked_beef/cooked_chicken/cooked_mutton at ids
+ * 38..41, and the furnace itself at 42. registryCount() moves 38 -> 43, the same shape as every
+ * move above: five records APPENDED, nothing renumbered.
+ *
+ * The four cooked meats mirror the raw cuts they are smelted from, row for row -- FULL_CUBE and
+ * SOLID like them (a CROSS cooked chop would hit the client's blockDropsNothing() and yield
+ * nothing, which defeats the point of cooking it), and carrying the SAME hardness ladder
+ * ordered by animal size, chicken 3 < porkchop 4 < mutton 5 < beef 6. The furnace is built out
+ * of stone and prices like it at hardness 45, and reuses BTEX_STONE on five of its six faces,
+ * so its row's tex0 is 3 -- an EXISTING tile -- rather than a new one; only the front face
+ * needs new art, twice over, once per lit state.
+ *
+ * Measured the same way as every move above -- a probe (srve_furnace_crc_probe.c) linking
+ * registry.c alone, no test file, so the golden below is not reachable from the binary being
+ * measured and cannot launder a wrong pin into a matching answer. Compiled once against this
+ * repo's own game/world/registry.c after tools/sync-world-sources.sh ran (it reported block.h
+ * and registry.c `synced` and the other nine `unchanged`) and once against the client's
+ * source/world/registry.c. Both printed
+ *
+ *     count=43 crc=0xE486 rev=1
+ *     id=38 name=cooked_porkchop  hardness=  4 flags=0x01 tex0=42
+ *     id=39 name=cooked_beef      hardness=  6 flags=0x01 tex0=43
+ *     id=40 name=cooked_chicken   hardness=  3 flags=0x01 tex0=44
+ *     id=41 name=cooked_mutton    hardness=  5 flags=0x01 tex0=45
+ *     id=42 name=furnace          hardness= 45 flags=0x01 tex0= 3
+ *     first-undefined-core-id=43
+ *
+ * A THIRD arm ran that same probe against this repo's PRE-sync game/world/registry.c,
+ * reconstructed out of `git show HEAD:game/world/...`, and printed count=38 crc=0x9610 rev=1
+ * with first-undefined-core-id=38. That arm is what makes the two numbers below evidence
+ * rather than assertion: the probe demonstrably reports whatever registry it is linked
+ * against, so a golden that agrees with it is not a golden edited until the suite went quiet.
+ *
+ * The lockstep rule is unchanged and points the same way, and this release is the sharpest case
+ * of it so far: these five rows are defined blocks a v1.8.14 client has never heard of, so the
+ * SERVER SHIPS FIRST -- a v1.8.14 client joining a v1.8.15 server fails registryMatchesInfo()
+ * on both halves and refuses the join (loud, recoverable). The reverse is NOT loud here: the
+ * client's source/net/networld.c:260-328 degrades an id the server does not define down to
+ * air, so a v1.8.15 player against a v1.9.4 server would watch furnaces quietly disappear and
+ * be told nothing at all. BS_PROTO_VERSION stays 1: nothing about transport packet types
+ * changed. REGISTRY_REV stays 1: appending rows is not a change in the MEANING of existing
+ * fields.
+ *
+ * MOVED WITH THIS RELEASE, as v1.9.4 did: test_inv_pickup_undefined_core_id_refused()'s literal
+ * goes 38 -> 43, because id 38 is now BLOCK_COOKED_PORKCHOP and that test's whole premise is an
+ * id that is NOT defined. 43 is what the probe's first-undefined-core-id line above reports --
+ * read off the table, not inferred from the count. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 43u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0xE486u
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -635,9 +684,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 38");
+          "core-only registryCount() matches the pinned golden 43");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0x9610");
+          "core-only registryCrc16() matches the pinned golden 0xE486");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }
@@ -1951,12 +2000,12 @@ static void test_inv_pickup_out_of_range_item_refused(void)
 }
 
 /* The id-space half of the ceiling, kept separate from the liquid exclusion
- * above for the reason stated there. 38 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
+ * above for the reason stated there. 43 is one past BS_REGISTRY_CORE_COUNT_GOLDEN
  * (test_registry_core_pinned_to_golden()'s golden, this same file) and the daemon
  * has registered no dynamic ids at the point this runs — the FETCH/DEFS batching
  * scenario that registers 40 of them runs last in main(), deliberately after this
- * — so registryIsDefined(38) is false here and inventoryCanHold(38) refuses it on
- * that ground, not on a liquid flag. Goes red the day the registry grows to 39
+ * — so registryIsDefined(43) is false here and inventoryCanHold(43) refuses it on
+ * that ground, not on a liquid flag. Goes red the day the registry grows to 44
  * core rows without this test moving — which is the point: it is meant to be
  * touched the next time a block is added, not to run forever unexamined.
  *
@@ -1981,17 +2030,39 @@ static void test_inv_pickup_out_of_range_item_refused(void)
  * exactly as this comment says it must. Unlike the previous move this one lands in the SAME
  * commit as the golden, rather than being handed to a following lane: the golden and this
  * literal go red together, so splitting them leaves a red suite whose failure has nothing to
- * do with the change that caused it. */
+ * do with the change that caused it.
+ *
+ * MOVED A FOURTH TIME 2026-09-03 from 38 to 43 by v1.8.15 "Furnace"'s five new core rows (ids
+ * 38..41: the four cooked meats, and 42: the furnace). Id 38 is now BLOCK_COOKED_PORKCHOP, a
+ * defined, breakable, non-liquid core row, so this test's premise once again no longer held --
+ * following BS_REGISTRY_CORE_COUNT_GOLDEN's move from 38 to 43 (this same file, above), in the
+ * same commit as the golden for the reason the previous entry gives.
+ *
+ * This one did not have to be predicted: it was OBSERVED. The suite was built and run against
+ * the freshly synced game/world/ BEFORE any pin here moved, and reported
+ *
+ *     FAIL  core-only registryCount() matches the pinned golden 38
+ *     FAIL  core-only registryCrc16() matches the pinned golden 0x9610
+ *     FAIL  the undefined id was never applied
+ *     FAIL 298 checks, 3 failed
+ *
+ * -- three failures, of which this test is the third and the only one that is not a golden.
+ * That red run is what identified this literal as stale; it was not found by reading. Note the
+ * shape of the failure, because it is why this test is worth keeping: 38 is now a perfectly
+ * valid pickup, so the daemon CREDITED it and inv_state_is_empty() went false. A stale literal
+ * here does not fail loudly on its own terms -- it quietly stops testing refusal at all and
+ * starts testing a successful pickup instead. 43 was then read off the probe's
+ * first-undefined-core-id line rather than inferred, so the premise is measured, not assumed. */
 static void test_inv_pickup_undefined_core_id_refused(void)
 {
-    puts("end-to-end: PICKUP of an undefined core id (38, one past the golden count) is refused, not kicked");
+    puts("end-to-end: PICKUP of an undefined core id (43, one past the golden count) is refused, not kicked");
     drain();
 
     send_join(0xF2A50011u, "nadia");
     msleep(100);
     drain();
 
-    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 38, 1, 0);
+    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 43, 1, 0);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A50011u, out, sizeof out, 500);

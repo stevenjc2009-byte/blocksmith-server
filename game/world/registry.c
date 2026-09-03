@@ -693,6 +693,91 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		.flags = REG_FLAG_SOLID,
 		.hardness = 5,
 	},
+	// ── v1.8.15 "Furnace": four cooked meat rows and the furnace, ids 38..42 ───────────
+	//
+	// docs/plan-1.8.15-furnace.md is the design, corrected on this tree's real next-free id
+	// (38, read off BLOCK_RAW_MUTTON == 37 directly — see world/block.h's note by the ids;
+	// the plan's own first draft named 27, written before the torch and the six ores
+	// claimed 27..33).
+	//
+	// ── Cooked meats: FULL_CUBE and SOLID, exactly like the raw cuts they come from ─────
+	//
+	// The apple row's argument transfers unchanged: world/block.h's blockDropsNothing()
+	// answers from the SHAPE, and scene/interact.c hands the bag BLOCK_AIR for every CROSS
+	// block. A cooked chop that breaks and yields nothing defeats the entire point of
+	// cooking it. As cubes they are targetable, breakable, carryable, placeable and eatable,
+	// exactly as the raw cuts already are.
+	//
+	// Not TRANSPARENT, for the raw meats' and the apple's reason: the art is fully opaque,
+	// and claiming TRANSPARENT would push four more cube rows into world/mesher.c's
+	// deferred pass and cost every internal face they have, buying nothing.
+	//
+	// .hardness is each cooked row's RAW counterpart's number, unchanged — cooking changes
+	// what the meat IS, not its size or texture, and there is no stated reason a cooked cut
+	// should take longer or shorter to break than the joint it was cut from. That keeps the
+	// four-step ladder world/registry_test.c's coreHardnessIsDeclared() and
+	// world/mining_test.c's testCoreHardness() already pin for the raw cuts — chicken 3 <
+	// porkchop 4 < mutton 5 < beef 6 — true of the cooked set too, rather than four
+	// identical bytes, which is exactly the failure mode those two tests exist to catch.
+	//
+	// ── Food ─────────────────────────────────────────────────────────────────────────────
+	//
+	// world/survival.c's kFoods[] is where each cooked row's hunger value lives (this file
+	// does not own that table); every cooked row restores STRICTLY MORE hunger than the raw
+	// cut it is smelted from, which is what makes running the furnace worth doing.
+	[38] = { // cooked porkchop — atlas slot 42
+		.name  = "cooked_porkchop",
+		.tex   = { BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP,
+		           BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 4,
+	},
+	[39] = { // cooked beef — atlas slot 43
+		.name  = "cooked_beef",
+		.tex   = { BTEX_COOKED_BEEF, BTEX_COOKED_BEEF, BTEX_COOKED_BEEF,
+		           BTEX_COOKED_BEEF, BTEX_COOKED_BEEF, BTEX_COOKED_BEEF },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 6,
+	},
+	[40] = { // cooked chicken — atlas slot 44
+		.name  = "cooked_chicken",
+		.tex   = { BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN,
+		           BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 3,
+	},
+	[41] = { // cooked mutton — atlas slot 45
+		.name  = "cooked_mutton",
+		.tex   = { BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON,
+		           BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 5,
+	},
+	// The furnace. FULL_CUBE and SOLID: it is a block of worked stone, not a plant or a
+	// light. .hardness matches BLOCK_STONE's 45 exactly — see [3] above — because it is
+	// built from stone and there is no stated reason it should be tougher or softer than
+	// the material it is made of.
+	//
+	// tex[] reuses BTEX_STONE on five of six faces and only the FACE_SOUTH slot carries new
+	// art (BTEX_FURNACE_FRONT), per the task's instruction to reuse the existing stone
+	// texture everywhere but the front. FACE_SOUTH is the arbitrary but fixed choice of
+	// "front" — this build has no per-block placement orientation (no block here carries a
+	// facing), so any single fixed face is as correct as any other; south was picked only
+	// because it needed to be one specific face and not because south means anything.
+	//
+	// BTEX_FURNACE_FRONT_LIT (world/block.h, atlas slot 47) is deliberately NOT referenced
+	// by this row: the registry table is one static row per block, not one per state, so it
+	// cannot swap a face texture when a furnace starts burning. The tile exists and is
+	// painted so that whichever later lane wires the furnace into rendering
+	// (scene/chunk_render.c, explicitly out of this lane's scope) can select it once it has
+	// a way to read FurnaceState.lit for the block being meshed — see world/furnace.h.
+	[42] = { // furnace — atlas slot 46 (unlit front); slot 47 is the lit front, unused here
+		.name  = "furnace",
+		.tex   = { BTEX_STONE, BTEX_STONE, BTEX_STONE,
+		           BTEX_STONE, BTEX_FURNACE_FRONT, BTEX_STONE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 45,
+	},
 };
 
 // The table itself. s_defs holds the authoritative bytes; s_view is the derived

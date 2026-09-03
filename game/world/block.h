@@ -227,6 +227,29 @@ enum {
 	BLOCK_RAW_BEEF      = 35,
 	BLOCK_RAW_CHICKEN   = 36,
 	BLOCK_RAW_MUTTON    = 37,
+	// ── v1.8.15 "Furnace": four cooked meats and the furnace itself, ids 38..42 ────────
+	//
+	// Literals, for the same reason as every id above them; the WARNING note at the top of
+	// this comment block applies unchanged — do NOT tidy these into BLOCK_COUNT + n.
+	//
+	// The comment on the raw meats above said the next version would read the first free id
+	// off this list the same way v1.8.14 did: BLOCK_RAW_MUTTON == 37, so 38 is free, and
+	// that is where these five rows start.
+	//
+	// The four cooked meats are FULL_CUBE and SOLID, exactly like the raw cuts they are
+	// smelted from and for the identical reason — blockDropsNothing() answers from the
+	// SHAPE, and a CROSS cooked chop would break and yield nothing, which defeats the point
+	// of cooking it. Each restores strictly more hunger than its raw counterpart;
+	// world/survival.c's kFoods[] carries the numbers (this file does not own that table —
+	// see that file's own comment for the rows and why).
+	//
+	// The furnace itself is one more core id, FULL_CUBE and SOLID like the stone it is
+	// built from — see world/registry.c's row for the hardness and the face textures.
+	BLOCK_COOKED_PORKCHOP = 38,
+	BLOCK_COOKED_BEEF     = 39,
+	BLOCK_COOKED_CHICKEN  = 40,
+	BLOCK_COOKED_MUTTON   = 41,
+	BLOCK_FURNACE         = 42,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
@@ -257,6 +280,12 @@ _Static_assert(BLOCK_RAW_PORKCHOP == 34 && BLOCK_RAW_BEEF == 35 &&
                "v1.8.14's raw meat ids are written into saved chunks, into block-edit packets "
                "and into every inventory slot on an SD card the moment a server ships them; "
                "they must never move");
+_Static_assert(BLOCK_COOKED_PORKCHOP == 38 && BLOCK_COOKED_BEEF == 39 &&
+                   BLOCK_COOKED_CHICKEN == 40 && BLOCK_COOKED_MUTTON == 41 &&
+                   BLOCK_FURNACE == 42,
+               "v1.8.15's cooked meat and furnace ids are written into saved chunks, into "
+               "block-edit packets and into every inventory slot on an SD card the moment a "
+               "server ships them; they must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
@@ -319,6 +348,17 @@ enum {
 	BTEX_RAW_BEEF,
 	BTEX_RAW_CHICKEN,
 	BTEX_RAW_MUTTON,
+	// v1.8.15 "Furnace", slots 42..47. Same order as gfx/atlas_tiles.h and as
+	// tools/make_atlas.py's TILES list; world/block_tiles_check.c fails the build if the
+	// two enums disagree. Four cooked-meat icons, then the furnace's unlit and lit front
+	// faces — the furnace's other five faces reuse BTEX_STONE (world/registry.c's row),
+	// so only the front needs new art, twice over, once per lit state.
+	BTEX_COOKED_PORKCHOP,
+	BTEX_COOKED_BEEF,
+	BTEX_COOKED_CHICKEN,
+	BTEX_COOKED_MUTTON,
+	BTEX_FURNACE_FRONT,
+	BTEX_FURNACE_FRONT_LIT,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is
