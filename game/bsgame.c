@@ -33,7 +33,7 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
-#include <sys/stat.h>   /* umask, around the socket bind below */
+#include <sys/stat.h>   /* umask around the socket bind, and stat() in state_dir_has_edits() */
 #include <sys/un.h>
 
 #include "../proto/bs_proto.h"
@@ -235,9 +235,23 @@ struct bs_game {
      * Treat the file as immutable after its first write. Changing it points
      * every diff already in block_diffs.bin at a different hillside, and unlike
      * the seed there is no matching value anywhere for the client to notice
-     * with. In particular it must not be edited to 2 to "turn on" the density
-     * generator: see BS_APP_WORLD_GEN in proto/bs_proto.h for why water makes
-     * that a separate and much larger change. */
+     * with. world_gen_load() below now enforces that rather than asking: a
+     * --world-gen that disagrees with the stored value on a --state-dir holding
+     * edits is refused, and --world-gen-force is the deliberate override.
+     *
+     * This used to add that the file "must not be edited to 2 to turn on the
+     * density generator", because water makes that a separate and much larger
+     * change. That was measured on 2026-09-05 and the severity does not hold.
+     * The observation behind it is still true — the client keeps water LEVEL in
+     * a local sparse side map that is on no wire, in no region file and in no
+     * chunk encoding — but water can never REACH the wire or block_diffs.bin, so
+     * what diverges between two clients is flow, not the world. The client
+     * writes water only through its own worldSet, whose edit hook does exactly
+     * one thing (a local waterNotify) and is not a sender; the one non-test
+     * caller of its send path is the player's own break/place. And a rejoining
+     * client re-derives the flood anyway, because the stored diffs are replayed
+     * through that same per-cell worldSet as columns stream in. See
+     * BS_APP_WORLD_GEN in proto/bs_proto.h for the long form. */
     uint32_t world_gen;
 
     BsPlayers   players;
@@ -370,22 +384,87 @@ static bool world_seed_load(const char *state_dir, const char *forced,
 
 /* --------------------------------------------------- world generator (P4) */
 
-/* What a state-dir with no world_gen.txt in it is minted at, and the only value
- * this release ever declares.
+/* Whether this --state-dir already holds player edits.
  *
- * 1 is the client's GEN_VERSION_LEGACY (its world/genversion.h). Spelled as a
- * bare 1 here because this repo does not and must not include that header — the
- * server has no generator to share with it — and named rather than written into
- * the code below so there is one place to read this comment.
+ * Two decisions below turn on this, and both are about the same fact: a diff is
+ * an absolute (x,y,z)->block override and NEVER records what the generator
+ * originally produced at that coordinate. So once edits exist, the generator
+ * that shaped the ground under them cannot be changed AND cannot be recovered
+ * either — there is nothing on disk to migrate from, which is why no migration
+ * tool exists for this and why none can be written. A state-dir with no edits
+ * carries none of that weight.
  *
- * Minting an EXISTING state-dir at 1 is not a guess, it is what actually
- * happened: every client that has ever joined this server generated legacy,
- * because until BS_APP_WORLD_GEN existed genVersionForSession() returned that
- * constant unconditionally and nothing could vary it. So the diffs in
- * block_diffs.bin are coordinates into legacy terrain by construction, and 1 is
- * the declaration that describes them. Any other default would be a claim about
- * worlds that already exist, made by an upgrade nobody opted into. */
-#define BSGAME_WORLD_GEN_DEFAULT 1u
+ * A stat() rather than diffstoreOpen(), and that is load-bearing: main() loads
+ * the seed and the generator declaration BEFORE opening the diff store, on
+ * purpose, so a bad declaration stops the daemon while the world is still
+ * untouched. Asking diffstoreCount() from here would invert that order.
+ *
+ * block_diffs.bin is an 8-byte magic followed by fixed 16-byte records
+ * (BS_DIFF_MAGIC_LEN and BS_DIFF_REC_BYTES in diffstore.c, both private to that
+ * file), so "has edits" is "longer than the magic". The length is spelled again
+ * here rather than shared, and duplicating it is safe in the only direction that
+ * matters: a magic that grew would make a record-less store look non-empty, so
+ * this would refuse MORE than it should, never less.
+ *
+ * A missing file — or a stat that fails for any other reason — is "no edits".
+ * That is the ordinary first-run path, and it is also what lets a fresh install
+ * mint the current generator instead of the oldest one. */
+#define BSGAME_DIFF_MAGIC_BYTES 8
+
+static bool state_dir_has_edits(const char *state_dir)
+{
+    char path[512];
+    if (!path_set(path, sizeof path, "%s/block_diffs.bin", state_dir)) return false;
+
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    return st.st_size > (off_t)BSGAME_DIFF_MAGIC_BYTES;
+}
+
+/* What a state-dir with no world_gen.txt in it is minted at.
+ *
+ * 1 is the client's GEN_VERSION_LEGACY; 5 is its GEN_VERSION_ORES, the newest it
+ * has (both in its world/genversion.h). Spelled as bare numbers because this
+ * repo does not and must not include that header — the server has no generator
+ * to share with it — and named rather than written into the code below so there
+ * is one place to read this comment.
+ *
+ * WHICH of the two is minted comes from state_dir_has_edits(), and that split is
+ * the point. The rule here used to be "always mint 1", on an argument that is
+ * still exactly right for half the cases and is kept verbatim:
+ *
+ *     Minting an EXISTING state-dir at 1 is not a guess, it is what actually
+ *     happened: every client that has ever joined this server generated legacy,
+ *     because until BS_APP_WORLD_GEN existed genVersionForSession() returned
+ *     that constant unconditionally and nothing could vary it. So the diffs in
+ *     block_diffs.bin are coordinates into legacy terrain by construction, and
+ *     1 is the declaration that describes them.
+ *
+ * Every word of that is about a state-dir that HAS diffs. Applied to one with
+ * none it proves nothing — there are no coordinates for the declaration to
+ * describe — and applying it there anyway is what quietly froze every NEW
+ * deployment on the oldest generator the client can still produce. A brand-new
+ * server minted at 1 tells every client to generate the 2D value-noise
+ * heightmap: no biomes, no caves, no ores, none of the terrain the client has
+ * shipped in the releases since. Nobody chose that. It was a default written for
+ * upgrades and then inherited by fresh installs.
+ *
+ * So the mint reads evidence instead of a constant. Edits on disk mean the world
+ * is legacy already and must keep being declared legacy. No edits mean nothing
+ * can be stranded, and the first player to join gets the terrain the client
+ * actually ships.
+ *
+ * The boundary case is a state-dir that ran but was never built in — an 8-byte
+ * block_diffs.bin, or none at all. It mints FRESH, and that is right rather than
+ * merely convenient: with no diffs there is nothing to strand, so the only thing
+ * that changes shape is ground no player has touched.
+ *
+ * Note what this does NOT do. The mint runs only when world_gen.txt is ABSENT.
+ * An existing deployment already has that file and keeps whatever it says across
+ * this upgrade, untouched — see world_gen_load() below, which returns the stored
+ * value before it ever reaches here. */
+#define BSGAME_WORLD_GEN_FRESH  5u
+#define BSGAME_WORLD_GEN_LEGACY 1u
 
 /* Loads --state-dir/world_gen.txt, or mints and writes one on first run.
  * Deliberately world_seed_load() above with the numbers changed, rather than a
@@ -394,12 +473,20 @@ static bool world_seed_load(const char *state_dir, const char *forced,
  * would be a parameterised text-file reader whose parameters were the whole of
  * the function.
  *
- * `forced` is a --world-gen argument, which overwrites whatever is stored. It
- * exists for the migration case a persisted file cannot serve by itself — an
- * operator who KNOWS their world is not legacy — and for the test suite, which
- * needs to start a daemon on a known declaration. Changing it on a live world
- * strands every diff in block_diffs.bin against terrain of a different shape,
- * so it is an explicit operator act and never something that happens by itself.
+ * `forced` is a --world-gen argument. It exists for the migration case a
+ * persisted file cannot serve by itself — an operator who KNOWS their world is
+ * not legacy — and for the test suite, which needs to start a daemon on a known
+ * declaration. Changing it on a live world strands every diff in
+ * block_diffs.bin against terrain of a different shape.
+ *
+ * `force_override` is --world-gen-force, and it is the ONLY way to make that
+ * change on a world that has edits in it. The comment here used to say the
+ * change "is an explicit operator act and never something that happens by
+ * itself", which was the intent but was not true of the code: nothing compared
+ * the forced value to the stored one, so a typo in a unit file rewrote the
+ * declaration silently at startup. The guard below is what makes the sentence
+ * true. The two flags are spelled differently on purpose — the destructive one
+ * cannot be reached by mistyping the ordinary one.
  *
  * A stored value above 0xFFFF is refused rather than truncated. BS_WORLD_GEN's
  * wire field is a uint16 (proto/bs_proto.h), so truncating would declare a
@@ -408,7 +495,7 @@ static bool world_seed_load(const char *state_dir, const char *forced,
  *
  * Returns false only on a fault the operator needs to know about; a missing file
  * is the ordinary first-run path. */
-static bool world_gen_load(const char *state_dir, const char *forced,
+static bool world_gen_load(const char *state_dir, const char *forced, bool force_override,
                            uint32_t *out, char *err, size_t errcap)
 {
     char path[512];
@@ -417,49 +504,109 @@ static bool world_gen_load(const char *state_dir, const char *forced,
         return false;
     }
 
+    /* Read what is stored FIRST, and read it even when forcing.
+     *
+     * This read used to sit inside `if (forced == NULL)`, so a forced run never
+     * opened the file at all. That left nothing to compare against, which is why
+     * --world-gen could overwrite the declaration silently. Reading first is
+     * what makes the guard further down possible at all. */
+    unsigned long long stored      = 0;
+    bool               have_stored = false;
+    bool               bad_stored  = false;
+
+    FILE *f = fopen(path, "r");
+    if (f != NULL) {
+        const int got = fscanf(f, "%llu", &stored);
+        fclose(f);
+        if (got != 1) {
+            /* Names the file and not the full path, for the reason
+             * world_seed_load() states above: `path` can be 512 bytes and
+             * the caller's buffer is 256. */
+            snprintf(err, errcap, "world_gen.txt in --state-dir holds no number");
+            bad_stored = true;
+        } else if (stored == 0 || stored > 0xFFFFu) {
+            snprintf(err, errcap,
+                     "world_gen.txt in --state-dir holds %llu, which no client can be told"
+                     " (the wire field is 16 bits and 0 is not a generator)", stored);
+            bad_stored = true;
+        } else {
+            have_stored = true;
+        }
+    } else if (errno != ENOENT) {
+        snprintf(err, errcap, "cannot read world_gen.txt in --state-dir: %s",
+                 strerror(errno));
+        return false;
+    }
+
+    /* An unusable stored value stays fatal when nothing was forced. That is the
+     * old behaviour and it is right: the operator has a corrupt file and has
+     * stated no intent, and guessing on their behalf is how a world ends up
+     * declared as something it is not.
+     *
+     * With a forced value it becomes a warning instead. The operator has named
+     * what they want, so there IS an intent to honour, and refusing here would
+     * leave the flag unable to repair the very file it writes — the only
+     * recovery path that exists. Nothing can be compared against a value that
+     * would not parse, so the guard below simply does not apply. */
+    if (bad_stored) {
+        if (forced == NULL) return false;
+        logf_("game: WARNING: %s — overwriting it, because a generator was forced", err);
+        err[0] = '\0';
+    }
+
     if (forced == NULL) {
-        FILE *f = fopen(path, "r");
-        if (f != NULL) {
-            unsigned long long v = 0;
-            int got = fscanf(f, "%llu", &v);
-            fclose(f);
-            if (got != 1) {
-                /* Names the file and not the full path, for the reason
-                 * world_seed_load() states above: `path` can be 512 bytes and
-                 * the caller's buffer is 256. */
-                snprintf(err, errcap, "world_gen.txt in --state-dir holds no number");
-                return false;
-            }
-            if (v == 0 || v > 0xFFFFu) {
-                snprintf(err, errcap,
-                         "world_gen.txt in --state-dir holds %llu, which no client can be told"
-                         " (the wire field is 16 bits and 0 is not a generator)", v);
-                return false;
-            }
-            *out = (uint32_t)v;
+        if (have_stored) {
+            *out = (uint32_t)stored;
             logf_("game: world generator %u (from %s)", *out, path);
             return true;
         }
-        if (errno != ENOENT) {
-            snprintf(err, errcap, "cannot read world_gen.txt in --state-dir: %s",
-                     strerror(errno));
-            return false;
-        }
-    }
-
-    if (forced != NULL) {
-        unsigned long long v = strtoull(forced, NULL, 10);
+        *out = state_dir_has_edits(state_dir) ? BSGAME_WORLD_GEN_LEGACY
+                                              : BSGAME_WORLD_GEN_FRESH;
+    } else {
+        const unsigned long long v = strtoull(forced, NULL, 10);
         if (v == 0 || v > 0xFFFFu) {
             snprintf(err, errcap,
                      "--world-gen %llu is out of range (1..65535; the wire field is 16 bits)", v);
             return false;
         }
+
+        /* The guard. A forced value that contradicts a stored one, on a world
+         * that has already been built in, is REFUSED rather than applied.
+         *
+         * A refusal and not a warning, because the damage is instantaneous and
+         * total: every record in block_diffs.bin is an absolute coordinate into
+         * terrain the STORED generator produced, nothing anywhere records what
+         * the block there used to be, and afterwards both sides agree on the new
+         * number, so no client reports anything. The player just finds their
+         * floors buried or floating. A line printed as the daemon comes up
+         * cannot undo any of it.
+         *
+         * The detail goes through logf_ rather than `err` because the caller's
+         * buffer is 256 bytes and this does not fit — the same constraint
+         * world_seed_load() works around above. */
+        if (have_stored && v != stored && !force_override && state_dir_has_edits(state_dir)) {
+            logf_("game: REFUSING to change the world generator of a world that has edits.");
+            logf_("game:   %s says %llu, and --world-gen asked for %llu.", path, stored, v);
+            logf_("game:   every edit in block_diffs.bin is a coordinate into terrain the stored");
+            logf_("game:   generator made, and nothing on disk records what stood there before,");
+            logf_("game:   so this cannot be undone and cannot be migrated.");
+            logf_("game:   to keep this world:           drop the flag and %llu is reused.", stored);
+            logf_("game:   to build a new world on %llu:  point --state-dir at an empty directory.", v);
+            logf_("game:   to change THIS world anyway:  pass --world-gen-force %llu instead.", v);
+            snprintf(err, errcap,
+                     "--world-gen %llu contradicts the stored %llu on a world that has edits"
+                     " (see the lines above; --world-gen-force overrides)", v, stored);
+            return false;
+        }
+
+        if (have_stored && v != stored)
+            logf_("game: world generator CHANGED from %llu to %llu%s", stored, v,
+                  state_dir_has_edits(state_dir) ? " on a world that HAS edits" : "");
+
         *out = (uint32_t)v;
-    } else {
-        *out = BSGAME_WORLD_GEN_DEFAULT;
     }
 
-    FILE *f = fopen(path, "w");
+    f = fopen(path, "w");
     if (f == NULL) {
         snprintf(err, errcap, "cannot write world_gen.txt in --state-dir: %s",
                  strerror(errno));
@@ -473,7 +620,11 @@ static bool world_gen_load(const char *state_dir, const char *forced,
     }
 
     logf_("game: world generator %u (%s, written to %s)", *out,
-          forced ? "forced by --world-gen" : "newly minted", path);
+          forced ? (force_override ? "forced by --world-gen-force" : "forced by --world-gen")
+                 : (state_dir_has_edits(state_dir)
+                        ? "newly minted as legacy: this --state-dir already has edits"
+                        : "newly minted as current: this --state-dir has no edits"),
+          path);
     return true;
 }
 
@@ -1697,24 +1848,42 @@ static void usage(void)
         "                       Changing it strands every edit already in block_diffs.bin.\n"
         "  --world-gen N        force the generator version declared to clients (1..65535),\n"
         "                       overwriting world_gen.txt. Omit it: the stored value is reused,\n"
-        "                       or minted to 1 (legacy) on first run, which is what every client\n"
-        "                       that has ever joined this server actually generated.\n"
-        "                       Changing it strands every edit already in block_diffs.bin, and\n"
-        "                       setting it to 2 does NOT enable the density generator -- see\n"
-        "                       BS_APP_WORLD_GEN in proto/bs_proto.h before touching it.\n");
+        "                       or minted on first run -- 5 (the newest terrain the client\n"
+        "                       ships) for an empty --state-dir, 1 (legacy) for one that\n"
+        "                       already has edits, because those edits are coordinates into\n"
+        "                       legacy terrain by construction.\n"
+        "                       On a --state-dir that has edits this is REFUSED when it\n"
+        "                       disagrees with the stored value: changing it strands every\n"
+        "                       edit in block_diffs.bin against terrain of a different shape,\n"
+        "                       and there is no way back.\n"
+        "  --world-gen-force N  the same thing, but overrides that refusal. Spelled\n"
+        "                       differently on purpose: the destructive one cannot be reached\n"
+        "                       by mistyping the ordinary one. Use it only if you accept\n"
+        "                       losing every build in this world.\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *game_sock = NULL, *gate_sock = NULL, *state_dir = NULL, *world_seed = NULL;
     const char *world_gen = NULL;
+    bool world_gen_force  = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--game-socket") && i + 1 < argc)      game_sock = argv[++i];
         else if (!strcmp(argv[i], "--gate-socket") && i + 1 < argc) gate_sock = argv[++i];
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc)   state_dir = argv[++i];
         else if (!strcmp(argv[i], "--world-seed") && i + 1 < argc)  world_seed = argv[++i];
-        else if (!strcmp(argv[i], "--world-gen") && i + 1 < argc)   world_gen = argv[++i];
+        /* Two spellings, one value. The bool is set by whichever spelling was
+         * used LAST rather than sticky, so `--world-gen-force 5 --world-gen 5`
+         * is an ordinary guarded run and not a forced one. */
+        else if (!strcmp(argv[i], "--world-gen") && i + 1 < argc) {
+            world_gen       = argv[++i];
+            world_gen_force = false;
+        }
+        else if (!strcmp(argv[i], "--world-gen-force") && i + 1 < argc) {
+            world_gen       = argv[++i];
+            world_gen_force = true;
+        }
         else { usage(); return 2; }
     }
     if (game_sock == NULL || gate_sock == NULL || state_dir == NULL) {
@@ -1756,7 +1925,7 @@ int main(int argc, char **argv)
      * declaration must stop the server while the world is still untouched,
      * rather than after clients have been told a number the operator's file
      * does not actually say. */
-    if (!world_gen_load(state_dir, world_gen, &g.world_gen, err, sizeof err)) {
+    if (!world_gen_load(state_dir, world_gen, world_gen_force, &g.world_gen, err, sizeof err)) {
         logf_("game: %s", err);
         return 1;
     }

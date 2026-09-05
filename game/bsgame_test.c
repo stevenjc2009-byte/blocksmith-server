@@ -331,6 +331,12 @@ static void open_sockets(void)
  * opinion about. */
 static const char *g_forced_gen = NULL;
 
+/* Which spelling g_forced_gen is passed with. "--world-gen" is guarded and
+ * refuses to contradict a stored value on a --state-dir that has edits;
+ * "--world-gen-force" overrides that. This suite needs both, because it forces
+ * over its own scratch dir AFTER the scenarios that place blocks. */
+static const char *g_forced_gen_flag = "--world-gen";
+
 static void start_daemon(void)
 {
     pid_t pid = fork();
@@ -338,10 +344,10 @@ static void start_daemon(void)
     if (pid == 0) {
         if (g_forced_gen != NULL) {
             execl("./bsgame", "bsgame",
-                  "--game-socket", g_game_sock,
-                  "--gate-socket", g_gate_sock,
-                  "--state-dir",   g_dir,
-                  "--world-gen",   g_forced_gen,
+                  "--game-socket",     g_game_sock,
+                  "--gate-socket",     g_gate_sock,
+                  "--state-dir",       g_dir,
+                  g_forced_gen_flag,   g_forced_gen,
                   (char *)NULL);
         } else {
             execl("./bsgame", "bsgame",
@@ -720,10 +726,15 @@ static bool recv_registry_info(uint32_t sid, unsigned ms)
 /* v1.8.3 Phase 4. What every join in this run must be told the generator is.
  * Spelled out rather than read back off the wire and compared to itself: a test
  * that only checks the second packet agrees with the first would stay green if
- * the daemon declared 7 to everyone. This is the client's GEN_VERSION_LEGACY,
- * and it is what bsgame.c's BSGAME_WORLD_GEN_DEFAULT mints a fresh --state-dir
- * at, which is what this suite always runs against. */
-#define BSGAME_TEST_WORLD_GEN 1u
+ * the daemon declared 7 to everyone.
+ *
+ * 5 as of the mint-by-evidence change: this is the client's GEN_VERSION_ORES,
+ * the newest terrain it ships, and it is what bsgame.c's BSGAME_WORLD_GEN_FRESH
+ * mints an EMPTY --state-dir at. This suite always runs against a scratch
+ * directory it just created, so the mint sees no block_diffs.bin and takes the
+ * fresh branch rather than the legacy one. It was 1 before that change, when the
+ * mint was an unconditional constant. */
+#define BSGAME_TEST_WORLD_GEN 5u
 
 /* Reads the BS_APP_WORLD_GEN that rides immediately behind WORLD_INFO, and
  * checks its POSITION IN THE BURST as well as its bytes.
@@ -754,11 +765,11 @@ static bool recv_world_gen(uint32_t sid, unsigned ms)
     if (!shaped) return false;
 
     check(bs_get_u16(out + 1) == BSGAME_TEST_WORLD_GEN,
-          "WORLD_GEN declares generator 1 (legacy) — the one every client that has ever"
-          " joined this server actually generated");
-    check(out[1] == 0x01 && out[2] == 0x00,
+          "WORLD_GEN declares generator 5 (ores) — what an empty --state-dir mints, which is"
+          " the newest terrain the client ships");
+    check(out[1] == 0x05 && out[2] == 0x00,
           "WORLD_GEN's version field is little-endian on the wire: the three bytes are"
-          " {0x0F, 0x01, 0x00}, checked without going through bs_get_u16");
+          " {0x0F, 0x05, 0x00}, checked without going through bs_get_u16");
     return true;
 }
 
@@ -2843,19 +2854,31 @@ static void send_registry_fetch(uint32_t sid, uint8_t first_index)
 
 /* ------------------------------------------- v1.8.3 Phase 4: world_gen.txt */
 
-/* Brings the daemon back up with (or without) a --world-gen argument and waits
+/* Brings the daemon back up with (or without) a generator argument and waits
  * for it, so the scenario below reads as three restarts rather than thirty
- * lines of fork bookkeeping. */
-static void restart_with_gen(const char *gen)
+ * lines of fork bookkeeping.
+ *
+ * `force` picks --world-gen-force over --world-gen. Every restart in the
+ * scenario below needs it, and that is not a convenience: this suite runs all
+ * three restarts against ONE shared scratch --state-dir, and by the time the
+ * scenario is reached (main() calls it after test_edit_broadcast_to_other_player_only,
+ * test_world_sync_after_edits, test_restart_persists_diffs and test_disk_format,
+ * all of which place blocks) that dir has a non-empty block_diffs.bin. Plain
+ * --world-gen is REFUSED there by design. Passing NULL forces nothing and the
+ * flag is irrelevant. */
+static void restart_with_gen(const char *gen, bool force)
 {
     stop_daemon();
-    g_forced_gen = gen;
+    g_forced_gen      = gen;
+    g_forced_gen_flag = force ? "--world-gen-force" : "--world-gen";
     start_daemon();
     if (!wait_ready(5000)) {
-        fprintf(stderr, "test: daemon never became ready after a --world-gen restart\n");
+        fprintf(stderr, "test: daemon never became ready after a %s restart\n",
+                g_forced_gen_flag);
         exit(1);
     }
-    g_forced_gen = NULL;
+    g_forced_gen      = NULL;
+    g_forced_gen_flag = "--world-gen";
     drain();
 }
 
@@ -2886,18 +2909,27 @@ static bool join_read_gen_bytes(uint32_t sid, const char *label, uint8_t v[2])
  * every boot.
  *
  * Restarting and checking the two joins agree would not prove that, and the
- * trap is worth naming because it is the obvious test to write: the mint
- * default is 1, so an implementation that ignored the file entirely and minted
- * on every boot would hand both joins a 1 and pass. So this forces a value that
- * is NOT the default (3), restarts WITHOUT the flag, and requires 3 to come
- * back. Only reading the file can produce that.
+ * trap is worth naming because it is the obvious test to write: the mint would
+ * answer 1 here (this shared state-dir has edits in it by now, so it takes the
+ * legacy branch), so an implementation that ignored the file entirely and
+ * minted on every boot would hand both joins a 1 and pass. So this forces a
+ * value the mint can never choose (3), restarts WITHOUT the flag, and requires
+ * 3 to come back. Only reading the file can produce that.
  *
  * 3 is not a generator any client can make. That is deliberate and it is safe
  * here: the server never generates anything, this state-dir is a scratch
- * directory this run created, and the declaration is restored to 1 at the end —
- * which the registry scenarios that follow re-verify for free, because their
- * own recv_world_gen() pins it. It also happens to be the value a client's
- * refusal path would fire on, which is what interop_test.c uses it for. */
+ * directory this run created, and the declaration is restored to
+ * BSGAME_TEST_WORLD_GEN at the end — which the registry scenarios that follow
+ * re-verify for free, because their own recv_world_gen() pins it. It also
+ * happens to be the value a client's refusal path would fire on, which is what
+ * interop_test.c uses it for.
+ *
+ * Every restart here forces with --world-gen-force. See restart_with_gen(): by
+ * the time main() reaches this scenario the shared scratch state-dir has edits
+ * in it, and plain --world-gen refuses to contradict a stored value there. That
+ * refusal is the subject of test_world_gen_refuses_to_strand_edits() below; this
+ * scenario is about persistence, so it takes the override and stays about the
+ * thing it was written to test. */
 static void test_world_gen_persists_across_restart(void)
 {
     puts("v1.8.3 Phase 4: the declared generator comes out of world_gen.txt, not out of a fresh mint every boot");
@@ -2913,19 +2945,19 @@ static void test_world_gen_persists_across_restart(void)
         fclose(f);
     }
     check(stored == BSGAME_TEST_WORLD_GEN,
-          "a fresh --state-dir mints the declaration at 1 (legacy), which is what every client"
-          " that has ever joined actually generated");
+          "an empty --state-dir mints the declaration at 5 (ores), the newest terrain the"
+          " client ships — this dir was empty when the daemon first came up");
 
     /* Forced to a value the mint would never choose, and written through. */
-    restart_with_gen("3");
+    restart_with_gen("3", true);
     uint8_t v[2] = { 0xFF, 0xFF };
     check(join_read_gen_bytes(0x6E0F0001u, "genforce", v),
-          "--world-gen 3 comes up and still sends WORLD_INFO then WORLD_GEN in that order");
+          "--world-gen-force 3 comes up and still sends WORLD_INFO then WORLD_GEN in that order");
     check(v[0] == 0x03 && v[1] == 0x00,
-          "--world-gen 3 is declared on the wire as the little-endian bytes {0x03, 0x00}");
+          "--world-gen-force 3 is declared on the wire as the little-endian bytes {0x03, 0x00}");
 
     /* And now the actual claim: no flag, and 3 has to survive. */
-    restart_with_gen(NULL);
+    restart_with_gen(NULL, false);
     v[0] = 0xFF; v[1] = 0xFF;
     check(join_read_gen_bytes(0x6E0F0002u, "genread", v),
           "the daemon restarted with NO --world-gen still sends WORLD_GEN");
@@ -2942,14 +2974,111 @@ static void test_world_gen_persists_across_restart(void)
     }
     check(stored == 3u, "world_gen.txt on disk holds the forced 3, matching what the wire said");
 
-    /* Restore, so every join after this one is told 1 again. The registry
-     * scenarios below re-prove it landed, through recv_world_gen(). */
-    restart_with_gen("1");
+    /* Restore, so every join after this one is told BSGAME_TEST_WORLD_GEN
+     * again. The registry scenarios below re-prove it landed, through
+     * recv_world_gen(). */
+    restart_with_gen("5", true);
     v[0] = 0xFF; v[1] = 0xFF;
     check(join_read_gen_bytes(0x6E0F0003u, "genrestore", v),
           "the state dir is put back and the daemon comes up clean");
-    check(v[0] == 0x01 && v[1] == 0x00,
-          "the declaration is 1 again for the rest of this run");
+    check(v[0] == 0x05 && v[1] == 0x00,
+          "the declaration is 5 again for the rest of this run");
+}
+
+/* The guard: --world-gen may NOT quietly contradict a stored declaration on a
+ * --state-dir that already has edits in it.
+ *
+ * This is the half of the flag that did not exist before. The stored value used
+ * to be read only when nothing was forced, so a forced run never opened
+ * world_gen.txt at all — there was no comparison to refuse on, and a typo in a
+ * unit file rewrote the declaration silently at startup, stranding every record
+ * in block_diffs.bin against terrain of a different shape.
+ *
+ * Runs immediately after test_world_gen_persists_across_restart(), which leaves
+ * the dir storing 5 and (by then) full of edits, so both halves of the guard's
+ * precondition hold without this scenario having to build them.
+ *
+ * The daemon is expected to EXIT rather than come up, so this cannot go through
+ * restart_with_gen() — that helper exit(1)s when the daemon never becomes ready,
+ * which here is the pass condition. It forks and waits on the status directly.
+ *
+ * Two assertions, and the second is the one that matters: a build that printed
+ * the refusal and then wrote the file anyway would pass the first alone. */
+static void test_world_gen_refuses_to_strand_edits(void)
+{
+    puts("the world generator cannot be changed out from under a world that has edits");
+
+    char path[256];
+    snprintf(path, sizeof path, "%s/world_gen.txt", g_dir);
+
+    char diffs[256];
+    snprintf(diffs, sizeof diffs, "%s/block_diffs.bin", g_dir);
+    struct stat dst;
+    check(stat(diffs, &dst) == 0 && dst.st_size > 8,
+          "the shared state-dir really does have edits by now, so the guard's precondition"
+          " holds and this scenario is not passing vacuously");
+
+    unsigned long long before = 0;
+    FILE *f = fopen(path, "r");
+    if (f != NULL) {
+        if (fscanf(f, "%llu", &before) != 1) before = 0;
+        fclose(f);
+    }
+    check(before == BSGAME_TEST_WORLD_GEN,
+          "world_gen.txt holds 5 going in, left there by the persistence scenario above");
+
+    stop_daemon();
+
+    pid_t pid = fork();
+    if (pid < 0) die("fork");
+    if (pid == 0) {
+        execl("./bsgame", "bsgame",
+              "--game-socket", g_game_sock,
+              "--gate-socket", g_gate_sock,
+              "--state-dir",   g_dir,
+              "--world-gen",   "3",
+              (char *)NULL);
+        _exit(127);
+    }
+
+    /* Bounded, and that is not defensive padding — it is the difference between
+     * a check that goes red and one that hangs. A plain waitpid() here blocks
+     * forever the moment the guard is missing, because then the daemon comes up
+     * and runs, which is exactly the arm this scenario exists to catch. Measured:
+     * the first version of this test was written with an unbounded waitpid and
+     * the sabotage run had to be killed at 600s having reported nothing. */
+    int  status = 0;
+    bool exited = false;
+    for (unsigned waited = 0; waited < 5000; waited += 50) {
+        if (waitpid(pid, &status, WNOHANG) == pid) { exited = true; break; }
+        msleep(50);
+    }
+    if (!exited) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+    }
+    check(exited && WIFEXITED(status) && WEXITSTATUS(status) == 1,
+          "--world-gen 3 over a stored 5 on a world with edits exits 1 instead of starting");
+
+    unsigned long long after = 0;
+    f = fopen(path, "r");
+    check(f != NULL, "world_gen.txt still exists after the refusal");
+    if (f != NULL) {
+        if (fscanf(f, "%llu", &after) != 1) after = 0;
+        fclose(f);
+    }
+    check(after == BSGAME_TEST_WORLD_GEN,
+          "and still holds 5 — the refusal happened BEFORE the write, so the declaration"
+          " on disk is untouched");
+
+    /* And the override still works, which is what makes the refusal a guard
+     * rather than a wall. Put the daemon back for whatever runs after this. */
+    restart_with_gen("5", true);
+    uint8_t v[2] = { 0xFF, 0xFF };
+    check(join_read_gen_bytes(0x6E0F0004u, "genguard", v),
+          "--world-gen-force brings the daemon back up over the same dir");
+    check(v[0] == 0x05 && v[1] == 0x00,
+          "and the declaration is still 5 for the rest of this run");
 }
 
 /* Consumes the four-packet welcome sequence for a fresh sid, asserting the
@@ -3183,11 +3312,16 @@ int main(void)
     test_ps_identical_report_does_not_rewrite_file();
 
     /* v1.8.3 Phase 4. Placed here, above the registry scenarios, because it
-     * restarts the daemon three times and leaves the declaration back at 1 —
-     * and the registry joins below then re-prove that restore for free through
-     * recv_world_gen(). Running it after them would leave nothing to check the
-     * restore with. */
+     * restarts the daemon three times and leaves the declaration back at
+     * BSGAME_TEST_WORLD_GEN — and the registry joins below then re-prove that
+     * restore for free through recv_world_gen(). Running it after them would
+     * leave nothing to check the restore with. */
     test_world_gen_persists_across_restart();
+
+    /* Immediately behind it, and the order is load-bearing in both directions:
+     * it needs the stored 5 and the edits that scenario runs on top of, and it
+     * leaves the same 5 behind for the registry joins to re-prove. */
+    test_world_gen_refuses_to_strand_edits();
 
     /* Registry sync runs last: its batching scenario rewrites registry.bin
      * and restarts the daemon, which would change what any later join's

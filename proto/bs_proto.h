@@ -320,14 +320,35 @@ enum bs_app_msg {
      * add an acknowledgement or a capability report; that would turn a
      * ship-order preference into kick-or-be-kicked.
      *
-     * Phase 4 declares 1 (the client's GEN_VERSION_LEGACY) and nothing else.
-     * Declaring 2 (DENSITY) is a SEPARATE and larger change and must not be
-     * done by editing world_gen.txt: the density generator places water, and
-     * the client keeps water LEVEL in a local sparse side map that is on no
-     * wire, in no region file and in no chunk encoding. Two clients that agree
-     * on "2" would generate the same lakes and then simulate their own flow
-     * out of them, with nothing reconciling the two and — because they agree —
-     * no refusal to fire. Water has to go on the wire first. */
+     * Phase 4 declared 1 (the client's GEN_VERSION_LEGACY) and nothing else, on
+     * the grounds that anything above it places water and "water has to go on
+     * the wire first". That was measured on 2026-09-05 and withdrawn. The
+     * observation it rests on is correct and is kept: the density generator
+     * places water, and the client keeps water LEVEL in a local sparse side map
+     * that is on no wire, in no region file and in no chunk encoding. What does
+     * not follow is the severity.
+     *
+     * Water cannot reach this protocol at all. On the client, water writes
+     * blocks only through worldSet; worldSet's edit hook does exactly one thing
+     * with them (a local waterNotify) and is not a sender; and the one non-test
+     * caller of the block-edit send path is the player's own break/place in
+     * scene/interact.c. The client's own water suite links water.c WITHOUT
+     * networld.c and builds, so a send from there would be an undefined symbol.
+     * Nothing water does can therefore land in block_diffs.bin or on this wire,
+     * which means two clients cannot disagree about the WORLD — only about flow
+     * in front of them, which is cosmetic and self-correcting.
+     *
+     * And a late joiner is not stranded either: the stored diffs for a column
+     * are replayed through that same per-cell worldSet as the column streams in,
+     * firing the hook, so a rejoining client re-derives the flood from the diff
+     * that caused it rather than inheriting a snapshot it has no way to build.
+     *
+     * So a generator above 1 is an OPERATIONAL choice — which world this
+     * --state-dir is — and not a protocol change. What it costs is real but is
+     * about edits, not water: every record already in block_diffs.bin is a
+     * coordinate into terrain the previous generator made. game/bsgame.c's
+     * world_gen_load() refuses to make that change on a state-dir that has edits
+     * unless --world-gen-force says so. */
     BS_APP_WORLD_GEN      = 0x0F  /* S->C only: {gen_version u16 LE}.            */
 };
 
