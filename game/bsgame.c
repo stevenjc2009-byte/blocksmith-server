@@ -254,6 +254,25 @@ struct bs_game {
      * BS_APP_WORLD_GEN in proto/bs_proto.h for the long form. */
     uint32_t world_gen;
 
+    /* v1.9.8. The day/night clock. Server-authoritative ticks since this
+     * WORLD was created — not ticks since this PROCESS started, which is
+     * what ticks_total above already is and specifically is NOT usable here:
+     * nothing in the simulation reads ticks_total (its own comment says so)
+     * and it is reset to 0 on every restart, so a world that used it would
+     * jump back to dawn every time this process is relaunched. This field is
+     * the wire-and-disk counter proto/bs_proto.h's BS_APP_TIME_SYNC
+     * broadcasts and day_time.txt persists — see send_time_sync() and
+     * day_time_save()/day_time_load() below.
+     *
+     * Same shape and meaning as the client's own DayNight.ticks
+     * (source/world/daynight.h): the WHOLE counter, not a 0..23999 wrap, so
+     * the day number and moon phase this process's clients derive from it
+     * agree with each other. uint64_t for the identical reason daynight.h
+     * gives: a uint32 would wrap after 6.8 real years of continuous uptime,
+     * and this field is durable, so a wrapped value would eventually read
+     * back as a world younger than it is. */
+    uint64_t day_time_ticks;
+
     BsPlayers   players;
     BsDiffStore diffs;
 };
@@ -628,6 +647,91 @@ static bool world_gen_load(const char *state_dir, const char *forced, bool force
     return true;
 }
 
+/* ------------------------------------------------------------- day/night */
+
+/* v1.9.8. What a --state-dir with no day_time.txt in it starts the clock at.
+ * The client's own default for a brand-new world (source/world/daynight.h's
+ * DAY_START_TICKS, which is DAY_TICK_DAY = 1000: "a new world begins at
+ * morning"). Spelled as a bare number for the same reason
+ * BSGAME_WORLD_GEN_FRESH/LEGACY above are: this repo does not and must not
+ * include daynight.h, so there is nowhere else to read the constant from. */
+#define BSGAME_DAY_START_TICKS 1000u
+
+/* Loads --state-dir/day_time.txt: the day/night counter this process is
+ * server-authoritative over. Same plain-decimal-text shape as
+ * world_seed_load()/world_gen_load() above, and deliberately NOT their
+ * fail-stop posture on a damaged or unreadable file.
+ *
+ * That asymmetry is the client's own, restated for this side. source/world/
+ * daynight.h's "Why a damaged time.bin does NOT refuse the world" argues a
+ * wrong seed strands a base the player already built and a wrong generator
+ * strands terrain the same way, while a wrong time of day just makes it
+ * morning when it should be evening — nothing is lost, nothing is
+ * overwritten, and the next save corrects it. That argument is exactly as
+ * true of this process refusing to START over the same fault, so this
+ * function never returns failure: every path it can take leaves *out holding
+ * a usable value, either the one on disk or BSGAME_DAY_START_TICKS. */
+static void day_time_load(const char *state_dir, uint64_t *out)
+{
+    *out = BSGAME_DAY_START_TICKS;
+
+    char path[512];
+    if (!path_set(path, sizeof path, "%s/day_time.txt", state_dir)) {
+        logf_("game: --state-dir is too long for the day time path, "
+              "starting the clock at tick %u", BSGAME_DAY_START_TICKS);
+        return;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        if (errno != ENOENT) {
+            logf_("game: cannot read day_time.txt in --state-dir: %s, "
+                  "starting the clock at tick %u", strerror(errno), BSGAME_DAY_START_TICKS);
+        }
+        return;   /* ENOENT: no sidecar yet, same as an old world with no time.bin */
+    }
+
+    unsigned long long v = 0;
+    int got = fscanf(f, "%llu", &v);
+    fclose(f);
+    if (got != 1) {
+        logf_("game: day_time.txt in --state-dir holds no number, "
+              "starting the clock at tick %u", BSGAME_DAY_START_TICKS);
+        return;
+    }
+
+    *out = (uint64_t)v;
+    logf_("game: day/night clock resumes at tick %llu (from %s)",
+          (unsigned long long)*out, path);
+}
+
+/* Writes --state-dir/day_time.txt. Called once at startup (so the file
+ * exists as soon as world_seed.txt and world_gen.txt do) and once a second
+ * from tick() thereafter (see BS_APP_TIME_SYNC's broadcast there) — never
+ * every tick, because unlike the seed or the generator declaration this
+ * value changes continuously, and an fopen/fprintf/fclose 20 times a second
+ * is needless disk I/O for a number the client only needs correcting once a
+ * second anyway.
+ *
+ * Logs and returns on failure rather than propagating one, the same posture
+ * write_status() below takes: a failed write here just means the NEXT
+ * restart starts the clock over at BSGAME_DAY_START_TICKS (day_time_load()
+ * above), which is the same harmless degrade daynight.h describes for a
+ * damaged or missing time.bin — never a reason to stop ticking. */
+static void day_time_save(const struct bs_game *g)
+{
+    char path[512];
+    if (!path_set(path, sizeof path, "%s/day_time.txt", g->state_dir)) return;
+
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        logf_("game: day_time.txt: %s", strerror(errno));
+        return;
+    }
+    fprintf(f, "%llu\n", (unsigned long long)g->day_time_ticks);
+    if (fclose(f) != 0) logf_("game: day_time.txt: short write: %s", strerror(errno));
+}
+
 /* ------------------------------------------------------------- gate I/O */
 
 static void gate_send(struct bs_game *g, const uint8_t *buf, size_t len)
@@ -854,6 +958,21 @@ static void send_world_gen(struct bs_game *g, uint32_t sid)
     uint8_t payload[BS_WORLD_GEN_BYTES];
     payload[0] = BS_APP_WORLD_GEN;
     bs_put_u16(payload + 1, (uint16_t)g->world_gen);
+    send_data(g, sid, payload, sizeof payload);
+}
+
+/* v1.9.8. Tells one player the server-authoritative day/night counter — see
+ * proto/bs_proto.h's BS_APP_TIME_SYNC for the wire shape and why S->C-only
+ * is safe, and source/world/daynight.h:338-365 for the design this
+ * implements. Used at JOIN only; the periodic once-a-second copy every
+ * already-connected player gets is broadcast directly from tick() below,
+ * which builds the identical payload once and sends it to everyone rather
+ * than once per player. */
+static void send_time_sync(struct bs_game *g, uint32_t sid)
+{
+    uint8_t payload[BS_TIME_SYNC_BYTES];
+    payload[0] = BS_APP_TIME_SYNC;
+    bs_put_u64(payload + 1, g->day_time_ticks);
     send_data(g, sid, payload, sizeof payload);
 }
 
@@ -1281,6 +1400,13 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
      * simply lost. */
     bool state_restored = load_player_state(g, p);
     send_player_state(g, sid, p, state_restored);
+
+    /* v1.9.8. So a player who arrives at dusk arrives at dusk — daynight.h's
+     * own phrase for this (source/world/daynight.h:356). Sent last in the
+     * burst: nothing above it depends on time of day and nothing about time
+     * of day depends on anything above it, so it carries none of the
+     * ordering weight WORLD_INFO through PLAYER_STATE do. */
+    send_time_sync(g, sid);
 }
 
 static void handle_leave(struct bs_game *g, uint32_t sid)
@@ -1658,12 +1784,40 @@ static void tick(struct bs_game *g, uint64_t t)
      * no rearrangement of the main loop can change what the number means. */
     g->ticks_total++;
 
+    /* v1.9.8. The day/night clock. Advanced unconditionally, every simulated
+     * tick, for the same reason ticks_total is: whether or not a player is
+     * connected does not change whether the calendar moves. See
+     * day_time_ticks's own comment on struct bs_game for why this counter,
+     * and not ticks_total, is what BS_APP_TIME_SYNC broadcasts and
+     * day_time.txt persists. */
+    g->day_time_ticks++;
+
     /* v1.8.0 task 21. The legacy-grace check below runs every tick — it is two
      * integer comparisons per player and being twice as responsive costs
      * nothing — but the position broadcast is decimated back to its old 10 Hz,
      * because that rate was chosen for bandwidth reasons that did not change
      * when the simulation rate did. See BS_POS_BROADCAST_PERIOD. */
     const bool send_pos = tickDue(t, BS_POS_BROADCAST_PERIOD, 0);
+
+    /* v1.9.8. Once a second — daynight.h's own cadence for this message
+     * (source/world/daynight.h:356-359), the same tickDue idiom
+     * BS_POS_BROADCAST_PERIOD just above already uses, undecimated: TICK_HZ
+     * itself rather than a fraction of it. Saved to disk on the same beat it
+     * is broadcast on, so the two can never drift out of step with each
+     * other — see day_time_save()'s own comment for why once a second and
+     * not every tick. Broadcast to every connected player at once
+     * (broadcast_except with exclude_sid 0 excludes nobody — sid 0 is never
+     * issued) rather than per player, unlike the WORLD_GEN resend loop
+     * below: every player gets the identical value, so there is nothing a
+     * per-player send would buy. */
+    if (tickDue(t, TICK_HZ, 0)) {
+        day_time_save(g);
+
+        uint8_t time_out[BS_TIME_SYNC_BYTES];
+        time_out[0] = BS_APP_TIME_SYNC;
+        bs_put_u64(time_out + 1, g->day_time_ticks);
+        broadcast_except(g, 0, time_out, sizeof time_out);
+    }
 
     for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
         BsPlayer *p = &g->players.p[i];
@@ -1842,7 +1996,8 @@ static void usage(void)
         "usage: bsgame --game-socket PATH --gate-socket PATH --state-dir DIR\n"
         "  --game-socket PATH   unix socket this process binds (gate sends JOIN/DATA/LEAVE here)\n"
         "  --gate-socket PATH   unix socket bsgate binds (this process sends DATA/KICK there)\n"
-        "  --state-dir DIR      holds block_diffs.bin, world_seed.txt, world_gen.txt and, on SIGUSR1, status.txt\n"
+        "  --state-dir DIR      holds block_diffs.bin, world_seed.txt, world_gen.txt, day_time.txt\n"
+        "                       and, on SIGUSR1, status.txt\n"
         "  --world-seed N       force this world's terrain seed, overwriting world_seed.txt.\n"
         "                       Omit it: the stored seed is reused, or minted on first run.\n"
         "                       Changing it strands every edit already in block_diffs.bin.\n"
@@ -1929,6 +2084,15 @@ int main(int argc, char **argv)
         logf_("game: %s", err);
         return 1;
     }
+    /* v1.9.8. Unlike the two loads above, this one cannot fail the startup —
+     * see day_time_load()'s own comment for why a damaged or missing
+     * day_time.txt degrades instead of refusing. Written back immediately
+     * afterwards so the file exists as soon as world_seed.txt and
+     * world_gen.txt do, matching what an operator expects a fresh
+     * --state-dir to look like right after first boot. g.state_dir is
+     * already set above, which is what day_time_save() reads. */
+    day_time_load(state_dir, &g.day_time_ticks);
+    day_time_save(&g);
     if (!diffstoreOpen(&g.diffs, state_dir, err, sizeof err)) {
         logf_("game: %s", err);
         return 1;
@@ -2035,6 +2199,13 @@ int main(int argc, char **argv)
     }
 
     logf_("game: shutting down");
+
+    /* v1.9.8. One last flush so a clean SIGTERM/SIGINT never throws away up
+     * to a second of calendar progress waiting on the next tickDue(t,
+     * TICK_HZ, 0) boundary — the periodic save in tick() is the steady-state
+     * path, this is just the shutdown edge case it can't cover on its own. */
+    day_time_save(&g);
+
     close(g.unix_fd);
     diffstoreClose(&g.diffs);
     return 0;

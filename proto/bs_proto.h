@@ -349,7 +349,38 @@ enum bs_app_msg {
      * coordinate into terrain the previous generator made. game/bsgame.c's
      * world_gen_load() refuses to make that change on a state-dir that has edits
      * unless --world-gen-force says so. */
-    BS_APP_WORLD_GEN      = 0x0F  /* S->C only: {gen_version u16 LE}.            */
+    BS_APP_WORLD_GEN      = 0x0F, /* S->C only: {gen_version u16 LE}.            */
+
+    /* v1.9.8. Server-authoritative time of day. The design is the client's
+     * own — see source/world/daynight.h:338-365, "Multiplayer, and why
+     * nothing here has to be torn up to add it" — and this message is
+     * exactly what that section specifies, not a variant of it.
+     *
+     * S->C ONLY, and load-bearing for the same reason as every other S->C-
+     * only type in this enum (BS_APP_WORLD_GEN's comment above states it at
+     * length; repeated here because getting THIS one backwards is worse than
+     * usual). bsgame's handle_app_payload() ends in send_kick() on an opcode
+     * it does not recognise, so a server-to-client-only type costs an old
+     * client nothing — the client's net/networld.c dispatch ends in
+     * `default: break;` and simply drops it — while a client-to-server
+     * message of the same kind would get every client older than this
+     * release kicked outright the first time it tried to send one. Time of
+     * day never needs to travel the other way: the client has no local clock
+     * decision left to make once this exists, only dayNightSet() to call.
+     *
+     * 0x10 because 0x0F (BS_APP_WORLD_GEN, just above) was the highest
+     * opcode defined in this enum before this one — confirmed by reading the
+     * enum, not assumed.
+     *
+     * Payload: the day/night counter, one uint64 little-endian, unchanged
+     * from daynight.h's spec — the WHOLE tick count since the world was
+     * created, not a 0..23999 time-of-day, so the day number and moon phase
+     * a client derives from it agree with the server's and with every other
+     * client's. See game/bsgame.c's day_time_ticks and send_time_sync() for
+     * where the value comes from and how often it goes out: once on JOIN, so
+     * a player who arrives at dusk arrives at dusk, and once a second after
+     * that. */
+    BS_APP_TIME_SYNC      = 0x10  /* S->C only: {ticks u64 LE}.                  */
 };
 
 /* Why INV_STATE is sent unprompted, and why the client must never open with
@@ -496,6 +527,22 @@ static inline int32_t bs_col_of(int32_t block_coord)
  * ignore" from "a field I have never heard of". Widening this later means a new
  * message type (0x10), not a bigger one. */
 #define BS_WORLD_GEN_BYTES (BS_APP_HDR_BYTES + 2u)                    /* 3 */
+
+/* TIME_SYNC: the day/night counter, one uint64 little-endian, and nothing
+ * else — daynight.h's own spec for this message, quoted in full at the enum
+ * above.
+ *
+ * uint64 rather than a narrower field because that is the width the counter
+ * already has where it is durable: the client's DayNight.ticks
+ * (source/world/daynight.h) and this server's day_time_ticks (game/bsgame.c)
+ * are both uint64_t, and truncating it on the wire would let this field
+ * silently disagree with either sidecar's on-disk width.
+ *
+ * No reserved bytes and no room to grow, same posture and same reason as
+ * BS_WORLD_INFO_BYTES and BS_WORLD_GEN_BYTES above: a strict-length reader
+ * cannot tell "reserved, ignore" from "a field I have never heard of", so
+ * widening this later means a new message type, not a bigger one. */
+#define BS_TIME_SYNC_BYTES (BS_APP_HDR_BYTES + 8u)                    /* 9 */
 
 /* ---- inventory ----------------------------------------------------------
  *

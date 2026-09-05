@@ -270,7 +270,17 @@ static ssize_t recv_app_for(uint32_t sid, uint8_t *out, size_t cap, unsigned ms)
  * been seen or `ms` runs out — so neither recipient's packet is ever thrown
  * away waiting on the other's. A packet for neither sid (or a duplicate for
  * one already captured) is simply not needed here and is dropped, same as
- * recv_app_for drops a mismatched sid. */
+ * recv_app_for drops a mismatched sid.
+ *
+ * v1.9.8: a packet whose payload type is BS_APP_WORLD_GEN or BS_APP_TIME_SYNC
+ * is dropped too, for either sid, even on a first match. Both are ambient
+ * background traffic unrelated to whatever this call is actually pairing up
+ * (see recv_app_skip_gen's comment for the fuller rationale) -- and unlike
+ * recv_app_skip_gen's retry loop, this function can't just keep reading past
+ * one: capturing an ambient packet into *n_a or *n_b would falsely satisfy
+ * that half of the wait, either stopping the read before the real packet
+ * this caller wants ever arrives, or reading as a spurious non-negative
+ * result on a check that asserts silence. */
 static void recv_app_for_two(uint32_t sid_a, uint8_t *out_a, size_t cap_a, ssize_t *n_a,
                              uint32_t sid_b, uint8_t *out_b, size_t cap_b, ssize_t *n_b,
                              unsigned ms)
@@ -286,6 +296,7 @@ static void recv_app_for_two(uint32_t sid_a, uint8_t *out_a, size_t cap_a, ssize
         uint8_t buf[2048];
         ssize_t n = gate_recv(buf, sizeof buf, (unsigned)(deadline - now));
         if (n < 5 || buf[0] != BS_GAME_DATA) return;
+        if (n >= 6 && (buf[5] == BS_APP_WORLD_GEN || buf[5] == BS_APP_TIME_SYNC)) continue;
 
         uint32_t sid = bs_get_u32(buf + 1);
         size_t len = (size_t)n - 5;
@@ -783,14 +794,26 @@ static bool recv_world_gen(uint32_t sid, unsigned ms)
  * way the first time the resend went in — the failure was in the suite's
  * assumptions, not in the daemon, and this is the repair.
  *
+ * v1.9.8: also discards BS_APP_TIME_SYNC, for the identical reason one size up.
+ * send_time_sync() (bsgame.c) puts one on the wire at the end of every join
+ * burst AND once a second forever after (tickDue(t, TICK_HZ, 0)), so any test
+ * whose wait window runs past a one-second boundary — several of the
+ * broadcast/silence scenarios below do — can have a TIME_SYNC land in the
+ * middle of a sequence it did not ask for. It is exactly the same shape of bug
+ * WORLD_GEN's resends caused, so it gets exactly the same fix: skipped here,
+ * still counted, still visible only to a caller that asks.
+ *
  * Deliberately NOT used by recv_world_gen() above, and that separation is the
  * whole point. recv_world_gen asserts WHERE in the burst WORLD_GEN sits; a
  * helper that skipped the message would turn that assertion into a tautology.
- * Every other reader wants the next packet that is not a resend.
+ * The same logic is why join_expect_registry_sequence() (this file) reads its
+ * trailing TIME_SYNC with recv_app_for directly rather than through here —
+ * that packet's position is the thing under test. Every other reader wants
+ * the next packet that is neither kind of ambient background noise.
  *
  * The skip is counted and returned so a caller can still see them if it cares;
  * nothing does yet, and a test that asserted silence would be lying if it could
- * not tell "nothing came" from "only resends came". */
+ * not tell "nothing came" from "only ambient packets came". */
 static ssize_t recv_app_skip_gen(uint32_t sid, uint8_t *out, size_t cap, unsigned ms,
                                  unsigned *skipped)
 {
@@ -803,7 +826,7 @@ static ssize_t recv_app_skip_gen(uint32_t sid, uint8_t *out, size_t cap, unsigne
 
         const ssize_t n = recv_app_for(sid, out, cap, (unsigned)(until - now));
         if (n < 1) return n;
-        if (out[0] != BS_APP_WORLD_GEN) return n;
+        if (out[0] != BS_APP_WORLD_GEN && out[0] != BS_APP_TIME_SYNC) return n;
         if (skipped) (*skipped)++;
     }
 }
@@ -1012,8 +1035,10 @@ static void test_edit_broadcast_to_other_player_only(void)
               "broadcast edit carries the exact coordinates and block id");
     }
 
-    /* The sender (alice) must not see her own edit echoed back. */
-    n = recv_app_for(0xA11CE001u, out, sizeof out, 300);
+    /* The sender (alice) must not see her own edit echoed back. v1.9.8:
+     * recv_app_skip_gen so a TIME_SYNC broadcast landing in this window is
+     * not mistaken for an echo -- see recv_app_skip_gen's comment. */
+    n = recv_app_skip_gen(0xA11CE001u, out, sizeof out, 300, NULL);
     check(n < 0, "the edit is not echoed back to the sender");
 }
 
@@ -1029,8 +1054,11 @@ static void test_invalid_block_id_rejected(void)
      * ids above the dyn range are still invalid, so this uses the top one. */
     send_block_edit(0xA11CE001u, 1, 1, 1, 0xFF /* above REG_ID_DYN_HI */);
 
+    /* v1.9.8: recv_app_skip_gen -- see recv_app_skip_gen's comment for why a
+     * TIME_SYNC broadcast in this window must not be mistaken for the
+     * rejected-edit broadcast this test asserts never happens. */
     uint8_t out[64];
-    ssize_t n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
+    ssize_t n = recv_app_skip_gen(0xB0B00002u, out, sizeof out, 400, NULL);
     check(n < 0, "no broadcast for an invalid block id");
 }
 
@@ -1121,14 +1149,19 @@ static void test_dyn_range_block_ids_accepted(void)
      * so a u8 row count can never overflow (world/registry.h), and neither is a
      * placeable block. If these two ever start passing, bsEditValid() has lost
      * its block-id test rather than had it raised. */
+    /* v1.9.8: recv_app_skip_gen on both of these -- the once-a-second
+     * TIME_SYNC broadcast (send_time_sync(), bsgame.c) can land in either
+     * 400ms window regardless of anything this test does, and recv_app_for
+     * would mistake that ambient packet for the rejected-edit broadcast this
+     * test is asserting never happens. See recv_app_skip_gen's comment. */
     drain();
     send_block_edit(0xA11CE001u, 7200, 12, 7200, (uint8_t)(REG_ID_DYN_HI + 1) /* 0xFE */);
-    n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
+    n = recv_app_skip_gen(0xB0B00002u, out, sizeof out, 400, NULL);
     check(n < 0, "an edit one past the highest dynamic block id (0xFE) is dropped");
 
     drain();
     send_block_edit(0xA11CE001u, 7300, 12, 7300, 0xFF);
-    n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
+    n = recv_app_skip_gen(0xB0B00002u, out, sizeof out, 400, NULL);
     check(n < 0, "an edit placing the top reserved id (0xFF) is dropped");
 }
 
@@ -1139,8 +1172,13 @@ static void test_out_of_range_coordinate_rejected(void)
 
     send_block_edit(0xA11CE001u, 2000000000, 5, 0, 1);
 
+    /* v1.9.8: recv_app_skip_gen, not recv_app_for — the once-a-second
+     * TIME_SYNC broadcast (send_time_sync(), bsgame.c) can land inside this
+     * window regardless of anything this test does, and an "n < 0" check
+     * that used recv_app_for would mistake that ambient packet for the
+     * broadcast this test is actually asserting never happens. */
     uint8_t out[64];
-    ssize_t n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
+    ssize_t n = recv_app_skip_gen(0xB0B00002u, out, sizeof out, 400, NULL);
     check(n < 0, "no broadcast for a coordinate far outside the world");
 }
 
@@ -1151,8 +1189,11 @@ static void test_out_of_range_y_rejected(void)
 
     send_block_edit(0xA11CE001u, 0, 500, 0, 1);
 
+    /* v1.9.8: recv_app_skip_gen -- see recv_app_skip_gen's comment for why a
+     * TIME_SYNC broadcast in this window must not be mistaken for the
+     * rejected-edit broadcast this test asserts never happens. */
     uint8_t out[64];
-    ssize_t n = recv_app_for(0xB0B00002u, out, sizeof out, 400);
+    ssize_t n = recv_app_skip_gen(0xB0B00002u, out, sizeof out, 400, NULL);
     check(n < 0, "no broadcast for y >= WORLD_HEIGHT");
 }
 
@@ -1275,8 +1316,11 @@ static void test_pos_update_relay(void)
         check(x == 12.5f && y == 64.0f && z == -3.25f, "relayed position values are exact");
     }
 
-    /* alice must not receive her own position back. */
-    n = recv_app_for(0xA11CE001u, out, sizeof out, 300);
+    /* alice must not receive her own position back. v1.9.8: recv_app_skip_gen
+     * so a TIME_SYNC broadcast landing in this 300ms window (send_time_sync(),
+     * bsgame.c, once a second) is not mistaken for her own echoed position —
+     * see recv_app_skip_gen's own comment. */
+    n = recv_app_skip_gen(0xA11CE001u, out, sizeof out, 300, NULL);
     check(n < 0, "position is not relayed back to its own sender");
 }
 
@@ -1727,8 +1771,12 @@ static void test_chunk_sub_suppresses_legacy_world_sync(void)
 
     msleep(BS_CHUNK_LEGACY_GRACE_MS + 300u);
 
+    /* v1.9.8: recv_app_skip_gen — this wait alone is long enough to cross a
+     * TIME_SYNC broadcast boundary (send_time_sync(), bsgame.c, once a
+     * second), and that ambient packet is not the legacy WORLD_SYNC this
+     * test is proving stays suppressed. See recv_app_skip_gen's comment. */
     uint8_t out[2048];
-    ssize_t n = recv_app_for(0xCA501001u, out, sizeof out, 300);
+    ssize_t n = recv_app_skip_gen(0xCA501001u, out, sizeof out, 300, NULL);
     check(n < 0, "nothing arrives on carol's socket well past the legacy grace window");
 }
 
@@ -3101,6 +3149,16 @@ static void join_expect_registry_sequence(uint32_t sid, const char *label)
     n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
           "registry probe: PLAYER_STATE fourth");
+
+    /* v1.9.8. TIME_SYNC now rides last in every join burst (handle_join(),
+     * bsgame.c's send_time_sync() call) — see that call's own comment for
+     * why it carries none of the ordering weight WORLD_INFO..PLAYER_STATE
+     * do. Consumed here so the FETCH exchanges that call this helper are not
+     * handed a leftover TIME_SYNC datagram instead of their real
+     * REGISTRY_DEFS reply. */
+    n = recv_app_for(sid, out, sizeof out, 500);
+    check(n == (ssize_t)BS_TIME_SYNC_BYTES && out[0] == BS_APP_TIME_SYNC,
+          "registry probe: TIME_SYNC rides last in the burst");
 }
 
 /* FETCH is a C->S message no client has ever sent before this suite — the
@@ -3218,6 +3276,183 @@ static void test_registry_fetch_batches_over_36_defs(void)
     check(n < 0, "no third DEFS batch follows the LAST-flagged one");
 }
 
+/* ------------------------------------------------------------ v1.9.8: day/night */
+
+/* BS_APP_TIME_SYNC (proto/bs_proto.h) is the server-authoritative day/night
+ * counter described in the client's own source/world/daynight.h:338-365:
+ * send_time_sync() (bsgame.c) puts one on the wire at the end of every join
+ * burst, and tick() broadcasts another once a second forever after
+ * (tickDue(t, TICK_HZ, 0)), persisting it to day_time.txt in --state-dir on
+ * the same beat. join_expect_registry_sequence() above already proves WHERE
+ * in the join burst the packet rides; this proves what it actually SAYS and
+ * that it keeps moving. */
+static void test_time_sync_on_join_and_periodic(void)
+{
+    puts("v1.9.8: TIME_SYNC arrives on join and again, larger, about a second later");
+    drain();
+
+    send_join(0x71A50001u, "chronos");
+
+    uint8_t out[64];
+    ssize_t n = recv_app_for(0x71A50001u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "day/night probe: WORLD_INFO leads");
+    (void)recv_world_gen(0x71A50001u, 500);
+    (void)recv_registry_info(0x71A50001u, 500);
+    n = recv_app_for(0x71A50001u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "day/night probe: INV_STATE next");
+    n = recv_app_for(0x71A50001u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
+          "day/night probe: PLAYER_STATE next");
+
+    n = recv_app_for(0x71A50001u, out, sizeof out, 500);
+    const bool shaped = (n == (ssize_t)BS_TIME_SYNC_BYTES && out[0] == BS_APP_TIME_SYNC);
+    check(shaped, "TIME_SYNC rides last in the join burst, exactly BS_TIME_SYNC_BYTES long");
+    if (!shaped) return;
+
+    uint64_t join_ticks = bs_get_u64(out + 1);
+
+    /* 1000 is BSGAME_DAY_START_TICKS (bsgame.c) and DAY_START_TICKS
+     * (daynight.h) both — a literal on purpose here, the same way
+     * BSGAME_TEST_WORLD_GEN is one above: bsgame.c's own #define is not
+     * visible to this translation unit, and this suite is a separate
+     * process speaking only the wire protocol. By the time this test runs
+     * the shared daemon has been up through the whole suite, so the real
+     * value is certain to be well past this floor; this only guards against
+     * a build that forgot to load the persisted clock at all and answers 0. */
+    check(join_ticks >= 1000u,
+          "the join-time counter is at least the calendar's start tick (1000)");
+
+    /* Decoded independently of bs_get_u64 -- that function is exactly what
+     * this message's own wire bytes are supposed to satisfy, so using it
+     * to check itself would prove nothing about whether the bytes are
+     * REALLY little-endian on the wire. */
+    uint64_t manual = 0;
+    for (int i = 7; i >= 0; i--) manual = (manual << 8) | out[1 + (unsigned)i];
+    check(manual == join_ticks,
+          "the counter's wire bytes are little-endian, verified without going through bs_get_u64");
+
+    /* tickDue(t, TICK_HZ, 0) fires once a second of SIMULATED ticks, not
+     * once a second of wall clock -- test_tick_rate_is_traffic_independent
+     * above already established this suite's own accepted floor for that
+     * (BS_TICK_TPS_LO = 16.0), so 20 ticks can legitimately take up to
+     * 20/16 = 1.25s of real time under load, before any scheduling or gate
+     * round-trip overhead on top. 1600ms measured too tight and this check
+     * went red on ordinary WSL scheduling jitter, not a real regression;
+     * 2500ms keeps that same margin.
+     *
+     * This loop skips, rather than fails on, any packet that is not the
+     * TIME_SYNC we are waiting for. Diagnosed by inlining a raw envelope dump
+     * here: chronos never sends a single CHUNK_SUB (this test has no reason
+     * to), so BS_CHUNK_LEGACY_GRACE_MS after its own join (500 ms -- see that
+     * constant in bsgame.c) tick()'s legacy fallback correctly fires it one
+     * unrequested full BS_APP_WORLD_SYNC dump. That is pre-existing, intended
+     * behaviour for any client that never subscribes to chunks (see
+     * BS_CHUNK_LEGACY_GRACE_MS's own comment in bsgame.c) -- unrelated to the
+     * day/night feature and not something this test should treat as a
+     * failure. recv_app_skip_gen() is not reused here because it already
+     * skips BS_APP_TIME_SYNC itself (the exact packet this wait is for), so a
+     * type-check that keeps everything except TIME_SYNC is written out
+     * directly instead of adding a third hardcoded type to that shared
+     * helper for what only this one test needs.
+     *
+     * `wide`, not `out`, is the receive buffer here: recv_app_for() returns
+     * -1 -- indistinguishable from a real timeout -- when a packet arrives
+     * that is too big for the caller's buffer, and it has already consumed
+     * that datagram off the socket by the time it tells you so. The legacy
+     * WORLD_SYNC above is exactly such an oversized, unwanted packet; with
+     * `out`'s 64 bytes as the receive buffer it would silently end this wait
+     * right there instead of being skipped. BS_MAX_PAYLOAD is the largest any
+     * single application payload can legally be. */
+    uint64_t deadline = now_ms() + 2500;
+    uint8_t wide[BS_MAX_PAYLOAD];
+    ssize_t n2 = -1;
+    for (;;) {
+        uint64_t now = now_ms();
+        if (now >= deadline) { n2 = -1; break; }
+        n2 = recv_app_for(0x71A50001u, wide, sizeof wide, (unsigned)(deadline - now));
+        if (n2 < 0 || wide[0] == BS_APP_TIME_SYNC) break;
+    }
+    check(n2 == (ssize_t)BS_TIME_SYNC_BYTES && wide[0] == BS_APP_TIME_SYNC,
+          "a second TIME_SYNC arrives roughly a second later, unprompted");
+    if (n2 == (ssize_t)BS_TIME_SYNC_BYTES) {
+        uint64_t periodic_ticks = bs_get_u64(wide + 1);
+        check(periodic_ticks > join_ticks,
+              "and its counter is strictly larger — the clock is really advancing, not"
+              " repeating a stale value");
+    }
+}
+
+/* Proves day_time.txt actually survives a restart -- the task's persistence
+ * requirement. Placed at the very end of main()'s sequence, after every
+ * other scenario that restarts the shared --state-dir or cares what a fresh
+ * join's REGISTRY_INFO/world_gen advertises, so this restart cannot disturb
+ * anything that runs after it (nothing does). */
+static void test_day_time_persists_across_restart(void)
+{
+    puts("v1.9.8: day_time.txt survives a restart and the clock resumes, not restarts");
+    drain();
+
+    char path[256];
+    snprintf(path, sizeof path, "%s/day_time.txt", g_dir);
+
+    unsigned long long before = 0;
+    FILE *f = fopen(path, "r");
+    check(f != NULL, "day_time.txt exists before the restart (written at daemon startup)");
+    if (f != NULL) {
+        check(fscanf(f, "%llu", &before) == 1,
+              "day_time.txt holds a plain decimal number an operator can cat");
+        fclose(f);
+    }
+
+    /* day_time_save() (bsgame.c) writes this file once a second, on the same
+     * tickDue(t, TICK_HZ, 0) boundary as the broadcast — give the clock a
+     * full beat so the on-disk value has demonstrably moved since the read
+     * above, proving the periodic save is real and not a one-time mint. */
+    msleep(1100);
+
+    stop_daemon();
+
+    unsigned long long at_shutdown = 0;
+    f = fopen(path, "r");
+    check(f != NULL, "day_time.txt still exists right after shutdown");
+    if (f != NULL) {
+        check(fscanf(f, "%llu", &at_shutdown) == 1, "and still holds a number");
+        fclose(f);
+    }
+    check(at_shutdown > before,
+          "the on-disk counter advanced during the run — day_time_save() is not a one-time mint");
+
+    start_daemon();
+    if (!wait_ready(5000)) { fprintf(stderr, "test: restarted daemon never became ready\n"); exit(1); }
+    drain();
+
+    uint8_t out[64];
+    send_join(0xDA790002u, "resumed");
+    ssize_t n = recv_app_for(0xDA790002u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_WORLD_INFO_BYTES && out[0] == BS_APP_WORLD_INFO,
+          "day/night restart probe: WORLD_INFO leads");
+    (void)recv_world_gen(0xDA790002u, 500);
+    (void)recv_registry_info(0xDA790002u, 500);
+    n = recv_app_for(0xDA790002u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_INV_STATE_BYTES && out[0] == BS_APP_INV_STATE,
+          "day/night restart probe: INV_STATE next");
+    n = recv_app_for(0xDA790002u, out, sizeof out, 500);
+    check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
+          "day/night restart probe: PLAYER_STATE next");
+
+    n = recv_app_for(0xDA790002u, out, sizeof out, 500);
+    const bool shaped = (n == (ssize_t)BS_TIME_SYNC_BYTES && out[0] == BS_APP_TIME_SYNC);
+    check(shaped, "TIME_SYNC rides last in the post-restart join burst too");
+    if (!shaped) return;
+
+    uint64_t resumed_ticks = bs_get_u64(out + 1);
+    check(resumed_ticks >= at_shutdown,
+          "the clock resumes at or after where it was saved — a restart never rewinds the"
+          " calendar (day_time_load() never returns less than what was on disk)");
+}
+
 /* ------------------------------------------------------------------- main */
 
 static void reap_daemon(void)
@@ -3328,6 +3563,13 @@ int main(void)
      * REGISTRY_INFO advertises. */
     test_registry_fetch_empty_reply();
     test_registry_fetch_batches_over_36_defs();
+
+    /* v1.9.8, day/night clock: last of all. test_day_time_persists_across_restart
+     * restarts the shared --state-dir one more time, which would upset any
+     * later scenario that cares what a fresh join's REGISTRY_INFO or
+     * world_gen declares — nothing after this point does. */
+    test_time_sync_on_join_and_periodic();
+    test_day_time_persists_across_restart();
 
     stop_daemon();
 
