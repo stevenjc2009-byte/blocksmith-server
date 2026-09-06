@@ -691,9 +691,56 @@ static uint32_t g_seen_seed = 0;
  * MOVED WITH THIS RELEASE, as v1.9.4 did: test_inv_pickup_undefined_core_id_refused()'s literal
  * goes 38 -> 43, because id 38 is now BLOCK_COOKED_PORKCHOP and that test's whole premise is an
  * id that is NOT defined. 43 is what the probe's first-undefined-core-id line above reports --
- * read off the table, not inferred from the count. */
-#define BS_REGISTRY_CORE_COUNT_GOLDEN 43u
-#define BS_REGISTRY_CORE_CRC16_GOLDEN 0xE486u
+ * read off the table, not inferred from the count.
+ *
+ * MOVED AN EIGHTH TIME 2026-09-05, 0xE486 -> 0x2A61, by the client's v1.9.0 "Storage", which
+ * appends ONE core row -- the chest at id 43. registryCount() moves 43 -> 44, the same shape as
+ * every move above: one record APPENDED, nothing renumbered. The client's block.h carries a
+ * _Static_assert(BLOCK_CHEST == 43) saying so in as many words.
+ *
+ * FULL_CUBE and SOLID like the furnace before it, hardness 40 -- matching BLOCK_PLANKS exactly,
+ * because it is crafted from planks, the same argument the furnace's row makes for stone. Its
+ * tex0 is 9 (BTEX_PLANKS): five of six faces reuse plank art and only FACE_TOP carries the one
+ * new tile, atlas slot 57.
+ *
+ * Measured the same way as every move above -- a probe (chest_crc_probe.c) linking registry.c
+ * alone, no test file, so the golden below is not reachable from the binary being measured.
+ * Compiled and run TWICE, once against the client's source/world/registry.c and once against
+ * this repo's own game/world/registry.c after tools/sync-world-sources.sh ran (it reported
+ * block.h and registry.c `synced` and the other nine `unchanged`; `cmp` on the two registry.c
+ * files then reported them identical). Both arms printed
+ *
+ *     count=44 crc=0x2A61 rev=1
+ *     id=40 name=cooked_chicken  hardness=  3 flags=0x01 tex0=44
+ *     id=41 name=cooked_mutton   hardness=  5 flags=0x01 tex0=45
+ *     id=42 name=furnace         hardness= 45 flags=0x01 tex0= 3
+ *     id=43 name=chest           hardness= 40 flags=0x01 tex0= 9
+ *
+ * The lockstep rule points the same way as v1.8.15 and for the same reason: the chest is a
+ * defined block a v1.8.20 client has never heard of, so the SERVER SHIPS FIRST. A v1.8.20
+ * client joining this server fails registryMatchesInfo() on both halves and refuses the join,
+ * which is loud and recoverable; the reverse is silent, because the client degrades an id the
+ * server does not define down to air, so the player would watch chests disappear and be told
+ * nothing. BS_PROTO_VERSION stays 1 -- no transport packet type changed. REGISTRY_REV stays 1
+ * -- appending a row is not a change in the MEANING of existing fields.
+ *
+ * ⚠ THE CHEST'S CONTENTS ARE NOT COVERED BY ANY OF THIS. This row makes the server agree with
+ * the client about what block id 43 IS, which is all a registry row ever does. The server has
+ * no BlockStateTable and no chest store, so a chest placed on a server is a shared block with
+ * per-client contents until the opcodes in the client's docs/design-1.9.0-chest-multiplayer.md
+ * are built here. Shipping the row without them is deliberate and is the lockstep rule working
+ * as intended -- it is what lets the client's capability gate see an old server -- but it must
+ * not be mistaken for chest support.
+ *
+ * MOVED WITH THIS RELEASE, as v1.9.4 and v1.9.5 did:
+ * test_inv_pickup_undefined_core_id_refused()'s literal goes 43 -> 44, because id 43 is now
+ * BLOCK_CHEST and that test's whole premise is an id that is NOT defined. This one did NOT rot
+ * silently the way that function's own comment warns it can: id 43 is holdable, so the pickup
+ * was applied and `the undefined id was never applied` went red. It went red as one of exactly
+ * three failures in the run ("FAIL 337 checks, 3 failed"), the other two being the two goldens
+ * above -- which is the control that says the suite noticed the row rather than absorbing it. */
+#define BS_REGISTRY_CORE_COUNT_GOLDEN 44u
+#define BS_REGISTRY_CORE_CRC16_GOLDEN 0x2A61u
 #define BS_REGISTRY_REV_GOLDEN        1u
 
 static void test_registry_core_pinned_to_golden(void)
@@ -701,9 +748,9 @@ static void test_registry_core_pinned_to_golden(void)
     puts("registry: the core table matches a pinned golden, not only itself");
     registryInitCore();
     check(registryCount() == BS_REGISTRY_CORE_COUNT_GOLDEN,
-          "core-only registryCount() matches the pinned golden 43");
+          "core-only registryCount() matches the pinned golden 44");
     check(registryCrc16() == BS_REGISTRY_CORE_CRC16_GOLDEN,
-          "core-only registryCrc16() matches the pinned golden 0xE486");
+          "core-only registryCrc16() matches the pinned golden 0x2A61");
     check(REGISTRY_REV == BS_REGISTRY_REV_GOLDEN,
           "REGISTRY_REV matches the pinned golden 1");
 }
@@ -2114,14 +2161,14 @@ static void test_inv_pickup_out_of_range_item_refused(void)
  * first-undefined-core-id line rather than inferred, so the premise is measured, not assumed. */
 static void test_inv_pickup_undefined_core_id_refused(void)
 {
-    puts("end-to-end: PICKUP of an undefined core id (43, one past the golden count) is refused, not kicked");
+    puts("end-to-end: PICKUP of an undefined core id (44, one past the golden count) is refused, not kicked");
     drain();
 
     send_join(0xF2A50011u, "nadia");
     msleep(100);
     drain();
 
-    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 43, 1, 0);
+    send_inv_action(0xF2A50011u, BS_INV_OP_PICKUP, 44, 1, 0);
 
     uint8_t out[64];
     ssize_t n = recv_app_for(0xF2A50011u, out, sizeof out, 500);

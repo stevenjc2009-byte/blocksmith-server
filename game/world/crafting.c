@@ -154,13 +154,53 @@ const CraftRecipe CRAFT_RECIPES[RECIPE_COUNT] = {
 		.output_item = BLOCK_TORCH, .output_count = 4,
 	},
 	// Appended at the END of the enum on purpose: net/bsgame.c indexes recipes by their
-	// position over the wire (bsgame.c:1332 bounds an incoming index against RECIPE_COUNT),
-	// so inserting this anywhere but last would silently renumber every recipe above it and
-	// leave an old client crafting the wrong thing against a new server.
+	// position over the wire (game/bsgame.c:1609, `if (a < RECIPE_COUNT) changed =
+	// craftMake(&p->inv, a);`, bounds an incoming index against RECIPE_COUNT), so inserting
+	// this anywhere but last would silently renumber every recipe above it and leave an old
+	// client crafting the wrong thing against a new server. v1.9.0 "Storage" appends
+	// RECIPE_PLANKS_TO_CHEST below this row for the identical reason — this stopped being the
+	// last recipe the moment that row landed, but it WAS the last one when this paragraph was
+	// written, and the discipline it describes is exactly what put the chest recipe after it
+	// rather than between it and RECIPE_COAL_ORE_TO_TORCH.
 	[RECIPE_STONE_TO_FURNACE] = {
 		.name = "Stone -> Furnace",
 		.input_item = BLOCK_STONE, .input_count = 8,
 		.output_item = BLOCK_FURNACE, .output_count = 1,
+	},
+	// ── v1.9.0 "Storage": 6 planks -> 1 chest ────────────────────────────────────────────
+	//
+	//   Same reachability argument as RECIPE_STONE_TO_FURNACE above, checked the same way —
+	//   by asking where blocks enter the bag, not by playing. BLOCK_CHEST (world/block.h, id
+	//   43) has a registry row, an atlas top/front tile pair and a hardness matching
+	//   BLOCK_PLANKS (world/registry_test.c), but nothing in worldgen.c places one and no
+	//   entity drops one, so of this game's three routes into an inventory — worldgen,
+	//   entity drop, and the crafting/withdraw path in scene/ui.c — only the third could ever
+	//   hand a player a chest. Before this row landed it did not, which is the same
+	//   "unreachable" failure the furnace paragraph above documents for BLOCK_FURNACE.
+	//
+	//   BLOCK_PLANKS as the input rather than BLOCK_WOOD is not a free choice: the chest's own
+	//   registry row textures every face from the planks tile (docs/plan-1.9.0-storage-qol.md
+	//   §3.1, "a chest is built from planks", and its hardness is pinned equal to
+	//   BLOCK_PLANKS's for the identical reason), so a wood-input recipe would let a player
+	//   own a plank-textured, plank-hardness block that never passed through the one recipe
+	//   that actually turns a log into planks — the wrong material would be "spent" for what
+	//   the block visibly and mechanically is.
+	//
+	//   Six is docs/plan-1.9.0-storage-qol.md §3.6's settled number, carried over unchanged:
+	//   deliberately NOT eight (real Minecraft's ring-shaped chest recipe), because that shape
+	//   needs a multi-slot grid this file's header already rejected once for the whole game —
+	//   re-opening a "should crafting be shaped" question for one block is out of scope for a
+	//   single recipe. That document is explicit that six is "a round, modest number," not a
+	//   value derived from anything else in the table, which this recipe accepts as its
+	//   justification rather than inventing a false one after the fact: it sits below the
+	//   furnace's 8 (a chest is a smaller project than a whole cooking system) and above
+	//   RECIPE_WOOD_TO_PLANKS's 1 and RECIPE_COAL_ORE_TO_TORCH's 1 (a chest is not a per-unit
+	//   conversion, it is a finished piece of furniture built from several units), which is
+	//   the only ordering this table's existing rows actually constrain.
+	[RECIPE_PLANKS_TO_CHEST] = {
+		.name = "Planks -> Chest",
+		.input_item = BLOCK_PLANKS, .input_count = 6,
+		.output_item = BLOCK_CHEST, .output_count = 1,
 	},
 };
 

@@ -250,6 +250,16 @@ enum {
 	BLOCK_COOKED_CHICKEN  = 40,
 	BLOCK_COOKED_MUTTON   = 41,
 	BLOCK_FURNACE         = 42,
+	// v1.9.0 "Storage": the chest. A literal, for the same reason as every id above it; the
+	// WARNING note at the top of this comment block applies unchanged — do NOT tidy this
+	// into BLOCK_COUNT + n.
+	//
+	// FULL_CUBE and SOLID, crafted from planks: world/registry.c's row gives it hardness 40,
+	// matching BLOCK_PLANKS exactly, for the identical reason the furnace matches stone.
+	// docs/decision-1.9.0-chest-storage.md settles where its contents live (the shared
+	// world/blockstate.h table, not a dedicated one); this id is only the block, not the
+	// state.
+	BLOCK_CHEST           = 43,
 };
 _Static_assert(BLOCK_COUNT == 8,
                "BLOCK_COUNT is the closed first item span and is written into every shipped "
@@ -286,6 +296,10 @@ _Static_assert(BLOCK_COOKED_PORKCHOP == 38 && BLOCK_COOKED_BEEF == 39 &&
                "v1.8.15's cooked meat and furnace ids are written into saved chunks, into "
                "block-edit packets and into every inventory slot on an SD card the moment a "
                "server ships them; they must never move");
+_Static_assert(BLOCK_CHEST == 43,
+               "v1.9.0's chest id is written into saved chunks, into block-edit packets and "
+               "into every inventory slot on an SD card the moment a server ships it; it "
+               "must never move");
 
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
@@ -359,6 +373,21 @@ enum {
 	BTEX_COOKED_MUTTON,
 	BTEX_FURNACE_FRONT,
 	BTEX_FURNACE_FRONT_LIT,
+	// v1.9.0 "Storage", atlas slot 57. One new tile, not two: unlike the furnace this block
+	// carries no running/idle visual state, so there is no lit/unlit pair to reserve a
+	// second slot for. It goes on FACE_TOP rather than on a side face (the furnace's choice,
+	// FACE_SOUTH) so the chest's inventory icon — which every full-cube block in this game
+	// draws from its own top face — has a shape of its own instead of reading as plain
+	// BTEX_STONE the way the furnace's icon does (world/registry.c's furnace row leaves
+	// tex[FACE_TOP] at BTEX_STONE; this row deliberately does not repeat that).
+	//
+	// NOT auto-incremented from BTEX_FURNACE_FRONT_LIT: that would give it 48, which collides
+	// with ITEM_ICON_APPLE (source/gfx/item_icons.h) — the v1.8.16 icon carve-out already
+	// claims 48..56, so there has been no free slot directly after 47 since then. This
+	// explicitly claims 57, the first slot free after the nine item icons, matching
+	// gfx/atlas_tiles.h's TILE_CHEST_TOP = 57 exactly — world/block_tiles_check.c's
+	// _Static_assert fails the build the moment these two numbers disagree.
+	BTEX_CHEST_TOP = 57,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

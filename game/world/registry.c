@@ -778,6 +778,26 @@ static const BlockDef kCoreDefs[REG_ID_DYN_LO] = {
 		.flags = REG_FLAG_SOLID,
 		.hardness = 45,
 	},
+	// v1.9.0 "Storage": the chest. FULL_CUBE and SOLID like the furnace, but built from
+	// planks rather than stone: .hardness matches BLOCK_PLANKS exactly, because it is
+	// crafted from planks and there is no stated reason it should be tougher or softer than
+	// the material it is made of — the same argument the furnace's own comment makes for
+	// stone.
+	//
+	// tex[] reuses BTEX_PLANKS on five of six faces; only FACE_TOP carries new art
+	// (BTEX_CHEST_TOP). FACE_TOP rather than the furnace's FACE_SOUTH because a chest has
+	// no "front" this build assigns any meaning to, and putting the distinct art on top is
+	// also what makes it double as the inventory icon — see world/block.h's BTEX_CHEST_TOP
+	// comment for the full reasoning. Contents (what the block holds, not what it looks
+	// like) live in the shared world/blockstate.h table per
+	// docs/decision-1.9.0-chest-storage.md — nothing about that is this row's concern.
+	[43] = { // chest — atlas slot 57
+		.name  = "chest",
+		.tex   = { BTEX_PLANKS, BTEX_PLANKS, BTEX_CHEST_TOP,
+		           BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 40,
+	},
 };
 
 // The table itself. s_defs holds the authoritative bytes; s_view is the derived

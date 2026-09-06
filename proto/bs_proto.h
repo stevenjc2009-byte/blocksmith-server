@@ -556,7 +556,7 @@ static inline int32_t bs_col_of(int32_t block_coord)
 #define BS_INV_SLOT_COUNT   24u   /* mirrors INV_SLOT_COUNT   */
 #define BS_INV_HOTBAR_SLOTS  8u   /* mirrors INV_HOTBAR_SLOTS */
 #define BS_INV_STACK_MAX    99u   /* mirrors INV_STACK_MAX    */
-#define BS_RECIPE_COUNT      6u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+#define BS_RECIPE_COUNT      7u   /* mirrors RECIPE_COUNT (world/crafting.h) */
 
 /* 4u -> 5u on 2026-09-03, client v1.8.12's RECIPE_COAL_ORE_TO_TORCH (one coal ore -> four
  * torches). Bumped here and not by tools/sync-world-sources.sh, because this file is NOT one
