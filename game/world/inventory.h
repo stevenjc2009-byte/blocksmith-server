@@ -336,6 +336,23 @@ bool inventorySplitStack(Inventory* inv, int slot, int dst);
 // selection pointing outside the hotbar.
 void inventorySelectHotbar(Inventory* inv, uint8_t hotbar_slot);
 
+// v1.9.0 HOTBAR-LR. The slot one step from `sel` in direction `dir`, wrapping at both ends of
+// the hotbar: one on from the last slot is slot 0, one back from slot 0 is the last slot. `dir`
+// is a DIRECTION, not a count — any negative value is one step back, any positive value one
+// step on, and 0 answers `sel` itself — so no caller can come to rely on +2 meaning two.
+//
+// Pure: it writes nothing and takes no Inventory. That is deliberate. main.c's L/R shoulder
+// buttons compute their target here and hand it to the one call the touchscreen hotbar tap
+// already makes (net/inv_bridge.h's invBridgeSelectHotbar, via scene/ui.c's
+// handleHotbarSelect), so the two controls share a single write to selected_hotbar, a single
+// clamp, and a single BS_INV_OP_SELECT to the server — rather than the buttons growing a
+// second write path this file would then have to keep in step with the first.
+//
+// An out-of-range `sel` is clamped to the last hotbar slot before stepping, the same rule
+// inventorySelectHotbar applies on the way in, so the answer is a real hotbar slot whatever
+// was passed.
+uint8_t inventoryHotbarStep(uint8_t sel, int dir);
+
 // What the player is currently holding — ITEM_NONE if the selected hotbar slot is empty.
 // This is what feeds scene/interact.h's Interact.holding every frame.
 ItemId  inventoryHeldItem(const Inventory* inv);

@@ -380,7 +380,44 @@ enum bs_app_msg {
      * where the value comes from and how often it goes out: once on JOIN, so
      * a player who arrives at dusk arrives at dusk, and once a second after
      * that. */
-    BS_APP_TIME_SYNC      = 0x10  /* S->C only: {ticks u64 LE}.                  */
+    BS_APP_TIME_SYNC      = 0x10, /* S->C only: {ticks u64 LE}.                  */
+
+    /* ---- chests (client v1.9.0 / server v1.9.10) ---------------------------
+     *
+     * Three opcodes, and the first of them exists so that the third can be
+     * added SAFELY. handle_app_payload() kicks on an opcode it does not know,
+     * so a client that sends BS_APP_CHEST_ACTION to a server older than this
+     * gets disconnected. The fix is not a protocol-version bump -- that would
+     * make every new client refuse every old server for one feature -- it is
+     * a capability bitfield the server announces once at join, and the client
+     * never sends CHEST_ACTION unless BS_CAP_CHESTS was in it. A new client on
+     * an old server never receives SERVER_CAPS at all, which reads as caps = 0,
+     * which is exactly the right answer.
+     *
+     * Bits 1..31 of caps are reserved: a client must IGNORE bits it does not
+     * know, never validate them, so an old client meeting a newer server does
+     * not care about capabilities it has never heard of.
+     *
+     * Positions are {x i32, y i32, z i32} in that order, matching
+     * BS_APP_BLOCK_EDIT exactly, so the server range-checks a chest position
+     * through the same bsEditValid() it already trusts for block edits rather
+     * than a second function written to agree with it.
+     *
+     * CHEST_STATE is a whole-chest snapshot, never a delta -- the same posture
+     * as BS_APP_INV_STATE, for the same reason: a snapshot cannot desync, and
+     * at 29 bytes a delta buys a class of bug and saves nothing worth having.
+     * The client never applies a chest mutation optimistically; it sends
+     * CHEST_ACTION and waits for the snapshot. Optimistic application is the
+     * other half of the duplication bug (two clients each taking the same
+     * stack and each believing it), so the verified model is used: both ends
+     * of a chest transfer are server-resident state, and the server checks
+     * the units exist before it moves them. See docs/design-1.9.0-chest-
+     * multiplayer.md in the client tree. */
+    BS_APP_SERVER_CAPS    = 0x11, /* S->C only: {caps u32 LE}. Once, at join.     */
+    BS_APP_CHEST_STATE    = 0x12, /* S->C only: {x i32, y i32, z i32,
+                                   *             (item u8, count u8) x BS_CHEST_SLOTS} */
+    BS_APP_CHEST_ACTION   = 0x13  /* C->S only, gated on BS_CAP_CHESTS:
+                                   * {op u8, x i32, y i32, z i32, a u8, b u8, count u8} */
 };
 
 /* Why INV_STATE is sent unprompted, and why the client must never open with
@@ -543,6 +580,42 @@ static inline int32_t bs_col_of(int32_t block_coord)
  * cannot tell "reserved, ignore" from "a field I have never heard of", so
  * widening this later means a new message type, not a bigger one. */
 #define BS_TIME_SYNC_BYTES (BS_APP_HDR_BYTES + 8u)                    /* 9 */
+
+/* ---- chests --------------------------------------------------------------
+ *
+ * BS_CHEST_SLOTS restates CHEST_SLOTS from the client's world/chest.h, the way
+ * BS_INV_SLOT_COUNT below restates INV_SLOT_COUNT and for the same reason:
+ * chest.h is deliberately NOT one of the eleven files tools/sync-world-sources.sh
+ * mirrors (the server keeps its own 8-slot record, matching the wire layout
+ * exactly, rather than importing a module whose only job on this side would
+ * be pack/unpack to a client-private on-disk format). The client's chest
+ * bridge static-asserts BS_CHEST_SLOTS == CHEST_SLOTS; if the two ever
+ * disagree the client build fails, which is the loud failure wanted.
+ *
+ * Item ids travel as one byte. BS_BLOCK_COUNT is 44 and the ceiling is 255;
+ * the day an ItemId no longer fits in a byte, this is a new message, not a
+ * wider one -- same strict-length posture as every *_BYTES above. */
+#define BS_CHEST_SLOTS 8u   /* mirrors CHEST_SLOTS (world/chest.h) */
+
+/* Capability bits carried by BS_APP_SERVER_CAPS. Bit 0 only, for now. */
+#define BS_CAP_CHESTS  (1u << 0)
+
+/* The one requested transfer a CHEST_ACTION carries. Slot indices are the
+ * INVENTORY's for the inventory side and the CHEST's for the chest side;
+ * `count` is units, 1..BS_INV_STACK_MAX. The server refuses, silently and
+ * without a kick, anything that does not validate: an unknown op, a position
+ * holding no chest, a slot out of range, more units than the source holds, a
+ * destination that holds a different item. A refusal produces no CHEST_STATE
+ * -- the client's screen simply does not change, which is how a refused
+ * INV_ACTION already reads. */
+enum {
+    BS_CHEST_OP_DEPOSIT  = 0x00, /* a = item id (src),        b = chest slot (dst)  */
+    BS_CHEST_OP_WITHDRAW = 0x01  /* a = chest slot (src),     b = inventory slot (dst) */
+};
+
+#define BS_SERVER_CAPS_BYTES  (BS_APP_HDR_BYTES + 4u)                          /* 5 */
+#define BS_CHEST_STATE_BYTES  (BS_APP_HDR_BYTES + 4u * 3u + BS_CHEST_SLOTS * 2u) /* 29 */
+#define BS_CHEST_ACTION_BYTES (BS_APP_HDR_BYTES + 1u + 4u * 3u + 1u + 1u + 1u)  /* 17 */
 
 /* ---- inventory ----------------------------------------------------------
  *

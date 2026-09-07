@@ -169,6 +169,18 @@ void inventorySelectHotbar(Inventory* inv, uint8_t hotbar_slot)
 	inv->selected_hotbar = hotbar_slot;
 }
 
+uint8_t inventoryHotbarStep(uint8_t sel, int dir)
+{
+	if (sel >= INV_HOTBAR_SLOTS) sel = INV_HOTBAR_SLOTS - 1;   // same clamp as the setter
+	// Sign only, so the arithmetic below cannot overflow for any int a caller might pass and
+	// the header's "a direction, not a count" contract holds by construction.
+	const int step = (dir > 0) - (dir < 0);                    // -1, 0 or +1
+	int next = (int)sel + step;
+	if (next < 0)                 next = INV_HOTBAR_SLOTS - 1;  // L off slot 0 lands on the last
+	if (next >= INV_HOTBAR_SLOTS) next = 0;                     // R off the last lands on slot 0
+	return (uint8_t)next;
+}
+
 ItemId inventoryHeldItem(const Inventory* inv)
 {
 	if (!inv) return ITEM_NONE;

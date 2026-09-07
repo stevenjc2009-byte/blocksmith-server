@@ -29,6 +29,7 @@
 
 #include "../proto/bs_gamelink.h"  /* enum bs_game_msg — the gate<->game framing this suite speaks */
 #include "../proto/bs_proto.h"
+#include "cheststore.h"   /* v1.9.10: the transfer rules and chests.bin, exercised in-process */
 #include "players.h"   /* BS_EDIT_BURST / BS_EDIT_REFILL_MS, for the rate-limit ceiling */
 #include "playerstate.h"  /* BS_PLAYER_STATE_BODY_BYTES, for the player.dat fixtures */
 #include "validate.h"  /* BS_BLOCK_COUNT, for the highest-legal-core-block-id boundary test */
@@ -878,6 +879,47 @@ static ssize_t recv_app_skip_gen(uint32_t sid, uint8_t *out, size_t cap, unsigne
     }
 }
 
+/* v1.9.10. Reads the BS_APP_SERVER_CAPS that now closes every join burst.
+ *
+ * This helper is a REPAIR as much as it is coverage. send_server_caps()
+ * (bsgame.c) was added to the tail of handle_join(), one packet behind
+ * TIME_SYNC, and the burst readers in this file were not told: the skip above
+ * discards WORLD_GEN and TIME_SYNC and nothing else, and
+ * join_expect_registry_sequence() stopped counting at TIME_SYNC. Four checks
+ * went red as a result — the legacy WORLD_SYNC wait in
+ * test_join_sends_world_info_then_sync() caught SERVER_CAPS instead, and both
+ * registry FETCH scenarios read it where they expected a DEFS batch. The
+ * daemon is right and the suite was stale; consuming the packet HERE, with
+ * assertions on it, is the fix that does not make the extra packet invisible.
+ *
+ * Read through recv_app_skip_gen rather than recv_app_for because the two
+ * callers arrive here differently: join_expect_registry_sequence() has just
+ * consumed the burst's TIME_SYNC explicitly, and
+ * test_join_sends_world_info_then_sync() reads the whole burst with the skip
+ * and so has not. That costs no strictness — SERVER_CAPS's position behind
+ * TIME_SYNC is pinned in the caller that cares about it, by the TIME_SYNC
+ * check standing immediately in front of this call. */
+static bool recv_server_caps(uint32_t sid, unsigned ms)
+{
+    uint8_t out[64];
+    memset(out, 0, sizeof out);
+    unsigned skipped = 0;
+    const ssize_t n = recv_app_skip_gen(sid, out, sizeof out, ms, &skipped);
+
+    const bool shaped = (n == (ssize_t)BS_SERVER_CAPS_BYTES && out[0] == BS_APP_SERVER_CAPS);
+    check(shaped, "v1.9.10: SERVER_CAPS closes the join burst, behind the state packets, exactly"
+                  " BS_SERVER_CAPS_BYTES long");
+    if (!shaped) return false;
+
+    check((bs_get_u32(out + 1) & BS_CAP_CHESTS) != 0,
+          "and it advertises BS_CAP_CHESTS — this build keeps chest contents server-side, so a"
+          " client may open one");
+    check(out[1] == 0x01 && out[2] == 0x00 && out[3] == 0x00 && out[4] == 0x00,
+          "the caps word is little-endian on the wire: the four bytes are {0x01, 0x00, 0x00,"
+          " 0x00}, checked without going through bs_get_u32");
+    return true;
+}
+
 /* v1.9.0. How many BS_APP_WORLD_GEN datagrams one join must put on the wire:
  * the join burst's own, plus bsgame.c's BS_WORLD_GEN_RESENDS.
  *
@@ -1042,6 +1084,13 @@ static void test_join_sends_world_info_then_sync(void)
     n = recv_app_skip_gen(0xA11CE001u, out, sizeof out, 500, &gen_skipped);
     check(n == (ssize_t)BS_PLAYER_STATE_BYTES && out[0] == BS_APP_PLAYER_STATE,
           "JOIN's fourth packet is the PLAYER_STATE capability probe");
+
+    /* v1.9.10: and SERVER_CAPS closes the burst behind it. Consumed here for
+     * the same reason PLAYER_STATE is consumed above — recv_app_skip_gen()
+     * does not skip it, so the legacy-WORLD_SYNC wait below would otherwise
+     * catch it and fail on a type mismatch that has nothing to do with what
+     * this scenario is about. (It did, until this line went in.) */
+    (void)recv_server_caps(0xA11CE001u, 500);
 
     n = recv_app_skip_gen(0xA11CE001u, out, sizeof out,
                           BS_CHUNK_LEGACY_GRACE_MS + 400u, &gen_skipped);
@@ -3205,7 +3254,15 @@ static void join_expect_registry_sequence(uint32_t sid, const char *label)
      * REGISTRY_DEFS reply. */
     n = recv_app_for(sid, out, sizeof out, 500);
     check(n == (ssize_t)BS_TIME_SYNC_BYTES && out[0] == BS_APP_TIME_SYNC,
-          "registry probe: TIME_SYNC rides last in the burst");
+          "registry probe: TIME_SYNC rides behind PLAYER_STATE");
+
+    /* v1.9.10. SERVER_CAPS is now the last packet of the burst, behind
+     * TIME_SYNC, and it has to be consumed here for the same reason TIME_SYNC
+     * is: the FETCH exchanges that call this helper read their REGISTRY_DEFS
+     * reply with recv_app_for(), which filters by session and not by type, so
+     * a leftover packet is handed to them in its place. Three checks in the
+     * two FETCH scenarios below failed exactly that way before this line. */
+    (void)recv_server_caps(sid, 500);
 }
 
 /* FETCH is a C->S message no client has ever sent before this suite — the
@@ -3500,6 +3557,2109 @@ static void test_day_time_persists_across_restart(void)
           " calendar (day_time_load() never returns less than what was on disk)");
 }
 
+/* ------------------------------------------------------------ v1.9.10: chests
+ *
+ * Two halves, deliberately.
+ *
+ * The first half is IN-PROCESS against game/cheststore.c, which this binary
+ * already links (game/Makefile's bsgame_test rule). cheststore.h says in as
+ * many words that the module is "plain C with no network or logging
+ * dependency, so the transfer rules and the file format can be exercised by
+ * host tests rather than trusted" — this is that. Every rule the header
+ * states about room, merge, refusal, withdrawal, capacity and the on-disk
+ * mirror is checked here, where a wrong answer is one function call away from
+ * its cause instead of six packets away.
+ *
+ * The second half is END-TO-END through the real daemon, and it exists
+ * because the interesting v1.9.10 behaviour is NOT in cheststore.c. It is in
+ * bsgame.c's chest_action_apply(): that a chest action is gated on the diff
+ * store actually holding BLOCK_CHEST at the position, that a refusal is
+ * SILENT and never a kick even though handle_app_payload() kicks unknown
+ * types, that an accepted transfer broadcasts one CHEST_STATE to everyone,
+ * and that a BLOCK_EDIT which replaces a chest takes its contents with it.
+ * None of those can be seen from inside cheststore.c.
+ *
+ * Placed last in main(), after the day/night restart, for the reason that
+ * scenario's own comment gives: nothing after this point cares what a fresh
+ * join's REGISTRY_INFO or world_gen advertises, and these scenarios place
+ * blocks and would otherwise be one more thing every later test is standing
+ * on. Positions are all in an x band of 5000+ that nothing earlier touches.
+ */
+
+/* The chest block's id in the vendored registry (game/world/block.h asserts
+ * BLOCK_CHEST == 43). A literal with the name in a comment, the way every
+ * other block id in this file is written: this suite speaks the wire, and on
+ * the wire a block id is a byte. */
+#define BSGAME_TEST_BLOCK_CHEST 43u
+
+/* game/cheststore.c's own BS_CHEST_REC_BYTES, which is private to that
+ * translation unit. Restated as a literal on purpose — computing it from
+ * BS_CHEST_STATE_BYTES here would agree with the implementation no matter
+ * what either became, which is the failure BSGAME_TEST_WORLD_GEN's comment
+ * above describes. 12 bytes of position plus 8 x (item, count). */
+#define BSGAME_TEST_CHEST_REC_BYTES 28u
+
+static void send_chest_action(uint32_t sid, uint8_t op, int32_t x, int32_t y, int32_t z,
+                              uint8_t a, uint8_t b, uint8_t count)
+{
+    uint8_t p[BS_CHEST_ACTION_BYTES];
+    p[0] = BS_APP_CHEST_ACTION;
+    p[1] = op;
+    bs_put_i32(p + 2,  x);
+    bs_put_i32(p + 6,  y);
+    bs_put_i32(p + 10, z);
+    p[14] = a;
+    p[15] = b;
+    p[16] = count;
+    send_app(sid, p, sizeof p);
+}
+
+/* Reads until a BS_APP_CHEST_STATE addressed to `sid` turns up, or `ms`
+ * elapses. Not recv_app_skip_gen(): the players these scenarios join never
+ * send CHUNK_SUB, so BS_CHUNK_LEGACY_GRACE_MS after each join tick() fires
+ * them one unrequested full BS_APP_WORLD_SYNC dump — a packet that is
+ * neither WORLD_GEN nor TIME_SYNC and is far larger than 64 bytes. Both
+ * facts matter: skipping by type is what keeps it out of the way, and the
+ * BS_MAX_PAYLOAD receive buffer is what stops recv_app_for() from returning
+ * -1 (indistinguishable from a timeout) after it has already eaten the
+ * datagram. test_time_sync_on_join_and_periodic() above learned both the
+ * hard way; this is the same repair. */
+static ssize_t recv_chest_state(uint32_t sid, uint8_t *out, size_t cap, unsigned ms)
+{
+    const uint64_t until = now_ms() + ms;
+
+    for (;;) {
+        const uint64_t now = now_ms();
+        if (now >= until) return -1;
+
+        uint8_t wide[BS_MAX_PAYLOAD];
+        const ssize_t n = recv_app_for(sid, wide, sizeof wide, (unsigned)(until - now));
+        if (n < 1) return -1;
+        if (wide[0] != BS_APP_CHEST_STATE) continue;
+        if ((size_t)n > cap) return -1;
+        memcpy(out, wide, (size_t)n);
+        return n;
+    }
+}
+
+/* Slot `slot`'s (item, count) out of a raw BS_APP_CHEST_STATE payload, hand
+ * parsed from the wire bytes exactly as inv_state_slot() does for INV_STATE:
+ * type byte, then x/y/z, then the pairs. */
+static void chest_state_slot(const uint8_t *st, unsigned slot, uint8_t *item, uint8_t *count)
+{
+    *item  = st[BS_APP_HDR_BYTES + 12u + slot * 2u];
+    *count = st[BS_APP_HDR_BYTES + 12u + slot * 2u + 1u];
+}
+
+static bool chest_state_is_empty(const uint8_t *st)
+{
+    for (unsigned i = 0; i < BS_CHEST_SLOTS; i++) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, i, &item, &count);
+        if (item != 0 || count != 0) return false;
+    }
+    return true;
+}
+
+/* Does the snapshot describe the chest at (x, y, z)? Decoded without
+ * bs_get_i32 for the reason recv_world_gen() gives: this suite's own decoder
+ * agreeing with this suite's own encoder proves nothing about what is
+ * actually on the wire. */
+static bool chest_state_at(const uint8_t *st, int32_t x, int32_t y, int32_t z)
+{
+    const int32_t v[3] = { x, y, z };
+    for (unsigned axis = 0; axis < 3; axis++) {
+        const uint32_t u = (uint32_t)v[axis];
+        for (unsigned b = 0; b < 4; b++) {
+            const uint8_t want = (uint8_t)((u >> (8u * b)) & 0xFFu);
+            if (st[BS_APP_HDR_BYTES + axis * 4u + b] != want) return false;
+        }
+    }
+    return true;
+}
+
+/* The silence probe every refusal scenario below rests on, and the reason it
+ * reads RAW envelopes rather than going through recv_app_for(): that helper
+ * folds a KICK into the same -1 a timeout gives, and "refused silently" versus
+ * "disconnected" is the exact distinction bs_proto.h's CHEST_ACTION contract
+ * makes ("refuses, silently and without a kick, anything that does not
+ * validate"). A test that could not tell those apart would stay green if
+ * handle_chest_action() started kicking. */
+static void chest_watch(uint32_t sid, unsigned ms, bool *saw_state, bool *saw_kick)
+{
+    *saw_state = false;
+    *saw_kick  = false;
+    const uint64_t until = now_ms() + ms;
+
+    for (;;) {
+        const uint64_t now = now_ms();
+        if (now >= until) return;
+
+        uint8_t buf[5 + BS_MAX_PAYLOAD];
+        const ssize_t n = gate_recv(buf, sizeof buf, (unsigned)(until - now));
+        if (n < 5) continue;                       /* poll timed out; the deadline decides */
+        if (bs_get_u32(buf + 1) != sid) continue;
+        if (buf[0] == BS_GAME_KICK) *saw_kick = true;
+        if (buf[0] == BS_GAME_DATA && n >= 6 && buf[5] == BS_APP_CHEST_STATE) *saw_state = true;
+    }
+}
+
+/* One BLOCK_EDIT, given time to land. 80 ms is comfortably inside the edit
+ * token bucket (BS_EDIT_BURST 40, one back per BS_EDIT_REFILL_MS 50) for the
+ * handful of placements each scenario makes. */
+static void chest_place_block(uint32_t sid, int32_t x, int32_t y, int32_t z, uint8_t block)
+{
+    send_block_edit(sid, x, y, z, block);
+    msleep(80);
+}
+
+/* Joins a player and swallows the whole welcome burst, so a scenario's first
+ * read is its own CHEST_STATE and not a leftover PLAYER_STATE. */
+static void chest_join(uint32_t sid, const char *label)
+{
+    send_join(sid, label);
+    msleep(150);
+    drain();
+}
+
+/* Total units of `item` across all eight slots of a CHEST_STATE snapshot —
+ * the chest-side twin of inv_state_total(), for the scenarios below that care
+ * about a sum rather than about which slot a unit landed in. */
+static uint32_t chest_state_total(const uint8_t *st, uint8_t item)
+{
+    uint32_t total = 0;
+    for (unsigned i = 0; i < BS_CHEST_SLOTS; i++) {
+        uint8_t it = 0, ct = 0;
+        chest_state_slot(st, i, &it, &ct);
+        if (it == item) total += ct;
+    }
+    return total;
+}
+
+/* recv_chest_state()'s twin for the OTHER half of a chest transfer. Same
+ * skip-by-type loop and the same reason for it: these players sit on the
+ * legacy path, so an unrequested WORLD_SYNC dump and a once-a-second
+ * TIME_SYNC are both in flight around every read. */
+static ssize_t recv_inv_state(uint32_t sid, uint8_t *out, size_t cap, unsigned ms)
+{
+    const uint64_t until = now_ms() + ms;
+
+    for (;;) {
+        const uint64_t now = now_ms();
+        if (now >= until) return -1;
+
+        uint8_t wide[BS_MAX_PAYLOAD];
+        const ssize_t n = recv_app_for(sid, wide, sizeof wide, (unsigned)(until - now));
+        if (n < 1) return -1;
+        if (wide[0] != BS_APP_INV_STATE) continue;
+        if ((size_t)n > cap) return -1;
+        memcpy(out, wide, (size_t)n);
+        return n;
+    }
+}
+
+/* v1.9.10 fix. Puts `count` units of `item` in the player's bag through the
+ * PICKUP path a real client uses for a mined block, and waits for the
+ * INV_STATE that answers it so the units are provably seated before the
+ * caller's first chest action.
+ *
+ * Every DEPOSIT scenario below needs this now, and that is the whole point of
+ * the fix: a deposit is a MOVE out of a bag the server owns, so a deposit of
+ * units the actor does not hold is refused. Before the fix these scenarios
+ * deposited out of thin air and the chest filled up anyway. */
+static void chest_give(uint32_t sid, uint8_t item, uint8_t count)
+{
+    send_inv_action(sid, BS_INV_OP_PICKUP, item, count, 0);
+    uint8_t inv[BS_INV_STATE_BYTES];
+    (void)recv_inv_state(sid, inv, sizeof inv, 700);
+}
+
+/* Reads the player's whole bag back off the wire WITHOUT going through a
+ * chest action: a BS_INV_OP_SELECT is answered with a fresh INV_STATE
+ * unconditionally (handle_inv_action's last line), and selecting a hotbar
+ * slot moves no units.
+ *
+ * Deliberately not "read the INV_STATE the chest action replied with". The
+ * conservation scenario has to be able to weigh the bag even on a build that
+ * sends no INV_STATE after a chest action at all — otherwise the invariant
+ * check would fail as a timeout rather than as a wrong SUM, and a timeout
+ * proves nothing about conservation. */
+static bool chest_bag_read(uint32_t sid, uint8_t *out)
+{
+    send_inv_action(sid, BS_INV_OP_SELECT, 0, 0, 0);
+    return recv_inv_state(sid, out, BS_INV_STATE_BYTES, 700) == (ssize_t)BS_INV_STATE_BYTES;
+}
+
+/* v1.9.10 fix (2026-09-07). chest_give()'s opposite, over the CONSUME path a
+ * real client uses for a placed block, and waits for the INV_STATE that
+ * answers it. The break-refused scenario below needs it to EMPTY a bag it
+ * deliberately filled: "the player can empty their bag and break it again" is
+ * half of what a refusal has to be worth, and a scenario that could only fill
+ * a bag could not measure that half. */
+static void chest_take(uint32_t sid, uint8_t item, uint8_t count)
+{
+    send_inv_action(sid, BS_INV_OP_CONSUME, item, count, 0);
+    uint8_t inv[BS_INV_STATE_BYTES];
+    (void)recv_inv_state(sid, inv, sizeof inv, 700);
+}
+
+/* v1.9.10 fix (2026-09-07). Fills a bag to its very last slot: INV_SLOT_COUNT
+ * stacks of BS_INV_STACK_MAX, all of one item, so inventoryAdd() has neither a
+ * partial stack to merge into nor an empty slot to spill into and REFUSES
+ * everything. Returns the number of units it put in, which is what the caller
+ * then weighs the bag against. */
+static uint32_t chest_fill_bag(uint32_t sid, uint8_t item)
+{
+    for (unsigned i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        chest_give(sid, item, (uint8_t)BS_INV_STACK_MAX);
+    }
+    return (uint32_t)BS_INV_SLOT_COUNT * (uint32_t)BS_INV_STACK_MAX;
+}
+
+static void chest_empty_bag(uint32_t sid, uint8_t item)
+{
+    for (unsigned i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        chest_take(sid, item, (uint8_t)BS_INV_STACK_MAX);
+    }
+}
+
+/* v1.9.10 fix (2026-09-07). Did a BLOCK_EDIT for THIS cell reach `sid` inside
+ * `ms`? The refusal probe: broadcast_block_edit() is the last thing
+ * handle_block_edit() does on an accepted edit, so a watcher on a second,
+ * legacy player (one that has never sent CHUNK_SUB, and therefore receives
+ * every broadcast unscoped) distinguishes "the break was refused and the world
+ * did not change" from "the break went through and the payout was silent".
+ *
+ * Raw envelopes for chest_watch()'s reason: recv_app_for() folds a KICK into
+ * the same -1 a timeout gives, and a refused break must not be a kick either.
+ * Matched on the POSITION too — the scenario places blocks of its own, and a
+ * probe that answered "some block edit happened" would go green on the wrong
+ * one. */
+static bool chest_saw_block_edit(uint32_t sid, int32_t x, int32_t y, int32_t z, unsigned ms)
+{
+    const uint64_t until = now_ms() + ms;
+    bool seen = false;
+
+    for (;;) {
+        const uint64_t now = now_ms();
+        if (now >= until) return seen;
+
+        uint8_t buf[5 + BS_MAX_PAYLOAD];
+        const ssize_t n = gate_recv(buf, sizeof buf, (unsigned)(until - now));
+        if (n < 5) continue;                       /* poll timed out; the deadline decides */
+        if (bs_get_u32(buf + 1) != sid) continue;
+        if (buf[0] != BS_GAME_DATA) continue;
+        if (n < (ssize_t)(5 + BS_BLOCK_EDIT_BYTES) || buf[5] != BS_APP_BLOCK_EDIT) continue;
+        if (bs_get_i32(buf + 6) == x && bs_get_i32(buf + 10) == y && bs_get_i32(buf + 14) == z) {
+            seen = true;
+        }
+    }
+}
+
+/* ---- in-process: the wire codec ---------------------------------------- */
+
+static void test_chest_action_decode(void)
+{
+    puts("v1.9.10: chestActionDecode accepts exactly one frame shape and reads it little-endian");
+
+    /* Hand-written literal bytes, NOT a frame built with bs_put_i32.
+     * chestActionDecode() reads the position with bs_get_i32, so a frame
+     * built by that function's inverse would agree with it even if both were
+     * big-endian — the same failure mode recv_world_gen()'s byte-level check
+     * above exists for. Every field's intended value is stated beside it. */
+    const uint8_t frame[BS_CHEST_ACTION_BYTES] = {
+        BS_APP_CHEST_ACTION,
+        BS_CHEST_OP_DEPOSIT,
+        0x04, 0x03, 0x02, 0x01,   /* x = 0x01020304 = 16909060 */
+        0x0B, 0x0A, 0x00, 0x00,   /* y = 0x00000A0B =     2571 */
+        0xFF, 0xFF, 0xFF, 0xFF,   /* z = 0xFFFFFFFF =       -1 */
+        0x07,                     /* a     */
+        0x03,                     /* b     */
+        0x05                      /* count */
+    };
+
+    BsChestAction act;
+    memset(&act, 0xEE, sizeof act);
+    const bool ok = chestActionDecode(frame, sizeof frame, &act);
+    check(ok, "a well-formed BS_CHEST_ACTION_BYTES frame decodes");
+    if (ok) {
+        check(act.op == BS_CHEST_OP_DEPOSIT, "the op byte is field 1, straight after the type byte");
+        check(act.x == 16909060, "x is the four bytes after the op, least significant first");
+        check(act.y == 2571,     "y is the next four, least significant first");
+        check(act.z == -1,       "z is the next four, least significant first");
+        check(act.a == 0x07 && act.b == 0x03 && act.count == 0x05,
+              "a, b and count are the last three bytes, in that order");
+    }
+
+    /* Negative coordinates on all three axes, in two's complement. The
+     * client sends absolute world positions and half the world is negative,
+     * so a decoder that sign-extended the wrong byte would work perfectly
+     * for every chest east of the origin and fail for every chest west. */
+    const uint8_t neg[BS_CHEST_ACTION_BYTES] = {
+        BS_APP_CHEST_ACTION,
+        BS_CHEST_OP_WITHDRAW,
+        0x79, 0xFE, 0xFF, 0xFF,   /* x = 0xFFFFFE79 = -391 */
+        0x00, 0xFF, 0xFF, 0xFF,   /* y = 0xFFFFFF00 = -256 */
+        0xFE, 0xFF, 0xFF, 0xFF,   /* z = 0xFFFFFFFE =   -2 */
+        0x00, 0x00, 0x01
+    };
+    memset(&act, 0xEE, sizeof act);
+    const bool neg_ok = chestActionDecode(neg, sizeof neg, &act);
+    check(neg_ok, "a frame carrying negative coordinates decodes");
+    if (neg_ok) {
+        check(act.x == -391 && act.y == -256 && act.z == -2,
+              "negative coordinates round-trip sign-correct on all three axes");
+        check(act.op == BS_CHEST_OP_WITHDRAW, "and the withdraw op decodes as itself");
+    }
+
+    /* Every wrong length, not a sampled one. cheststore.h's contract is
+     * "false unless it is exactly that long", and BS_CHEST_ACTION_BYTES is
+     * 17, so 0..24 covers short frames, the exact frame, and long ones. */
+    unsigned wrong_len_accepted = 0;
+    uint8_t pad[32];
+    memcpy(pad, frame, sizeof frame);
+    memset(pad + sizeof frame, 0, sizeof pad - sizeof frame);
+    for (size_t len = 0; len <= 24u; len++) {
+        if (len == BS_CHEST_ACTION_BYTES) continue;
+        BsChestAction junk;
+        if (chestActionDecode(pad, len, &junk)) wrong_len_accepted++;
+    }
+    check(wrong_len_accepted == 0,
+          "every length from 0 to 24 except BS_CHEST_ACTION_BYTES (17) is refused — a"
+          " short frame and a long one are both malformed, not a prefix to read");
+
+    check(BS_CHEST_ACTION_BYTES == 17u,
+          "BS_CHEST_ACTION_BYTES is 17 — the number the length check above is really about");
+
+    /* Right length, wrong type byte. The payload arrives at this decoder
+     * only because handle_app_payload() dispatched on body[0], so this can
+     * only fire on a hand-built frame — but it is the one field a caller
+     * could plausibly stop checking, and dropping it would leave a
+     * CHEST_STATE (an S->C message) decodable as an action. */
+    unsigned wrong_type_accepted = 0;
+    const uint8_t wrong_types[] = { 0x00, BS_APP_BLOCK_EDIT, BS_APP_CHEST_STATE, 0x14, 0xFF };
+    for (unsigned i = 0; i < sizeof wrong_types / sizeof wrong_types[0]; i++) {
+        uint8_t bad[BS_CHEST_ACTION_BYTES];
+        memcpy(bad, frame, sizeof bad);
+        bad[0] = wrong_types[i];
+        BsChestAction junk;
+        if (chestActionDecode(bad, sizeof bad, &junk)) wrong_type_accepted++;
+    }
+    check(wrong_type_accepted == 0,
+          "a right-length frame carrying any type byte other than BS_APP_CHEST_ACTION is refused,"
+          " CHEST_STATE's own 0x12 included");
+}
+
+static void test_chest_state_encode(void)
+{
+    puts("v1.9.10: chestStateEncode writes exactly 29 bytes, and a chest with no record is empty");
+
+    check(BS_CHEST_STATE_BYTES == 29u,
+          "BS_CHEST_STATE_BYTES is 29: one type byte, twelve of position, eight (item, count) pairs");
+    check(BS_CHEST_SLOTS == 8u, "a chest has eight slots on the wire");
+
+    BsChest c;
+    memset(&c, 0, sizeof c);
+    c.x = -391; c.y = 70; c.z = 16909060;
+    for (unsigned i = 0; i < BS_CHEST_SLOTS; i++) {
+        c.slot[i][0] = (uint8_t)(2u + i);       /* dirt upward: distinct per slot */
+        c.slot[i][1] = (uint8_t)(1u + i * 3u);
+    }
+
+    /* Written into a longer buffer with a sentinel tail, so "writes exactly
+     * BS_CHEST_STATE_BYTES" is a claim this test can actually fail on rather
+     * than one the array size quietly guarantees. */
+    uint8_t buf[BS_CHEST_STATE_BYTES + 4u];
+    memset(buf, 0xA5, sizeof buf);
+    chestStateEncode(buf, c.x, c.y, c.z, &c);
+
+    check(buf[0] == BS_APP_CHEST_STATE, "the snapshot's type byte is BS_APP_CHEST_STATE (0x12)");
+    check(buf[BS_CHEST_STATE_BYTES] == 0xA5 && buf[BS_CHEST_STATE_BYTES + 1u] == 0xA5
+          && buf[BS_CHEST_STATE_BYTES + 2u] == 0xA5 && buf[BS_CHEST_STATE_BYTES + 3u] == 0xA5,
+          "and it writes 29 bytes and not one more — the four sentinel bytes past the end survive");
+    check(chest_state_at(buf, -391, 70, 16909060),
+          "x, y, z are little-endian in that order, negative values included (checked byte by byte,"
+          " not through bs_get_i32)");
+
+    bool slots_ok = true;
+    for (unsigned i = 0; i < BS_CHEST_SLOTS; i++) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(buf, i, &item, &count);
+        if (item != (uint8_t)(2u + i) || count != (uint8_t)(1u + i * 3u)) slots_ok = false;
+    }
+    check(slots_ok, "all eight (item, count) pairs follow the position in slot order");
+
+    /* The NULL case is not a convenience: bsgame.c's broadcast_chest_state()
+     * passes cheststoreFind()'s result straight through, and that is NULL
+     * for every chest nobody has deposited into yet — which is every chest
+     * the moment it is placed. */
+    memset(buf, 0xA5, sizeof buf);
+    chestStateEncode(buf, 5, 6, 7, NULL);
+    check(buf[0] == BS_APP_CHEST_STATE && chest_state_at(buf, 5, 6, 7),
+          "a chest with no record still encodes its own position");
+    check(chest_state_is_empty(buf),
+          "and all sixteen slot bytes are zero — a chest that has never been used reads as empty,"
+          " never as uninitialised");
+}
+
+/* ---- in-process: the transfer rules ------------------------------------ */
+
+/* BsChestStore is BS_CHEST_MAX (4096) x 28 bytes plus change — 115 KiB, far
+ * past what belongs on a test's stack, so every scenario below works on a
+ * heap copy. */
+static BsChestStore *chest_store_new(void)
+{
+    BsChestStore *cs = malloc(sizeof *cs);
+    if (cs == NULL) die("malloc BsChestStore");
+    memset(cs, 0, sizeof *cs);
+    return cs;
+}
+
+static void test_cheststore_deposit_rules(void)
+{
+    puts("v1.9.10: cheststoreRoom/Deposit — empty slot, merge, cap, wrong item, bad index");
+
+    BsChestStore *cs = chest_store_new();
+    const int32_t x = 10, y = 40, z = -20;
+
+    check(cheststoreCount(cs) == 0, "a zeroed store holds no chests");
+    check(cheststoreFind(cs, x, y, z) == NULL,
+          "and a chest nobody has deposited into has no record — NULL, not an empty one");
+    check(cheststoreRoom(cs, x, y, z, 0, 2 /* BLOCK_DIRT */) == (uint8_t)BS_INV_STACK_MAX,
+          "an untouched chest's slot 0 has room for a whole stack");
+
+    check(cheststoreDeposit(cs, x, y, z, 0, 2, 5),
+          "a deposit into an empty slot lands");
+    check(cheststoreCount(cs) == 1, "and it is the deposit that creates the record, nothing earlier");
+    const BsChest *c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[0][0] == 2 && c->slot[0][1] == 5,
+          "the slot holds the item and the count that were deposited");
+
+    check(cheststoreRoom(cs, x, y, z, 0, 2) == (uint8_t)(BS_INV_STACK_MAX - 5u),
+          "room in a slot holding the same item is the cap minus what is already there");
+    check(cheststoreDeposit(cs, x, y, z, 0, 2, 3),
+          "a deposit of the same item merges into the stack");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[0][0] == 2 && c->slot[0][1] == 8,
+          "and the counts add rather than replacing");
+    check(cheststoreCount(cs) == 1, "a second deposit into the same chest makes no second record");
+
+    /* The cap. 95 + 10 does not fit, and the store is all-or-nothing: it
+     * refuses rather than moving the 4 that would. bsgame.c is where the
+     * partial move lives — it asks cheststoreRoom() first and deposits the
+     * smaller of the two. That split is the whole reason both halves of this
+     * section exist. */
+    check(cheststoreDeposit(cs, x, y, z, 1, 2, 95), "a 95-unit deposit into an empty slot lands");
+    check(cheststoreRoom(cs, x, y, z, 1, 2) == 4u,
+          "a slot holding 95 of an item has room for exactly 4 more");
+    check(!cheststoreDeposit(cs, x, y, z, 1, 2, 10),
+          "and asking it to take 10 is refused outright — cheststoreDeposit is all-or-nothing,"
+          " the partial move is bsgame.c's job");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[1][1] == 95, "the refused deposit changed nothing");
+    check(cheststoreDeposit(cs, x, y, z, 1, 2, 4), "the 4 that do fit are accepted");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[1][1] == (uint8_t)BS_INV_STACK_MAX,
+          "leaving the slot at the stack cap, 99");
+    check(cheststoreRoom(cs, x, y, z, 1, 2) == 0u, "a slot at the cap has no room left");
+    check(!cheststoreDeposit(cs, x, y, z, 1, 2, 1), "and refuses even one more unit");
+
+    /* A different item in the destination. This is the rule that keeps a
+     * chest slot a stack rather than a pile. */
+    check(cheststoreRoom(cs, x, y, z, 0, 3 /* BLOCK_STONE */) == 0u,
+          "a slot holding a different item reports no room, whatever is left of the cap");
+    check(!cheststoreDeposit(cs, x, y, z, 0, 3, 1),
+          "and a deposit of a different item into it is refused");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[0][0] == 2 && c->slot[0][1] == 8,
+          "the slot still holds what it held — no overwrite, no silent swap");
+
+    check(cheststoreRoom(cs, x, y, z, (uint8_t)BS_CHEST_SLOTS, 2) == 0u,
+          "slot index 8 is one past the last slot and reports no room");
+    check(!cheststoreDeposit(cs, x, y, z, (uint8_t)BS_CHEST_SLOTS, 2, 1),
+          "a deposit into slot 8 is refused");
+    check(!cheststoreDeposit(cs, x, y, z, 255, 2, 1), "so is one into slot 255");
+
+    check(cheststoreRoom(cs, x, y, z, 2, 0) == 0u, "item id 0 (air) has no room anywhere");
+    check(!cheststoreDeposit(cs, x, y, z, 2, 0, 1), "and depositing item 0 is refused");
+    check(!cheststoreDeposit(cs, x, y, z, 2, 2, 0),
+          "so is a deposit of zero units — a count is never a way of saying nothing");
+    check(!cheststoreDeposit(cs, x, y, z, 2, 2, (uint8_t)(BS_INV_STACK_MAX + 1u)),
+          "so is one of 100 units, past BS_INV_STACK_MAX");
+
+    /* A refused deposit into a chest with no record must not leave an empty
+     * record behind — cheststore.c answers room before it creates anything,
+     * and this is what says so. */
+    check(!cheststoreDeposit(cs, 999, 40, 999, 0, 0, 1),
+          "a refused deposit into a chest that has no record is still refused");
+    check(cheststoreFind(cs, 999, 40, 999) == NULL && cheststoreCount(cs) == 1,
+          "and leaves no empty record behind — the table still holds exactly one chest");
+
+    free(cs);
+}
+
+static void test_cheststore_withdraw_rules(void)
+{
+    puts("v1.9.10: cheststoreWithdraw — takes what is there, empties to item 0, refuses the rest");
+
+    BsChestStore *cs = chest_store_new();
+    const int32_t x = -5, y = 12, z = 30;
+
+    check(cheststoreWithdraw(cs, x, y, z, 0, 1, NULL) == 0,
+          "a withdraw from a chest with no record takes nothing");
+
+    check(cheststoreDeposit(cs, x, y, z, 2, 5 /* BLOCK_WOOD */, 10), "priming deposit of 10 wood");
+
+    uint8_t item = 0xEE;
+    check(cheststoreWithdraw(cs, x, y, z, 2, 4, &item) == 4, "a withdraw of 4 returns 4");
+    check(item == 5, "and reports which item it took through item_out");
+    const BsChest *c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[2][0] == 5 && c->slot[2][1] == 6,
+          "leaving 6 of the same item in the slot");
+
+    /* NOT a clamp. cheststore.h: "0 and nothing changed when the slot ...
+     * holds fewer than `units` — the caller asked for units that do not
+     * exist, and the verified model refuses rather than rounds down". This
+     * is the half of the duplication defence that matters when two clients
+     * race: the loser is told no, not given a smaller share. */
+    check(cheststoreWithdraw(cs, x, y, z, 2, 20, NULL) == 0,
+          "a withdraw of more than the slot holds takes NOTHING — it is refused, not rounded down");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[2][1] == 6, "and the slot is untouched by the refusal");
+
+    check(cheststoreWithdraw(cs, x, y, z, 2, 6, NULL) == 6, "a withdraw of exactly what is there succeeds");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[2][0] == 0 && c->slot[2][1] == 0,
+          "and empties the slot to {0, 0} — the item id is cleared too, never left stale beside a zero count");
+
+    check(cheststoreWithdraw(cs, x, y, z, 2, 1, NULL) == 0, "a withdraw from the now-empty slot takes nothing");
+    check(cheststoreWithdraw(cs, x, y, z, 0, 1, NULL) == 0, "so does one from a slot never used");
+    check(cheststoreWithdraw(cs, x, y, z, (uint8_t)BS_CHEST_SLOTS, 1, NULL) == 0,
+          "so does one from slot 8, past the last slot");
+    check(cheststoreWithdraw(cs, x, y, z, 255, 1, NULL) == 0, "and one from slot 255");
+
+    /* units == 0 means "the whole stack" to this function. Unreachable from
+     * the wire — bsgame.c refuses count 0 before it gets here, and
+     * test_chest_action_count_validation() below proves that — but it is
+     * what the header documents, so it is what is checked. */
+    check(cheststoreDeposit(cs, x, y, z, 3, 5, 7), "priming deposit of 7 wood into slot 3");
+    check(cheststoreWithdraw(cs, x, y, z, 3, 0, NULL) == 7,
+          "units == 0 takes the whole stack at the module's own interface (bsgame.c never asks that)");
+    c = cheststoreFind(cs, x, y, z);
+    check(c != NULL && c->slot[3][0] == 0 && c->slot[3][1] == 0, "and empties that slot too");
+
+    free(cs);
+}
+
+static void test_cheststore_remove_and_capacity(void)
+{
+    puts("v1.9.10: cheststoreRemove drops a record whole, and the table stops at BS_CHEST_MAX");
+
+    BsChestStore *cs = chest_store_new();
+
+    check(cheststoreDeposit(cs, 1, 40, 1, 0, 2, 3), "a chest to remove");
+    check(cheststoreDeposit(cs, 2, 40, 2, 0, 2, 3), "and one beside it");
+    check(cheststoreRemove(cs, 1, 40, 1), "cheststoreRemove reports it removed one");
+    check(cheststoreFind(cs, 1, 40, 1) == NULL, "the record is gone, contents and all");
+    check(cheststoreFind(cs, 2, 40, 2) != NULL,
+          "and its neighbour survived — the swap-with-last compaction did not take the wrong one");
+    check(cheststoreCount(cs) == 1, "the count fell by exactly one");
+    check(!cheststoreRemove(cs, 1, 40, 1), "removing it again reports there was nothing to remove");
+
+    /* Fill to BS_CHEST_MAX. cheststore.h: the bound exists for the reason
+     * BS_DIFF_MAX does — a hostile client must not be able to grow this
+     * without limit — so what happens AT the bound is a documented behaviour
+     * and not an implementation accident. */
+    memset(cs, 0, sizeof *cs);
+    unsigned filled = 0;
+    for (uint32_t i = 0; i < BS_CHEST_MAX; i++) {
+        if (cheststoreDeposit(cs, (int32_t)i, 40, 7000, 0, 2, 1)) filled++;
+    }
+    check(filled == BS_CHEST_MAX, "BS_CHEST_MAX (4096) distinct chests all take their first deposit");
+    check(cheststoreCount(cs) == BS_CHEST_MAX, "and the table reports exactly that many");
+
+    check(cheststoreRoom(cs, 999999, 40, 7000, 0, 2) == 0u,
+          "with the table full, a chest that has no record reports no room — the caller is told"
+          " BEFORE it takes the units out of a bag");
+    check(!cheststoreDeposit(cs, 999999, 40, 7000, 0, 2, 1),
+          "and the deposit that would have created record 4097 is refused");
+    check(cheststoreCount(cs) == BS_CHEST_MAX, "the refusal did not grow the table");
+
+    check(cheststoreRoom(cs, 0, 40, 7000, 5, 2) == (uint8_t)BS_INV_STACK_MAX,
+          "a chest that already HAS a record is unaffected by a full table");
+    check(cheststoreDeposit(cs, 0, 40, 7000, 5, 2, 1), "and can still take a deposit");
+
+    check(cheststoreRemove(cs, 0, 40, 7000), "removing one frees a row");
+    check(cheststoreCount(cs) == BS_CHEST_MAX - 1u, "the table is one short of full");
+    check(cheststoreDeposit(cs, 999999, 40, 7000, 0, 2, 1),
+          "and the deposit that was refused a moment ago now lands in the freed row");
+
+    free(cs);
+}
+
+/* ---- in-process: the on-disk mirror ------------------------------------ */
+
+static void chest_bin_path(char *out, size_t cap, const char *dir)
+{
+    snprintf(out, cap, "%s/chests.bin", dir);
+}
+
+/* Writes a chests.bin by hand: magic, then `n` 28-byte records straight out
+ * of `recs`. Used for the sanitising cases, which have to put bytes on disk
+ * that cheststoreFlush() would never write. */
+static bool chest_bin_write(const char *dir, const uint8_t *recs, unsigned n, const char *magic)
+{
+    char path[256];
+    chest_bin_path(path, sizeof path, dir);
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) return false;
+    bool ok = fwrite(magic, 1, 8, f) == 8;
+    if (ok && n > 0) {
+        ok = fwrite(recs, 1, (size_t)n * BSGAME_TEST_CHEST_REC_BYTES, f)
+             == (size_t)n * BSGAME_TEST_CHEST_REC_BYTES;
+    }
+    return fclose(f) == 0 && ok;
+}
+
+static void chest_rec_put(uint8_t *rec, int32_t x, int32_t y, int32_t z,
+                          uint8_t item0, uint8_t count0)
+{
+    memset(rec, 0, BSGAME_TEST_CHEST_REC_BYTES);
+    bs_put_i32(rec,     x);
+    bs_put_i32(rec + 4, y);
+    bs_put_i32(rec + 8, z);
+    rec[12] = item0;
+    rec[13] = count0;
+}
+
+static void test_cheststore_disk_round_trip(void)
+{
+    puts("v1.9.10: chests.bin round-trips, debounces, and sanitises every record it reads back");
+
+    char dir[192];
+    snprintf(dir, sizeof dir, "%s/chest_rt", g_dir);
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) die("mkdir chest_rt");
+
+    char err[256];
+    unsigned dropped = 0xFFFFFFFFu;
+    BsChestStore *cs = chest_store_new();
+
+    check(cheststoreOpen(cs, dir, err, sizeof err, &dropped),
+          "opening a state dir with no chests.bin succeeds — a fresh world, not an error");
+    check(cheststoreCount(cs) == 0 && dropped == 0, "and yields an empty store with nothing dropped");
+
+    check(cheststoreFlush(cs, 100000u, true) == 0,
+          "flushing a store nothing has changed writes nothing, even forced");
+
+    check(cheststoreDeposit(cs, 100, 40, -200, 0, 2 /* BLOCK_DIRT */, 9), "a deposit to persist");
+    check(cheststoreDeposit(cs, 100, 40, -200, 7, 5 /* BLOCK_WOOD */, 1), "and a second slot in the same chest");
+    check(cheststoreDeposit(cs, -300, 12, 400, 3, 3 /* BLOCK_STONE */, 64), "and a second chest");
+
+    /* The debounce, with synthetic clocks so the assertion is about
+     * BS_CHEST_FLUSH_MS and not about how fast this machine runs. */
+    check(cheststoreFlush(cs, 100000u, true) == 1, "a forced flush of a dirty store writes the file");
+    check(cheststoreFlush(cs, 100000u, true) == 0, "and the store is clean afterwards, so a second forced flush is a no-op");
+    check(cheststoreDeposit(cs, -300, 12, 400, 4, 3, 1), "dirty it again");
+    check(cheststoreFlush(cs, 100500u, false) == 0,
+          "an unforced flush 500 ms after the last one is not yet due — BS_CHEST_FLUSH_MS is 1000");
+    check(cheststoreFlush(cs, 101000u, false) == 1, "one a full second after it is");
+
+    char path[256];
+    chest_bin_path(path, sizeof path, dir);
+    FILE *f = fopen(path, "rb");
+    check(f != NULL, "chests.bin exists on disk");
+    if (f != NULL) {
+        char magic[8];
+        check(fread(magic, 1, 8, f) == 8 && memcmp(magic, "BSCHEST1", 8) == 0,
+              "and starts with the BSCHEST1 magic");
+        fseek(f, 0, SEEK_END);
+        const long size = ftell(f);
+        fclose(f);
+        check(size == 8L + 2L * (long)BSGAME_TEST_CHEST_REC_BYTES,
+              "its body is a whole number of 28-byte records, one per chest — 8 + 2*28 = 64 bytes");
+    }
+
+    BsChestStore *re = chest_store_new();
+    dropped = 0xFFFFFFFFu;
+    check(cheststoreOpen(re, dir, err, sizeof err, &dropped),
+          "a second store opens the file the first one wrote");
+    check(cheststoreCount(re) == 2 && dropped == 0, "and reads back both chests, dropping none");
+    const BsChest *a = cheststoreFind(re, 100, 40, -200);
+    const BsChest *b = cheststoreFind(re, -300, 12, 400);
+    check(a != NULL && a->slot[0][0] == 2 && a->slot[0][1] == 9
+          && a->slot[7][0] == 5 && a->slot[7][1] == 1,
+          "the first chest's slots survive the round trip, including a negative z");
+    check(b != NULL && b->slot[3][0] == 3 && b->slot[3][1] == 64 && b->slot[4][1] == 1,
+          "and so do the second's, including a negative x");
+    free(re);
+    free(cs);
+
+    /* Refusals. cheststore.h's stance is diffstoreOpen's: a file that is
+     * present but is not this format is a reason to refuse to start, because
+     * running with half the players' chests silently emptied is worse. */
+    BsChestStore *bad = chest_store_new();
+    check(chest_bin_write(dir, NULL, 0, "NOTCHEST"), "a file with the wrong magic is written");
+    err[0] = '\0';
+    check(!cheststoreOpen(bad, dir, err, sizeof err, &dropped),
+          "and cheststoreOpen refuses it rather than treating it as an empty world");
+    check(err[0] != '\0', "with a reason in err the caller can print");
+
+    uint8_t torn[8 + BSGAME_TEST_CHEST_REC_BYTES];
+    memcpy(torn, "BSCHEST1", 8);
+    chest_rec_put(torn + 8, 1, 2, 3, 2, 1);
+    f = fopen(path, "wb");
+    check(f != NULL, "a truncated file opens for writing");
+    if (f != NULL) {
+        /* One record short of whole: 8 + 20 of a 28-byte record. */
+        check(fwrite(torn, 1, 8u + 20u, f) == 8u + 20u, "and 20 of a record's 28 bytes are written");
+        fclose(f);
+    }
+    err[0] = '\0';
+    check(!cheststoreOpen(bad, dir, err, sizeof err, &dropped),
+          "a torn trailing record is refused too — the length is not a whole number of records");
+    check(err[0] != '\0', "and that refusal also carries a reason");
+
+    /* Sanitising. Every field of every record that IS read is checked rather
+     * than trusted, because chests.bin is a file an operator (or anything
+     * with write access to the state dir) can edit. */
+    uint8_t recs[4][BSGAME_TEST_CHEST_REC_BYTES];
+    chest_rec_put(recs[0], 70000, 40, 0, 2, 5);        /* x past BS_WORLD_XZ_LIMIT   */
+    chest_rec_put(recs[1], 10, 40, 10, 8 /* water */, 5);  /* inventoryCanHold refuses  */
+    chest_rec_put(recs[2], 20, 40, 20, 2, 200);        /* count past BS_INV_STACK_MAX */
+    chest_rec_put(recs[3], 20, 40, 20, 2, 1);          /* duplicate position          */
+    check(chest_bin_write(dir, &recs[0][0], 4, "BSCHEST1"), "a hand-built chests.bin with four dubious records");
+
+    dropped = 0xFFFFFFFFu;
+    check(cheststoreOpen(bad, dir, err, sizeof err, &dropped),
+          "cheststoreOpen accepts a well-formed file whose CONTENTS are dubious — it sanitises"
+          " rather than refusing to start");
+    check(cheststoreCount(bad) == 2 && dropped == 2,
+          "two of the four records are kept and two dropped: the out-of-range position and the"
+          " duplicate of a position already loaded");
+    check(cheststoreFind(bad, 70000, 40, 0) == NULL,
+          "the record bsEditValid() refuses is gone entirely, position and all");
+    const BsChest *liq = cheststoreFind(bad, 10, 40, 10);
+    check(liq != NULL && liq->slot[0][0] == 0 && liq->slot[0][1] == 0,
+          "a slot holding an id inventoryCanHold() refuses is CLEARED, not dropped with its chest");
+    const BsChest *over = cheststoreFind(bad, 20, 40, 20);
+    check(over != NULL && over->slot[0][0] == 2 && over->slot[0][1] == (uint8_t)BS_INV_STACK_MAX,
+          "and a count past BS_INV_STACK_MAX is clamped to 99, keeping the item");
+
+    free(bad);
+    remove(path);
+}
+
+/* ---- end-to-end: the daemon -------------------------------------------- */
+
+static void test_chest_deposit_broadcasts_a_snapshot(void)
+{
+    puts("v1.9.10 end-to-end: a DEPOSIT into a placed chest answers with a whole-chest snapshot");
+    drain();
+
+    const uint32_t sid = 0xC4E51001u;
+    const int32_t x = 5001, y = 40, z = 5000;
+    chest_join(sid, "chesta");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* v1.9.10 fix: a DEPOSIT is a MOVE out of the bag now, so every scenario
+     * below has to put the units in the bag first. Before the fix these
+     * deposits came out of nothing. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 8);
+    chest_give(sid, 3 /* BLOCK_STONE */, 2);
+    drain();
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0 /* chest slot */, 5);
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    ssize_t n = recv_chest_state(sid, st, sizeof st, 700);
+    const bool shaped = (n == (ssize_t)BS_CHEST_STATE_BYTES);
+    check(shaped, "an accepted DEPOSIT puts exactly one BS_CHEST_STATE_BYTES snapshot on the wire");
+    if (!shaped) return;
+
+    check(chest_state_at(st, x, y, z), "the snapshot names the chest that was deposited into");
+    uint8_t item = 0, count = 0;
+    chest_state_slot(st, 0, &item, &count);
+    check(item == 2 && count == 5, "chest slot 0 holds the 5 dirt that were deposited");
+
+    /* The other seven slots come back in the same packet: CHEST_STATE is a
+     * whole-chest snapshot and never a delta (bs_proto.h's own words), which
+     * is what makes it impossible to desync. */
+    bool rest_empty = true;
+    for (unsigned i = 1; i < BS_CHEST_SLOTS; i++) {
+        uint8_t it = 0, ct = 0;
+        chest_state_slot(st, i, &it, &ct);
+        if (it != 0 || ct != 0) rest_empty = false;
+    }
+    check(rest_empty, "and the other seven slots ride along empty — a snapshot, never a delta");
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 0, 3);
+    n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "a second DEPOSIT is answered too");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 2 && count == 8, "and it merged into the same stack: 5 + 3 = 8");
+    }
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 3 /* BLOCK_STONE */, 7, 2);
+    n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "a deposit into the last slot is answered");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t i0 = 0, c0 = 0, i7 = 0, c7 = 0;
+        chest_state_slot(st, 0, &i0, &c0);
+        chest_state_slot(st, 7, &i7, &c7);
+        check(i0 == 2 && c0 == 8 && i7 == 3 && c7 == 2,
+              "and the snapshot carries both slots at once — slot 0 untouched, slot 7 new");
+    }
+}
+
+static void test_chest_deposit_partial_merge_at_the_cap(void)
+{
+    puts("v1.9.10 end-to-end: a deposit that does not fit whole moves what fits, and says so");
+    drain();
+
+    const uint32_t sid = 0xC4E51002u;
+    const int32_t x = 5002, y = 40, z = 5000;
+    chest_join(sid, "chestb");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* 106 dirt: 95 for the priming deposit, 10 for the one that only
+     * partly fits, and 1 left over so the final attempt is refused for
+     * having no ROOM rather than for an empty bag. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 95);
+    chest_give(sid, 2, 11);
+    drain();
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 95);
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    ssize_t n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "the priming 95-unit deposit is accepted");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 2 && count == 95, "leaving slot 0 at 95");
+    }
+
+    /* The case bsgame.c's chest_action_apply() header states outright: "a
+     * slot at 95 asked for 10 goes to 99 and the snapshot says so". Only 4
+     * move; the client reconciles its own bag from the snapshot, which is
+     * why no INV_STATE follows. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 0, 10);
+    n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "asking a slot at 95 to take 10 more is ACCEPTED, not refused");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 2 && count == (uint8_t)BS_INV_STACK_MAX,
+              "and exactly the 4 that fit moved — the snapshot shows 99, not 105 and not 95");
+    }
+
+    /* Now there is no room at all, and that is a refusal rather than a
+     * zero-unit transfer. */
+    bool saw_state = false, saw_kick = false;
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 0, 1);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_state, "a deposit into a slot already at the cap produces no snapshot at all");
+    check(!saw_kick, "and no kick");
+}
+
+static void test_chest_deposit_refusals_are_silent(void)
+{
+    puts("v1.9.10 end-to-end: every invalid DEPOSIT is refused silently — no snapshot, no kick");
+    drain();
+
+    const uint32_t sid = 0xC4E51003u;
+    const int32_t x = 5003, y = 40, z = 5000;
+    chest_join(sid, "chestc");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* The stone matters: without it the "different item into an occupied
+     * slot" case below would be refused for an EMPTY BAG instead, and the
+     * refusal this scenario names would stop being the one being tested. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 7);
+    chest_give(sid, 3 /* BLOCK_STONE */, 1);
+    drain();
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 1);
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "the priming deposit lands, so slot 0 holds dirt for the refusals below");
+
+    /* Each of these is a separate documented refusal. They are run as one
+     * batch and watched together because the assertion is identical for all
+     * of them — nothing comes back and the session survives — and because
+     * one 400 ms silence window per case would add three seconds to the
+     * suite for no extra evidence. */
+    struct { const char *what; uint8_t item; uint8_t slot; uint8_t count; } bad[] = {
+        { "a different item into an occupied slot", 3 /* BLOCK_STONE */, 0,   1 },
+        { "chest slot 8, one past the last",        2,                   8,   1 },
+        { "chest slot 255",                         2,                   255, 1 },
+        { "water (id 8), which inventoryCanHold refuses", 8,             1,   1 },
+        { "item id 0",                              0,                   1,   1 },
+    };
+    bool any_state = false, any_kick = false;
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        bool saw_state = false, saw_kick = false;
+        send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, bad[i].item, bad[i].slot, bad[i].count);
+        chest_watch(sid, 250, &saw_state, &saw_kick);
+        if (saw_state) { any_state = true; printf("  ..    a snapshot came back for: %s\n", bad[i].what); }
+        if (saw_kick)  { any_kick  = true; printf("  ..    a KICK came back for: %s\n", bad[i].what); }
+    }
+    check(!any_state,
+          "none of the five invalid DEPOSITs produces a CHEST_STATE: wrong item into an occupied"
+          " slot, slot 8, slot 255, a liquid, item 0");
+    check(!any_kick,
+          "and none of them disconnects the player — a malformed or invalid CHEST_ACTION is a"
+          " refusal, never a protocol violation, unlike an unknown message type");
+
+    /* The refusals changed nothing, and the session still works. Without
+     * this the two silence checks above would stay green against a daemon
+     * that had stopped listening altogether. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 0, 4);
+    const ssize_t n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and a valid DEPOSIT sent straight afterwards is still answered — the session survived"
+          " all five");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 2 && count == 5, "slot 0 holds 1 + 4 = 5 dirt: not one refusal moved a unit");
+        uint8_t i1 = 0, c1 = 0;
+        chest_state_slot(st, 1, &i1, &c1);
+        check(i1 == 0 && c1 == 0, "and slot 1, the target of the liquid and item-0 attempts, is still empty");
+    }
+    check(kill(g_daemon, 0) == 0, "the daemon is still up after five invalid chest actions");
+}
+
+static void test_chest_withdraw(void)
+{
+    puts("v1.9.10 end-to-end: WITHDRAW takes what was asked, empties the slot, then refuses");
+    drain();
+
+    const uint32_t sid = 0xC4E51004u;
+    const int32_t x = 5004, y = 40, z = 5000;
+    chest_join(sid, "chestd");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* v1.9.10 fix: a DEPOSIT is a MOVE out of the bag now, so every scenario
+     * below has to put the units in the bag first. Before the fix these
+     * deposits came out of nothing. */
+    chest_give(sid, 5 /* BLOCK_WOOD */, 13);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 5 /* BLOCK_WOOD */, 2, 10);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "priming deposit of 10 wood into chest slot 2");
+
+    /* WITHDRAW's field contract is the mirror of DEPOSIT's and easy to get
+     * backwards: a = the CHEST slot, b = the inventory slot (which this
+     * server ignores entirely — the client is authoritative for its own
+     * bag). Passing 6 as `b` here is deliberate: if the two were ever
+     * swapped, this would try to take from chest slot 6, which is empty. */
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 2 /* chest slot */, 6 /* inv slot */, 4);
+    ssize_t n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "a WITHDRAW of 4 is answered with a snapshot");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 2, &item, &count);
+        check(item == 5 && count == 6, "and the chest slot is down to 6 — a = the chest slot, b is ignored");
+    }
+
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 2, 0, 6);
+    n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "taking the remaining 6 is answered");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 2, &item, &count);
+        check(item == 0 && count == 0,
+              "and the emptied slot reads back as {0, 0} — the item id goes with the last unit");
+    }
+
+    /* Three refusals, silent like every other. The over-ask is the one worth
+     * naming: cheststore.h refuses rather than rounding down, so asking a
+     * slot holding nothing (or holding fewer than asked) for units yields no
+     * snapshot at all. */
+    struct { const char *what; uint8_t slot; uint8_t count; } bad[] = {
+        { "the slot that was just emptied",          2,   1 },
+        { "a slot that was never used",              0,   1 },
+        { "chest slot 8, one past the last",         8,   1 },
+        { "chest slot 255",                          255, 1 },
+    };
+    bool any_state = false, any_kick = false;
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        bool saw_state = false, saw_kick = false;
+        send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, bad[i].slot, 0, bad[i].count);
+        chest_watch(sid, 250, &saw_state, &saw_kick);
+        if (saw_state) { any_state = true; printf("  ..    a snapshot came back for: %s\n", bad[i].what); }
+        if (saw_kick)  { any_kick  = true; printf("  ..    a KICK came back for: %s\n", bad[i].what); }
+    }
+    check(!any_state, "a WITHDRAW from an empty slot, an unused slot, slot 8 or slot 255 produces no snapshot");
+    check(!any_kick,  "and none of them kicks the player");
+
+    /* The over-ask, on a slot that really does hold something. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 5, 4, 3);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "priming deposit of 3 wood into chest slot 4");
+    bool saw_state = false, saw_kick = false;
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 4, 0, 20);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_state,
+          "asking a slot holding 3 for 20 units is REFUSED outright — cheststore.h rounds nothing"
+          " down, so no snapshot goes out");
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 4, 0, 3);
+    n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "and the 3 that are there can still be taken afterwards");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 4, &item, &count);
+        check(item == 0 && count == 0, "leaving that slot empty too");
+    }
+}
+
+static void test_chest_action_count_validation(void)
+{
+    puts("v1.9.10 end-to-end: count is a count — 0 is refused, and so is anything past 99");
+    drain();
+
+    const uint32_t sid = 0xC4E51005u;
+    const int32_t x = 5005, y = 40, z = 5000;
+    chest_join(sid, "cheste");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* Only the priming deposit needs backing: every refusal below is
+     * gated on `count` or on the op byte, both of which are read before
+     * the bag is consulted at all. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 6);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 6);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "priming deposit of 6 dirt");
+
+    /* count 0 is the one that matters. cheststoreWithdraw() reads 0 as "the
+     * whole stack" at its own interface, so a bsgame.c that forwarded it
+     * would empty the slot on a packet that asked for nothing — the exact
+     * shape bs_proto.h forbids: "a COUNT, never a pad: 0 is refused, not
+     * read as everything". */
+    bool saw_state = false, saw_kick = false;
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 0);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_state, "a WITHDRAW with count 0 is refused, NOT read as \"take everything\"");
+    check(!saw_kick, "and does not kick");
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 1, 0);
+    chest_watch(sid, 250, &saw_state, &saw_kick);
+    check(!saw_state, "a DEPOSIT with count 0 is refused too");
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 1, 100);
+    chest_watch(sid, 250, &saw_state, &saw_kick);
+    check(!saw_state, "and so is a count of 100, one past BS_INV_STACK_MAX");
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 1, 255);
+    chest_watch(sid, 250, &saw_state, &saw_kick);
+    check(!saw_state, "and 255");
+
+    /* An op byte that is neither DEPOSIT nor WITHDRAW. */
+    send_chest_action(sid, 0x02, x, y, z, 2, 1, 1);
+    chest_watch(sid, 250, &saw_state, &saw_kick);
+    check(!saw_state, "an unknown op byte (0x02) is refused");
+    send_chest_action(sid, 0xFF, x, y, z, 2, 1, 1);
+    chest_watch(sid, 250, &saw_state, &saw_kick);
+    check(!saw_state, "and so is 0xFF");
+    check(!saw_kick, "no unknown-op refusal kicks either — the dispatch table's default case is"
+                     " for unknown MESSAGE TYPES, not unknown ops inside a known one");
+
+    /* Nothing above moved a unit, and the session is alive. */
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 6);
+    const ssize_t n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "a valid action after seven refusals is still answered");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 0 && count == 0,
+              "and the 6 dirt were all still there to take — not one refusal removed a unit");
+    }
+}
+
+static void test_chest_action_malformed_is_not_a_kick(void)
+{
+    puts("v1.9.10 end-to-end: a wrong-length CHEST_ACTION is dropped, NOT KICKed");
+    drain();
+
+    const uint32_t sid = 0xC4E51006u;
+    const int32_t x = 5006, y = 40, z = 5000;
+    chest_join(sid, "chestf");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* v1.9.10 fix: a DEPOSIT is a MOVE out of the bag now, so every scenario
+     * below has to put the units in the bag first. Before the fix these
+     * deposits came out of nothing. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 2);
+    drain();
+
+    /* This is the important one. handle_app_payload() KICKs an unknown
+     * message type, and BLOCK_EDIT, POS_UPDATE, CHUNK_SUB, CHUNK_UNSUB and
+     * PLAYER_REPORT all kick on "right type, wrong length" too — five of the
+     * seven neighbours of this case behave the opposite way. bs_proto.h
+     * makes CHEST_ACTION an explicit exception ("refuses, silently and
+     * without a kick, anything that does not validate"), so the pull toward
+     * the majority rule is exactly what this test is holding the line
+     * against. */
+    const uint8_t stub[3] = { BS_APP_CHEST_ACTION, BS_CHEST_OP_DEPOSIT, 0 };
+    send_app(sid, stub, sizeof stub);
+    bool saw_state = false, saw_kick = false;
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_kick, "a 3-byte CHEST_ACTION does NOT disconnect the player");
+    check(!saw_state, "and produces no snapshot either");
+
+    uint8_t over[BS_CHEST_ACTION_BYTES + 4u];
+    memset(over, 0, sizeof over);
+    over[0] = BS_APP_CHEST_ACTION;
+    send_app(sid, over, sizeof over);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_kick, "neither does a 21-byte one — too long is malformed, not a frame with padding");
+    check(!saw_state, "and it produces no snapshot");
+
+    /* The proof the session is really still there rather than merely quiet:
+     * a valid action on it is answered. Without this, both checks above
+     * would pass against a daemon that had silently dropped the player. */
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 2);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and the same session answers a well-formed CHEST_ACTION straight afterwards — it was"
+          " never disconnected, only ignored");
+}
+
+static void test_chest_position_gating(void)
+{
+    puts("v1.9.10 end-to-end: a chest action is refused unless a chest really stands there");
+    drain();
+
+    const uint32_t sid = 0xC4E51007u;
+    const int32_t y = 40, z = 5000;
+    chest_join(sid, "chestg");
+    /* Enough dirt that every refusal below is a POSITION refusal. The
+     * position gates run before the bag is consulted, so this only really
+     * backs the valid deposit at the end -- but a scenario whose refusals
+     * could be explained by an empty bag would prove nothing about the
+     * gate it is named after. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 10);
+    drain();
+
+    /* A cell with no diff at all. The diff store is what knows which cells
+     * are chests (cheststore.h is explicit that it does not), so this is the
+     * check that stops a client naming an arbitrary coordinate and getting a
+     * chest for free. */
+    bool saw_state = false, saw_kick = false;
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, 5100, y, z, 2, 0, 1);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_state, "a DEPOSIT at a cell the world has never been edited at is refused");
+    check(!saw_kick, "and is not a kick");
+
+    /* A cell holding a real block that is not a chest. */
+    chest_place_block(sid, 5101, y, z, 3 /* BLOCK_STONE */);
+    drain();
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, 5101, y, z, 2, 0, 1);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_state, "a DEPOSIT at a cell holding stone is refused — the block has to be a chest");
+    check(!saw_kick, "and is not a kick");
+
+    /* Out of the world entirely — and note carefully what these two checks do
+     * NOT prove.
+     *
+     * chest_action_apply() calls bsEditValid() before it looks the cell up,
+     * so a position past BS_WORLD_XZ_LIMIT (60000) or BS_WORLD_HEIGHT (128)
+     * is refused there first. But it would be refused by the chest-presence
+     * gate a line later anyway: handle_block_edit() runs the same
+     * bsEditValid(), so no out-of-range cell can ever be in the diff store to
+     * be found. MEASURED, not assumed — with that bsEditValid() call replaced
+     * by `if (false)` in a scratch copy, this whole suite still printed PASS
+     * 531 checks, 0 failed. The range gate is defence in depth that nothing
+     * reachable from the wire can distinguish, and no end-to-end check can
+     * honestly claim to cover it.
+     *
+     * So these two assert the OBSERVABLE behaviour — an absurd position is
+     * refused, and quietly — and nothing about which guard did it. The one
+     * place bsEditValid() is both load-bearing and testable is
+     * cheststore.c's decode_record(), where it drops out-of-range records
+     * read back off disk; test_cheststore_disk_round_trip() above covers
+     * that, and a red arm on that call confirms the coverage is real. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, 70000, y, z, 2, 0, 1);
+    chest_watch(sid, 300, &saw_state, &saw_kick);
+    check(!saw_state, "a DEPOSIT at x = 70000, past BS_WORLD_XZ_LIMIT, is refused");
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, 5102, 5000, z, 2, 0, 1);
+    chest_watch(sid, 300, &saw_state, &saw_kick);
+    check(!saw_state, "and so is one at y = 5000, past BS_WORLD_HEIGHT");
+    check(!saw_kick, "neither out-of-range position kicks the player");
+
+    /* And the same player, at a cell that IS a chest, still works. */
+    chest_place_block(sid, 5103, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    drain();
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, 5103, y, z, 2, 0, 1);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and a DEPOSIT at a cell that really does hold a chest is answered");
+}
+
+static void test_chest_orphan_record_dropped_on_block_edit(void)
+{
+    puts("v1.9.10 end-to-end: breaking a chest drops its contents; replacing chest with chest keeps them");
+    drain();
+
+    const uint32_t sid = 0xC4E51008u;
+    const int32_t x = 5008, y = 40, z = 5000;
+    chest_join(sid, "chesth");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* v1.9.10 fix: a DEPOSIT is a MOVE out of the bag now, so every scenario
+     * below has to put the units in the bag first. Before the fix these
+     * deposits came out of nothing. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 8);
+    chest_give(sid, 5 /* BLOCK_WOOD */, 1);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 7);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "seven dirt go into the chest");
+
+    /* Chest onto chest: the block did not change, so the record must not be
+     * touched. bsgame.c gates the drop on `block != BLOCK_CHEST` for exactly
+     * this, and without the gate every re-place would empty the chest. */
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    drain();
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 0, 1);
+    ssize_t n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "a deposit after a chest-onto-chest edit is answered");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 2 && count == 8,
+              "and the chest still holds what it held: 7 + 1 = 8 — a chest-onto-chest edit keeps"
+              " the contents");
+    }
+
+    /* Now replace it with something else, then put a chest back. A record
+     * that outlived its block would resurrect, full, inside the next chest
+     * placed on the same cell — free items for anyone who breaks and
+     * re-places a chest. */
+    chest_place_block(sid, x, y, z, 3 /* BLOCK_STONE */);
+    drain();
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    drain();
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 5 /* BLOCK_WOOD */, 3, 1);
+    n = recv_chest_state(sid, st, sizeof st, 700);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES, "a deposit into the newly placed chest is answered");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t i0 = 0, c0 = 0, i3 = 0, c3 = 0;
+        chest_state_slot(st, 0, &i0, &c0);
+        chest_state_slot(st, 3, &i3, &c3);
+        check(i0 == 0 && c0 == 0,
+              "and slot 0 is EMPTY — the eight dirt went with the block that was broken, they did"
+              " not resurrect inside the new chest");
+        check(i3 == 5 && c3 == 1, "while the new deposit is where it was put");
+    }
+}
+
+static void test_chest_two_players_cannot_take_the_same_stack(void)
+{
+    puts("v1.9.10 end-to-end: the second player to pull on a stack is refused, not given a copy");
+    drain();
+
+    const uint32_t sid_a = 0xC4E51009u, sid_b = 0xC4E5100Au;
+    const int32_t x = 5009, y = 40, z = 5000;
+    chest_join(sid_a, "chesti");
+    chest_join(sid_b, "chestj");
+    chest_place_block(sid_a, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    /* v1.9.10 fix: a DEPOSIT is a MOVE out of the bag now, so every scenario
+     * below has to put the units in the bag first. Before the fix these
+     * deposits came out of nothing. */
+    chest_give(sid_a, 2 /* BLOCK_DIRT */, 9);
+    chest_give(sid_b, 5 /* BLOCK_WOOD */, 2);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid_a, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 9);
+    check(recv_chest_state(sid_a, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "nine dirt go into a chest both players can reach");
+
+    /* The same snapshot reaches the OTHER player: broadcast_chest_state()
+     * sends to every connected player, not to the actor and not scoped by
+     * column, so a player who cannot see the chest still stores what they
+     * will find in it. */
+    const ssize_t nb = recv_chest_state(sid_b, st, sizeof st, 700);
+    check(nb == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and the snapshot reaches the second player too — CHEST_STATE goes to everyone");
+    if (nb == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(chest_state_at(st, x, y, z) && item == 2 && count == 9,
+              "carrying the same position and the same nine dirt the depositor saw");
+    }
+
+    /* A takes the lot. */
+    send_chest_action(sid_a, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 9);
+    const ssize_t na = recv_chest_state(sid_a, st, sizeof st, 700);
+    check(na == (ssize_t)BS_CHEST_STATE_BYTES, "the first player's withdraw of all nine is answered");
+    if (na == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 0 && count == 0, "and the slot is empty afterwards");
+    }
+    drain();
+
+    /* B asks for the same nine. The whole point of keeping chest contents
+     * server-side: B is told no rather than handed a second copy. */
+    bool saw_state = false, saw_kick = false;
+    send_chest_action(sid_b, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 9);
+    chest_watch(sid_b, 500, &saw_state, &saw_kick);
+    check(!saw_state,
+          "the second player asking for the same nine gets NO snapshot — the units are gone and"
+          " the store refuses rather than duplicating them");
+    check(!saw_kick, "and is not kicked for asking");
+
+    send_chest_action(sid_b, BS_CHEST_OP_DEPOSIT, x, y, z, 5 /* BLOCK_WOOD */, 0, 2);
+    check(recv_chest_state(sid_b, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and the refused player's session still works — a valid action of theirs is answered");
+
+    send_leave(sid_a);
+    send_leave(sid_b);
+    msleep(50);
+    drain();
+}
+
+/* v1.9.10 fix (2026-09-07). THE invariant, and the reason this group needed a
+ * scenario that asserts a SUM rather than a sequence.
+ *
+ * Every other scenario in this group checks the chest half of a transfer and
+ * nothing else, because before this fix the chest half was the only half the
+ * server had: bsgame.c's own comment said "a DEPOSIT does not debit p->inv and
+ * a WITHDRAW does not credit it". A suite made entirely of chest-side
+ * assertions is green on a server that duplicates every deposited stack and
+ * destroys every withdrawn one, because neither of those is visible from the
+ * chest side. This scenario is what closes that: it weighs BOTH halves, before
+ * and after, and asserts the total did not move.
+ *
+ * Deliberately asserts nothing about which individual actions were accepted.
+ * The mixed run below contains refusals on purpose — an over-ask, a deposit
+ * with no room, a deposit of units the bag no longer holds — and pinning which
+ * ones are refused would make this scenario go red for reasons that are not
+ * conservation, which is the one thing it exists to measure. The accept/refuse
+ * rules are pinned by the scenarios above and below it.
+ *
+ * Driven entirely through the real handle_chest_action() over the real gate
+ * socket, never through cheststore.c directly: the bug was in bsgame.c, which
+ * a store-level test cannot reach. */
+static void test_chest_conservation_invariant(void)
+{
+    puts("v1.9.10 fix: bag + chest conserves every unit across a mixed run of transfers");
+    drain();
+
+    const uint32_t sid = 0xC4E5100Bu;
+    const int32_t x = 5011, y = 40, z = 5000;
+    chest_join(sid, "chestk");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    drain();
+
+    /* 180 dirt (two full stacks and change) and 40 wood, seated through
+     * PICKUP. Two 90s rather than one 180: PICKUP's count is one byte and
+     * bs_proto.h caps it at BS_INV_STACK_MAX. */
+    chest_give(sid, 2 /* BLOCK_DIRT */, 90);
+    chest_give(sid, 2, 90);
+    chest_give(sid, 5 /* BLOCK_WOOD */, 40);
+    drain();
+
+    uint8_t inv[BS_INV_STATE_BYTES];
+    const bool got_start = chest_bag_read(sid, inv);
+    check(got_start, "the primed bag reads back as a full INV_STATE");
+    if (!got_start) return;
+
+    const uint32_t dirt_start = inv_state_total(inv, 2);
+    const uint32_t wood_start = inv_state_total(inv, 5);
+    check(dirt_start == 180u && wood_start == 40u,
+          "and it holds the 180 dirt and 40 wood that were put in it — the chest is empty, so"
+          " those two numbers ARE the world totals this scenario has to conserve");
+
+    /* A mixed run: full stacks, partial merges at the cap, over-asks, a
+     * deposit of units the bag has already spent, and withdraws in both the
+     * exact and the too-large shape. Ordered so that a server which debits
+     * nothing ends up visibly heavier and one which credits nothing ends up
+     * visibly lighter. */
+    struct { uint8_t op; uint8_t a; uint8_t b; uint8_t count; } run[] = {
+        { BS_CHEST_OP_DEPOSIT,  2, 0, 99 },   /* fills chest slot 0            */
+        { BS_CHEST_OP_DEPOSIT,  2, 0, 10 },   /* no room: refused              */
+        { BS_CHEST_OP_DEPOSIT,  2, 1, 81 },   /* the rest of the dirt          */
+        { BS_CHEST_OP_DEPOSIT,  2, 2,  1 },   /* bag has no dirt left          */
+        { BS_CHEST_OP_WITHDRAW, 0, 0, 50 },   /* takes half of slot 0          */
+        { BS_CHEST_OP_WITHDRAW, 0, 0, 60 },   /* slot 0 holds 49: over-ask     */
+        { BS_CHEST_OP_WITHDRAW, 0, 0, 49 },   /* exactly what is there         */
+        { BS_CHEST_OP_DEPOSIT,  5, 3, 40 },   /* all the wood                  */
+        { BS_CHEST_OP_WITHDRAW, 3, 0, 41 },   /* one more than the slot holds  */
+        { BS_CHEST_OP_WITHDRAW, 3, 0, 25 },   /* and then part of it           */
+        /* Slot 1 holds 81, so there is room for 18 of these 40. This is the
+         * one shape a run of whole-stack transfers never produces, and the
+         * one an over-debiting server needs in order to be visible from
+         * HERE: debit the bag by what was asked while the chest takes only
+         * what fits, and the 22-unit difference is destroyed. Added
+         * 2026-09-07 because the over-accept red arm went red only in the
+         * scenario below and left this invariant — the primary criterion —
+         * green. */
+        { BS_CHEST_OP_DEPOSIT,  2, 1, 40 },   /* partial clamp: 18 of 40 fit   */
+    };
+    for (unsigned i = 0; i < sizeof run / sizeof run[0]; i++) {
+        send_chest_action(sid, run[i].op, x, y, z, run[i].a, run[i].b, run[i].count);
+        msleep(120);
+        drain();
+    }
+
+    /* One last accepted transfer, purely to force a fresh CHEST_STATE out of
+     * the server: a refused action produces no snapshot, so without this the
+     * scenario would have to weigh the chest from a stale one. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 4, 20);
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    const ssize_t ns = recv_chest_state(sid, st, sizeof st, 900);
+    check(ns == (ssize_t)BS_CHEST_STATE_BYTES,
+          "a final DEPOSIT is answered, so the chest can be weighed from a current snapshot");
+    if (ns != (ssize_t)BS_CHEST_STATE_BYTES) return;
+
+    const bool got_end = chest_bag_read(sid, inv);
+    check(got_end, "and the bag reads back one last time");
+    if (!got_end) return;
+
+    const uint32_t dirt_end = inv_state_total(inv, 2) + chest_state_total(st, 2);
+    const uint32_t wood_end = inv_state_total(inv, 5) + chest_state_total(st, 5);
+
+    printf("  ..    dirt: %u before, %u after (bag %u + chest %u)\n",
+           dirt_start, dirt_end, inv_state_total(inv, 2), chest_state_total(st, 2));
+    printf("  ..    wood: %u before, %u after (bag %u + chest %u)\n",
+           wood_start, wood_end, inv_state_total(inv, 5), chest_state_total(st, 5));
+
+    check(dirt_end == dirt_start,
+          "CONSERVATION, dirt: bag + chest after the whole run equals bag + chest before it —"
+          " a deposit that is not debited duplicates, a withdraw that is not credited destroys,"
+          " and this is the only check in the group that can see either");
+    check(wood_end == wood_start,
+          "CONSERVATION, wood: the same total across an item that went in whole and came back"
+          " out in PART — the run leaves 15 wood behind on purpose, because an item that went in"
+          " and came all the way back out again nets to zero on the chest side and would balance"
+          " even on a server that debited nothing");
+}
+
+/* v1.9.10 fix (2026-09-07). The four behaviours the conservation invariant
+ * above is the SUM of, asserted one at a time so a failure says which half
+ * broke. Conservation catches a server that duplicates or destroys; it cannot
+ * distinguish "the debit never happened" from "the credit happened twice",
+ * and it cannot see the INV_STATE at all — a server that moved the units
+ * correctly and simply never told the actor would balance perfectly and leave
+ * every client's bag stale until its next unrelated INV_ACTION. */
+static void test_chest_transfer_moves_units_not_copies_them(void)
+{
+    puts("v1.9.10 fix: a transfer DEBITS the bag, CREDITS it, answers with INV_STATE, and never"
+         " moves more than the chest took");
+    drain();
+
+    const uint32_t sid = 0xC4E5100Cu;
+    const int32_t x = 5012, y = 40, z = 5000;
+    chest_join(sid, "chestl");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    chest_give(sid, 2 /* BLOCK_DIRT */, 99);
+    chest_give(sid, 2, 30);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    uint8_t inv[BS_INV_STATE_BYTES];
+    uint8_t item = 0, count = 0;
+
+    /* ---- DEPOSIT: the chest gains, the bag loses, and the actor is told. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 0, 10);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "a DEPOSIT of 10 dirt out of a bag holding 129 is answered with a snapshot");
+    chest_state_slot(st, 0, &item, &count);
+    check(item == 2 && count == 10, "and the chest slot holds the 10");
+
+    ssize_t ni = recv_inv_state(sid, inv, sizeof inv, 700);
+    check(ni == (ssize_t)BS_INV_STATE_BYTES,
+          "the SAME action also sends the actor an INV_STATE — without it the client's bag stays"
+          " stale and the 10 dirt exist in both places on screen");
+    if (ni == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(inv, 2) == 119u,
+              "and the bag is down to 119 — the deposit DEBITED it, it did not copy the units");
+    }
+
+    /* ---- WITHDRAW: the bag gains exactly what the chest lost. */
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 4);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "a WITHDRAW of 4 is answered with a snapshot");
+    chest_state_slot(st, 0, &item, &count);
+    check(item == 2 && count == 6, "leaving 6 in the chest slot");
+    ni = recv_inv_state(sid, inv, sizeof inv, 700);
+    check(ni == (ssize_t)BS_INV_STATE_BYTES, "and with an INV_STATE too");
+    if (ni == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(inv, 2) == 123u,
+              "with the bag back up to 123 — the withdraw CREDITED it, the units were not"
+              " destroyed on the way out");
+    }
+
+    /* ---- The over-accept case. bsgame.c clamps a deposit to the slot's
+     * remaining room, so a client that debited the full `count` would lose
+     * the difference. The bag must end up holding exactly what the chest
+     * refused. */
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 1, 95);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "priming chest slot 1 to 95");
+    (void)recv_inv_state(sid, inv, sizeof inv, 700);
+
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 1, 10);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "asking that slot for 10 more is accepted");
+    chest_state_slot(st, 1, &item, &count);
+    check(item == 2 && count == (uint8_t)BS_INV_STACK_MAX, "and it goes to 99, taking only 4");
+    ni = recv_inv_state(sid, inv, sizeof inv, 700);
+    check(ni == (ssize_t)BS_INV_STATE_BYTES, "with the matching INV_STATE");
+    if (ni == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(inv, 2) == 24u,
+              "and the bag went 28 -> 24, debited by the 4 that MOVED and not by the 10 that were"
+              " asked for — the actor holds exactly what the server did not accept");
+    }
+
+    /* ---- The source shortfall: more than the bag holds is refused whole. */
+    bool saw_state = false, saw_kick = false;
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 2, 25);
+    chest_watch(sid, 400, &saw_state, &saw_kick);
+    check(!saw_state,
+          "a DEPOSIT of 25 out of a bag holding 24 produces no snapshot — bs_proto.h refuses"
+          " \"more units than the source holds\", and the bag is a source like any other");
+    check(!saw_kick, "and does not kick");
+    if (chest_bag_read(sid, inv)) {
+        check(inv_state_total(inv, 2) == 24u, "and the refusal moved nothing: still 24 in the bag");
+    } else {
+        check(false, "the bag could be read back after the refusal");
+    }
+}
+
+/* v1.9.10 fix (2026-09-07). The second, coupled fault: before this change
+ * broadcast_chest_state() had exactly one caller, so a chest's contents only
+ * ever reached a client that happened to be connected when somebody moved a
+ * stack. A player who joined later opened a full chest, saw eight empty slots,
+ * could take nothing out of it — and could BREAK it, paying themselves from
+ * their own empty local record while the server deleted the real contents.
+ *
+ * The check that matters is the last one: the joiner can actually WITHDRAW
+ * what the snapshot showed. A snapshot the client stores but cannot act on
+ * would satisfy a weaker test and still lose the chest. */
+static void test_chest_contents_reach_a_player_who_joins_later(void)
+{
+    puts("v1.9.10 fix: a player who joins after a chest is filled gets its contents on CHUNK_SUB");
+    drain();
+
+    const uint32_t sid_a = 0xC4E5100Du, sid_b = 0xC4E5100Eu;
+    /* A column of its own, well clear of every other chest scenario's:
+     * 5120 >> BS_CHUNK_DIM_SHIFT is column 320, and the rest of this group
+     * lives around columns 312-313. */
+    const int32_t x = 5120, y = 40, z = 5120;
+    const int32_t cx = 320, cz = 320;
+
+    chest_join(sid_a, "chestm");
+    chest_place_block(sid_a, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    chest_give(sid_a, 2 /* BLOCK_DIRT */, 40);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid_a, BS_CHEST_OP_DEPOSIT, x, y, z, 2, 5, 40);
+    check(recv_chest_state(sid_a, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "the first player fills chest slot 5 with 40 dirt");
+    drain();
+
+    /* B was not connected for that broadcast, and the server does not resend
+     * a snapshot until the next mutation. */
+    chest_join(sid_b, "chestn");
+    drain();
+
+    /* A column with nothing in it first, so the delivery is provably SCOPED
+     * and not a full dump that happens to include the right chest. */
+    bool saw_state = false, saw_kick = false;
+    send_chunk_sub(sid_b, 400, 400);
+    chest_watch(sid_b, 400, &saw_state, &saw_kick);
+    check(!saw_state,
+          "subscribing to an empty column sends no chest snapshots at all — the contents ride the"
+          " column, they are not dumped at whoever asks for anything");
+    check(!saw_kick, "and a CHUNK_SUB for an empty column is not a kick");
+
+    /* Now the column the chest is actually in. */
+    send_chunk_sub(sid_b, cx, cz);
+    const ssize_t n = recv_chest_state(sid_b, st, sizeof st, 900);
+    check(n == (ssize_t)BS_CHEST_STATE_BYTES,
+          "subscribing to the chest's column DOES deliver a snapshot — a joiner used to see eight"
+          " empty slots and break the chest believing it empty");
+    if (n == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t it = 0, ct = 0;
+        chest_state_slot(st, 5, &it, &ct);
+        check(chest_state_at(st, x, y, z),
+              "the snapshot names the chest's own position, not the column's");
+        check(it == 2 && ct == 40,
+              "and carries the 40 dirt the other player put there before this one existed");
+    }
+
+    /* The payoff, and the check that a merely-stored snapshot cannot pass:
+     * the joiner can take the units out. */
+    send_chest_action(sid_b, BS_CHEST_OP_WITHDRAW, x, y, z, 5, 0, 40);
+    const ssize_t nw = recv_chest_state(sid_b, st, sizeof st, 900);
+    check(nw == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and the joiner can withdraw from a chest they never saw being filled");
+    uint8_t inv[BS_INV_STATE_BYTES];
+    if (recv_inv_state(sid_b, inv, sizeof inv, 900) == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(inv, 2) == 40u,
+              "with all 40 dirt landing in a bag that started empty");
+    } else {
+        check(false, "the joiner's withdraw is answered with an INV_STATE");
+    }
+
+    send_leave(sid_a);
+    send_leave(sid_b);
+    msleep(50);
+    drain();
+}
+
+/* v1.9.10 fix (2026-09-07). THE HEADLINE BUG, from the ledger side.
+ *
+ * Breaking a chest used to run cheststoreRemove() and put a BLOCK_EDIT on the
+ * wire and nothing else. Measured with an adversary receiver bound to the real
+ * bsgame.c: 0 CHEST_STATE, 0 INV_STATE, 1 BLOCK_EDIT — 94 units left the
+ * authoritative store with nothing on the wire to account for them. The client
+ * appeared to pay itself out of its own local record, and the very next
+ * INV_ACTION (handle_inv_action answers every one of them with an
+ * unconditional INV_STATE built from p->inv) overwrote the bag with a server
+ * inventory that had never been credited, so the items vanished on the next
+ * hotbar tap.
+ *
+ * What this asserts is a SUM, for test_chest_conservation_invariant()'s reason:
+ * bag + chest weighed before the break and after it, per item id. A scenario
+ * that only checked "an INV_STATE arrived" would stay green on a server that
+ * credited the wrong number, and one that only checked the chest side cannot
+ * see this bug at all — the chest side is correct either way, the record is
+ * gone in both.
+ *
+ * Two item ids in two different chest slots on purpose: the payout walks all
+ * BS_CHEST_SLOTS, and a loop that credited only the first non-empty slot would
+ * balance for a one-item chest. */
+static void test_chest_break_pays_the_breaker(void)
+{
+    puts("v1.9.10 fix: breaking a chest CREDITS the breaker's bag — bag + chest conserves");
+    drain();
+
+    const uint32_t sid = 0xC4E5100Fu;
+    const int32_t x = 5013, y = 40, z = 5000;
+    chest_join(sid, "chesto");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    chest_give(sid, 2 /* BLOCK_DIRT */, 40);
+    chest_give(sid, 5 /* BLOCK_WOOD */, 12);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 2 /* BLOCK_DIRT */, 0, 30);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "thirty dirt go into chest slot 0");
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 5 /* BLOCK_WOOD */, 3, 12);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "and twelve wood into chest slot 3 — two item ids in two slots, so a payout that walks"
+          " only the first non-empty slot cannot balance");
+    drain();
+
+    /* The weigh-in. Both halves, before anything is broken. */
+    uint8_t bag[BS_INV_STATE_BYTES];
+    uint32_t bag_dirt = 0, bag_wood = 0;
+    if (chest_bag_read(sid, bag)) {
+        bag_dirt = inv_state_total(bag, 2);
+        bag_wood = inv_state_total(bag, 5);
+        check(bag_dirt == 10 && bag_wood == 0,
+              "the bag holds the ten dirt the deposit left behind and no wood at all");
+    } else {
+        check(false, "the bag can be weighed before the break");
+    }
+    const uint32_t chest_dirt = 30, chest_wood = 12;
+    drain();
+
+    /* The break. Stone over the chest: the block changes, so the record goes. */
+    send_block_edit(sid, x, y, z, 3 /* BLOCK_STONE */);
+
+    const ssize_t n = recv_inv_state(sid, bag, sizeof bag, 900);
+    check(n == (ssize_t)BS_INV_STATE_BYTES,
+          "the breaker is sent an INV_STATE — before this fix the break put ONE BLOCK_EDIT on the"
+          " wire and nothing else, and the contents left the store unaccounted for");
+    if (n == (ssize_t)BS_INV_STATE_BYTES) {
+        check(inv_state_total(bag, 2) == bag_dirt + chest_dirt,
+              "and it carries the credited dirt: bag + chest before == bag after");
+        check(inv_state_total(bag, 5) == bag_wood + chest_wood,
+              "and the credited wood too — the second slot was paid out, not just the first");
+    }
+
+    /* Read the bag back independently of the reply, so the conservation claim
+     * does not rest on the same packet the credit claim does: a server that
+     * sent a correct-looking INV_STATE without committing p->inv would be
+     * green above and red here, which is exactly the shape of the original bug
+     * seen from the client (the next INV_ACTION overwrote the bag). */
+    if (chest_bag_read(sid, bag)) {
+        check(inv_state_total(bag, 2) == bag_dirt + chest_dirt
+              && inv_state_total(bag, 5) == bag_wood + chest_wood,
+              "and a FRESH read of the bag — a separate INV_ACTION, the very thing that used to"
+              " make the items vanish — still shows the credit, so p->inv really was committed");
+    } else {
+        check(false, "the bag can be weighed after the break");
+    }
+
+    /* The record went with the block: put a chest back and it comes up empty.
+     * Without this the payout would be a duplication bug instead of a
+     * destruction one. */
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    drain();
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 1);
+    bool saw_state = false, saw_kick = false;
+    chest_watch(sid, 500, &saw_state, &saw_kick);
+    check(!saw_state,
+          "a chest re-placed on the same cell is EMPTY — the units were paid out once, they did"
+          " not also stay in a record that outlived the block");
+    check(!saw_kick, "and asking is not a kick");
+
+    send_leave(sid);
+    msleep(50);
+    drain();
+}
+
+/* v1.9.10 fix (2026-09-07). The other half of the payout, and the one that
+ * decides what "conserves" means when the bag has no room.
+ *
+ * There are exactly three things a server can do with a chest full of units
+ * the breaker cannot carry: destroy the remainder (the bug, in a new costume),
+ * drop it into the world (impossible — this process has no entity system, see
+ * bsgame.c's header comment), or refuse the break. It refuses, and refusing is
+ * only worth anything if it is COMPLETE: the block must not change, the record
+ * must survive with its contents, and the player must be able to empty their
+ * bag and try again. This scenario measures all three, in that order.
+ *
+ * The ordering trap lives here. diffstoreApply() commits the edit before the
+ * old orphan-drop line ran, so a refusal decided after the commit would leave
+ * a world that had changed and a chest record that had not. `observer` is what
+ * catches that: a second, legacy player (never sends CHUNK_SUB, so
+ * broadcast_block_edit() reaches it unscoped) watching the cell for a
+ * BLOCK_EDIT that must never arrive. */
+static void test_chest_break_into_a_full_bag_is_refused(void)
+{
+    puts("v1.9.10 fix: a break that cannot be paid for is REFUSED whole — block, record and bag"
+         " all unchanged");
+    drain();
+
+    const uint32_t sid = 0xC4E51010u, observer = 0xC4E51011u;
+    const int32_t x = 5014, y = 40, z = 5000;
+    chest_join(sid, "chestp");
+    chest_join(observer, "chestq");
+    chest_place_block(sid, x, y, z, (uint8_t)BSGAME_TEST_BLOCK_CHEST);
+    chest_give(sid, 5 /* BLOCK_WOOD */, 20);
+    drain();
+
+    uint8_t st[BS_CHEST_STATE_BYTES];
+    send_chest_action(sid, BS_CHEST_OP_DEPOSIT, x, y, z, 5 /* BLOCK_WOOD */, 0, 20);
+    check(recv_chest_state(sid, st, sizeof st, 700) == (ssize_t)BS_CHEST_STATE_BYTES,
+          "twenty wood go into the chest, leaving the depositor's bag empty");
+    drain();
+
+    /* Every slot, at the cap, all one item: inventoryAdd() has nothing to
+     * merge into and nothing to spill into, so it refuses outright. */
+    const uint32_t filled = chest_fill_bag(sid, 2 /* BLOCK_DIRT */);
+    uint8_t bag[BS_INV_STATE_BYTES];
+    if (chest_bag_read(sid, bag)) {
+        check(inv_state_total(bag, 2) == filled,
+              "and the breaker's bag is then filled to its very last slot — every slot at the"
+              " stack cap, so nothing more can fit in it at all");
+    } else {
+        check(false, "the filled bag can be weighed");
+    }
+    drain();
+
+    /* The break that cannot be paid for. */
+    send_block_edit(sid, x, y, z, 3 /* BLOCK_STONE */);
+    check(!chest_saw_block_edit(observer, x, y, z, 500),
+          "NO BLOCK_EDIT reaches the other player — the world did not change, so the refusal was"
+          " decided BEFORE the diff store was committed, not after it");
+    check(recv_inv_state(sid, bag, sizeof bag, 300) != (ssize_t)BS_INV_STATE_BYTES,
+          "and the breaker is credited nothing — a refused break sends no INV_STATE");
+    drain();
+
+    if (chest_bag_read(sid, bag)) {
+        check(inv_state_total(bag, 2) == filled && inv_state_total(bag, 5) == 0,
+              "the bag is byte-for-byte what it was: still full of dirt, still holding no wood —"
+              " no partial payout was smuggled in");
+    } else {
+        check(false, "the bag can be weighed after the refusal");
+    }
+
+    /* "Empty your bag and try again" is the whole promise of a refusal, so it
+     * is asserted rather than assumed. */
+    chest_empty_bag(sid, 2 /* BLOCK_DIRT */);
+    if (chest_bag_read(sid, bag)) {
+        check(inv_state_total(bag, 2) == 0, "the player empties the bag");
+    } else {
+        check(false, "the emptied bag can be weighed");
+    }
+    drain();
+
+    /* THE RECORD SURVIVED, AND THE BLOCK IS STILL A CHEST. One packet proves
+     * both: chest_action_apply() refuses a CHEST_ACTION unless the diff store
+     * says BLOCK_CHEST stands at the cell, and a WITHDRAW can only answer with
+     * a snapshot if the record is still there holding the units. */
+    send_chest_action(sid, BS_CHEST_OP_WITHDRAW, x, y, z, 0, 0, 1);
+    const ssize_t nw = recv_chest_state(sid, st, sizeof st, 900);
+    check(nw == (ssize_t)BS_CHEST_STATE_BYTES,
+          "a WITHDRAW at the cell is still answered — the block is STILL A CHEST and the record"
+          " survived the refused break");
+    if (nw == (ssize_t)BS_CHEST_STATE_BYTES) {
+        uint8_t item = 0, count = 0;
+        chest_state_slot(st, 0, &item, &count);
+        check(item == 5 && count == 19,
+              "with all twenty wood still in it before that withdraw — the contents were intact,"
+              " not silently trimmed to what would have fitted");
+    }
+    drain();
+
+    /* And now the break goes through, paying out the nineteen that are left. */
+    send_block_edit(sid, x, y, z, 3 /* BLOCK_STONE */);
+    check(chest_saw_block_edit(observer, x, y, z, 700),
+          "breaking it again with room in the bag DOES change the world this time");
+    if (chest_bag_read(sid, bag)) {
+        check(inv_state_total(bag, 5) == 20u,
+              "and the player ends up holding all twenty wood: 1 withdrawn + 19 paid out by the"
+              " break — nothing was destroyed by the refusal that came before it");
+    } else {
+        check(false, "the bag can be weighed after the retried break");
+    }
+
+    send_leave(sid);
+    send_leave(observer);
+    msleep(50);
+    drain();
+}
+
+/* v1.9.10 (2026-09-07), the crash-durability fix, SOURCE-TEXT half.
+ *
+ * handle_block_edit() force-flushes chests.bin in the same step as the chest
+ * break (bsgame.c, inside `if (has_record)`). MEASURED window it closes: prime
+ * a chest, SIGKILL inside BS_CHEST_FLUSH_MS, and inventory.dat already holds
+ * the credited units while chests.bin still holds the removed record's old
+ * ones — the two stores disagreeing on disk.
+ *
+ * Why this is a source-text check and not a behavioural one. A behavioural
+ * check was written first — read chests.bin off disk right after the break —
+ * and thrown out, because it could not go red. This suite runs ONE shared
+ * daemon (main(), g_daemon) through every chest scenario above; by the time a
+ * break happens, tick()'s own debounced cheststoreFlush(force=false) (every
+ * TICK_HZ=20 tick, 50ms) already has a stale last_flush_ms from that traffic
+ * and flushes on the very next tick regardless of the fix. Proving the forced
+ * flush behaviourally needs a real kill and restart, which a shared-process
+ * suite cannot do without ending the run; scratchpad/m1910/srvmeasure.c is
+ * that instrument and stays the only one that can catch the actual window.
+ * What is left to guard in-repo is that the CALL is still there, so this pins
+ * the source text — the technique ../../source/net/networld_test.c already
+ * uses on source/main.c's edit hooks.
+ *
+ * Scoped, not grepped. bsgame.c calls cheststoreFlush() in three places —
+ * here, in tick(), and at shutdown — so a file-wide search for the name passes
+ * with the fix deleted, i.e. proves nothing. Everything below runs against the
+ * `if (has_record)` block's body alone, and the extraction has its own checks:
+ * a locator that finds nothing FAILS rather than quietly searching an empty
+ * string and reporting no violation. */
+static char *read_whole_source_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    const long n = ftell(f);
+    if (n <= 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (buf == NULL) { fclose(f); return NULL; }
+    const size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+/* The `}` matching the `{` at `open`, or NULL if the text runs out first. Plain
+ * brace counting, which is sound on the one region it is used on below: the
+ * `if (has_record)` block's body is ten lines of comment-free code whose only
+ * braces are real ones (its format strings carry "(%d,%d,%d)", no braces). A
+ * miscount surfaces as NULL — a FAILING check — never as a silently over-wide
+ * body that would make the scoping vacuous. */
+static const char *matching_brace(const char *open)
+{
+    int depth = 0;
+    for (const char *c = open; *c != '\0'; c++) {
+        if (*c == '{') {
+            depth++;
+        } else if (*c == '}') {
+            depth--;
+            if (depth == 0) return c;
+        }
+    }
+    return NULL;
+}
+
+static void test_chest_break_forces_a_chest_store_flush(void)
+{
+    puts("handle_block_edit() force-flushes chests.bin in the same step as the chest break");
+
+    /* `make test` (game/Makefile) runs ./bsgame_test with game/ as the working
+     * directory, and this suite never chdir()s — VERIFIED by running it, not
+     * assumed. The path is named in the check text so a failure says which one
+     * was tried rather than only that a file was missing. */
+    static const char *const SRC_PATH = "bsgame.c";
+    char what[192];
+
+    char *src = read_whole_source_file(SRC_PATH);
+    snprintf(what, sizeof what,
+             "the daemon's source could be read (tried \"%s\", relative to the suite's working"
+             " directory)", SRC_PATH);
+    check(src != NULL, what);
+    if (src == NULL) return;
+
+    /* Control for the whole technique: the OTHER cheststoreFlush() calls are
+     * still in this file. That is precisely why the search below is scoped —
+     * with these present, a file-wide search for the name stays green even with
+     * the forced flush deleted. If this ever fails, the scoping has stopped
+     * being the thing that makes the assertions meaningful. */
+    check(strstr(src, "cheststoreFlush(&g->chests, now, false)") != NULL,
+          "control: tick()'s DEBOUNCED cheststoreFlush() is still elsewhere in this file, so a"
+          " file-wide search for the name would pass even with the forced flush deleted");
+
+    const char *fn = strstr(src, "static void handle_block_edit(");
+    check(fn != NULL, "handle_block_edit() was located in the daemon's source");
+    if (fn == NULL) {
+        free(src);
+        return;
+    }
+
+    /* Function bounds first, so the block search cannot wander into a later
+     * function if handle_block_edit() ever loses its own. Line-initial closing
+     * brace, the idiom networld_test.c uses: every top-level function here ends
+     * at column 0 and nothing inside this one starts a line with `}`. */
+    const char *fn_end = strstr(fn, "\n}");
+    check(fn_end != NULL, "handle_block_edit()'s body is delimited");
+    if (fn_end == NULL) {
+        free(src);
+        return;
+    }
+
+    const char *blk = strstr(fn, "if (has_record) {");
+    check(blk != NULL && blk < fn_end,
+          "the `if (has_record)` chest-break block was located inside handle_block_edit()");
+    if (blk == NULL || blk >= fn_end) {
+        free(src);
+        return;
+    }
+
+    const char *open  = strchr(blk, '{');
+    const char *close = (open != NULL) ? matching_brace(open) : NULL;
+    check(close != NULL, "the `if (has_record)` block's body is delimited by a matching brace");
+    if (close == NULL) {
+        free(src);
+        return;
+    }
+
+    const size_t body_len = (size_t)(close - blk) + 1u;
+    char *body = (char *)malloc(body_len + 1u);
+    check(body != NULL, "the block's body could be copied out for searching");
+    if (body == NULL) {
+        free(src);
+        return;
+    }
+    memcpy(body, blk, body_len);
+    body[body_len] = '\0';
+
+    /* ---- the extraction is real, and it is NARROW -------------------------
+     *
+     * These four are what stop the assertions below from being a file-wide
+     * grep wearing a scope's clothes. They go red if the delimiter ever
+     * over-runs, which is the failure mode that would make everything after
+     * them pass for the wrong reason. */
+    check(body_len > 0u && body_len < 1024u,
+          "the extracted body is block-sized, not file-sized — the scope really is a scope");
+    check(strstr(body, "cheststoreRemove(&g->chests, x, y, z)") != NULL,
+          "control: the removal this block exists to perform is inside the extracted body, so the"
+          " search shape does find hits in it");
+    check(strstr(body, "broadcast_block_edit") == NULL,
+          "and the body stops at the block: broadcast_block_edit(), the next statement AFTER it,"
+          " is outside what was extracted");
+    check(strstr(body, "cheststoreFlush(&g->chests, now, false)") == NULL,
+          "and it did not swallow tick()'s debounced flush either");
+
+    /* ---- the assertion ---------------------------------------------------- */
+    const char *remove_at = strstr(body, "cheststoreRemove(");
+    const char *flush_at  = strstr(body, "cheststoreFlush(");
+
+    check(flush_at != NULL,
+          "a cheststoreFlush() call stands INSIDE the `if (has_record)` block — the chest break"
+          " writes chests.bin in the same step it removes the record");
+    check(strstr(body, "cheststoreFlush(&g->chests, now, true)") != NULL,
+          "and it is the FORCED form (force=true) — a debounced call here would leave the"
+          " measured crash window open");
+    check(remove_at != NULL && flush_at != NULL && flush_at > remove_at,
+          "and the flush comes AFTER the removal, so what reaches the disk is the store with the"
+          " record already gone");
+
+    free(body);
+    free(src);
+}
+
+/* v1.9.10 (2026-09-06). The chest group's own check count, pinned as a
+ * LITERAL the way the client tree's *_EXPECTED_CHECKS constants are (see
+ * tests/food_placeable_invariant_test.c, which writes the idiom out: "a
+ * literal, never computed from a production constant"). Without it, deleting
+ * a check inside this group shrinks the run silently and every remaining
+ * check still passes.
+ *
+ * Scoped to this group's DELTA rather than to g_checks as a whole, and that
+ * is deliberate: this suite has never carried a whole-file pin, and adding
+ * one would go red every time anyone added a check anywhere else in the file
+ * — a pin that cries wolf gets raised instead of read.
+ *
+ * MEASURED, not summed: this is the number the run below actually printed
+ * for `g_checks - chest_checks_before`, read off a green run on 2026-09-06,
+ * not a total arrived at by counting check() calls in the source.
+ *
+ * 2026-09-07, the conservation fix: 184 -> 214. Three scenarios were added
+ * (test_chest_conservation_invariant, the transfer-debits-and-credits one and
+ * the joiner-gets-the-contents one) and no check was removed. Read off this
+ * run's own "chest group ran N checks" line, again, never summed.
+ *
+ * 2026-09-07, the break-payout fix: 214 -> 233. Two scenarios were added
+ * (test_chest_break_pays_the_breaker and
+ * test_chest_break_into_a_full_bag_is_refused) and no check was removed. Read
+ * off the "chest group ran 233 checks (pin is 214)" line that run printed
+ * while the pin was still at the old number — not summed from the source.
+ *
+ * 2026-09-07, the crash-durability fix (forced cheststoreFlush() at the
+ * chest-break site in handle_block_edit()): no check added here. A disk-read
+ * check was tried (chest_bin_has_record() right after the break) and thrown
+ * out — red-armed by reverting the forced flush, it stayed GREEN, because
+ * this suite runs one shared daemon (main(), g_daemon) through many earlier
+ * chest scenarios first, each marking the store dirty; by the time this
+ * scenario runs, tick()'s own debounced cheststoreFlush(force=false) (called
+ * every TICK_HZ=20 tick, 50ms) already has a stale last_flush_ms from that
+ * earlier traffic, so the very next tick flushes anyway regardless of the
+ * fix. A check that cannot go red proves nothing, so it was removed rather
+ * than kept for show. The real regression coverage for this fix is
+ * scratchpad/m1910/srvmeasure.c, which SIGKILLs the daemon inside the
+ * debounce window and reads chests.bin/inventory.dat back after a restart —
+ * that needs a real kill and restart this shared-process suite cannot do
+ * without ending the whole run, so it stays the only instrument that can
+ * catch the actual crash window.
+ *
+ * 2026-09-07, the crash-durability fix, source-text half: 233 -> 247. The
+ * paragraph above still describes the DISK-READ attempt correctly and it is
+ * still gone. What replaced it is a source-text scenario,
+ * test_chest_break_forces_a_chest_store_flush(), which pins the forced
+ * cheststoreFlush() call inside handle_block_edit()'s `if (has_record)` block
+ * — see its own header for why the scoping is what makes it non-tautological.
+ * Unlike the disk-read attempt it DOES go red: verified twice, once with the
+ * flush statement deleted outright and once with it merely moved out of the
+ * block to just before broadcast_block_edit(). Read off the "chest group ran
+ * 247 checks (pin is 233)" line that run printed while the pin was still at
+ * the old number — not summed from the source. */
+#define BSGAME_TEST_CHEST_CHECKS 247
+
 /* ------------------------------------------------------------------- main */
 
 static void reap_daemon(void)
@@ -3617,6 +5777,39 @@ int main(void)
      * world_gen declares — nothing after this point does. */
     test_time_sync_on_join_and_periodic();
     test_day_time_persists_across_restart();
+
+    /* v1.9.10, chests: after the day/night restart, for the same reason that
+     * scenario gives — these place blocks and join players, and nothing above
+     * should have to work around a world they have edited. The in-process
+     * half needs no daemon at all but is run here so the whole group's check
+     * count is one contiguous span. */
+    const int chest_checks_before = g_checks;
+    test_chest_action_decode();
+    test_chest_state_encode();
+    test_cheststore_deposit_rules();
+    test_cheststore_withdraw_rules();
+    test_cheststore_remove_and_capacity();
+    test_cheststore_disk_round_trip();
+    test_chest_deposit_broadcasts_a_snapshot();
+    test_chest_deposit_partial_merge_at_the_cap();
+    test_chest_deposit_refusals_are_silent();
+    test_chest_withdraw();
+    test_chest_action_count_validation();
+    test_chest_action_malformed_is_not_a_kick();
+    test_chest_position_gating();
+    test_chest_orphan_record_dropped_on_block_edit();
+    test_chest_two_players_cannot_take_the_same_stack();
+    test_chest_conservation_invariant();
+    test_chest_transfer_moves_units_not_copies_them();
+    test_chest_contents_reach_a_player_who_joins_later();
+    test_chest_break_pays_the_breaker();
+    test_chest_break_into_a_full_bag_is_refused();
+    test_chest_break_forces_a_chest_store_flush();
+    const int chest_checks = g_checks - chest_checks_before;
+    printf("  ..    chest group ran %d checks (pin is %d)\n", chest_checks, BSGAME_TEST_CHEST_CHECKS);
+    check(chest_checks == BSGAME_TEST_CHEST_CHECKS,
+          "the chest group ran the number of checks it is pinned at — a deleted check shrinks the"
+          " run silently otherwise, and every survivor still passes");
 
     stop_daemon();
 

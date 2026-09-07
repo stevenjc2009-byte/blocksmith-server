@@ -37,6 +37,7 @@
 #include <sys/un.h>
 
 #include "../proto/bs_proto.h"
+#include "cheststore.h"
 #include "diffstore.h"
 #include "playerstate.h"
 #include "players.h"
@@ -55,6 +56,11 @@
 #include "world/crafting.h"
 #include "world/inventory.h"
 #include "world/tick.h"
+
+/* v1.9.10. BLOCK_CHEST, for "is the cell a CHEST_ACTION names actually a
+ * chest". The vendored copy, unconditionally present (validate.c's note on
+ * why block.h needs no #if). */
+#include "world/block.h"
 
 /* Gate<->game framing (enum bs_game_msg). This used to be hand-copied here,
  * under a comment naming "server/gateway/bsgate.c:293-298" as canonical — a
@@ -275,6 +281,12 @@ struct bs_game {
 
     BsPlayers   players;
     BsDiffStore diffs;
+
+    /* v1.9.10. Every player-placed chest's contents — see cheststore.h.
+     * Which cells ARE chests is the diff store's knowledge, not this one's:
+     * handle_chest_action() asks `diffs` for BLOCK_CHEST at the position
+     * before it asks `chests` for anything. */
+    BsChestStore chests;
 };
 
 /* ------------------------------------------------------------------- util */
@@ -976,6 +988,22 @@ static void send_time_sync(struct bs_game *g, uint32_t sid)
     send_data(g, sid, payload, sizeof payload);
 }
 
+/* v1.9.10. Tells one player which optional features this server speaks
+ * (BS_APP_SERVER_CAPS, proto/bs_proto.h): the client never sends
+ * CHEST_ACTION unless it saw BS_CAP_CHESTS here, because handle_app_payload
+ * kicks an opcode it does not know and an older server does not know that
+ * one. S->C only, once, at the end of the join burst (handle_join). Anything
+ * a client might echo back is not a message type this side dispatches, so
+ * "caps bits a client sends are ignored" is enforced by the default case:
+ * an unknown C->S type is a kick, exactly as before. */
+static void send_server_caps(struct bs_game *g, uint32_t sid)
+{
+    uint8_t payload[BS_SERVER_CAPS_BYTES];
+    payload[0] = BS_APP_SERVER_CAPS;
+    bs_put_u32(payload + 1, BS_CAP_CHESTS);
+    send_data(g, sid, payload, sizeof payload);
+}
+
 /* Tells one player the fingerprint of this server's block registry: layout
  * revision, defined-row count and the CRC-16 over the canonical table stream.
  * Sent immediately after WORLD_INFO at join (handle_join below) — a client
@@ -1402,11 +1430,18 @@ static void handle_join(struct bs_game *g, uint32_t sid, const uint8_t *body, si
     send_player_state(g, sid, p, state_restored);
 
     /* v1.9.8. So a player who arrives at dusk arrives at dusk — daynight.h's
-     * own phrase for this (source/world/daynight.h:356). Sent last in the
-     * burst: nothing above it depends on time of day and nothing about time
-     * of day depends on anything above it, so it carries none of the
+     * own phrase for this (source/world/daynight.h:356). Sent after
+     * PLAYER_STATE: nothing above it depends on time of day and nothing about
+     * time of day depends on anything above it, so it carries none of the
      * ordering weight WORLD_INFO through PLAYER_STATE do. */
     send_time_sync(g, sid);
+
+    /* v1.9.10. Last in the burst: what this server can do beyond the v1
+     * baseline (BS_APP_SERVER_CAPS, proto/bs_proto.h). The client latches it
+     * whenever it lands and consults it only when a chest is opened, so its
+     * position carries no ordering weight either — it rides behind TIME_SYNC
+     * so every packet an older client knows keeps the position it had. */
+    send_server_caps(g, sid);
 }
 
 static void handle_leave(struct bs_game *g, uint32_t sid)
@@ -1453,6 +1488,85 @@ static void handle_block_edit(struct bs_game *g, BsPlayer *p, const uint8_t *msg
         logf_("game: %s: rejected edit, rate limit", p->label);
         return;
     }
+    /* v1.9.10 fix (2026-09-07). THE PAYOUT, and it sits ABOVE the world commit
+     * on purpose.
+     *
+     * WHAT WAS WRONG. The orphan drop further down used to be the whole story:
+     * cheststoreRemove() dropped the record "contents and all" and only a
+     * BLOCK_EDIT went on the wire. Measured with a real AF_UNIX SOCK_DGRAM
+     * receiver bound to this process: 0 CHEST_STATE, 0 INV_STATE, 1 BLOCK_EDIT
+     * — 94 units left the authoritative store with nothing on the wire to
+     * account for them. The client appeared to pay itself out of its own local
+     * blockstate record, which is client-authoritative AND self-defeating:
+     * handle_inv_action() below answers EVERY INV_ACTION with an unconditional
+     * send_inv_state(g, p->sid, &p->inv), so the player's next hotbar tap
+     * overwrote their bag with a p->inv that had never been credited and the
+     * items silently vanished. send_chunk_column_chests() fixed VISIBILITY
+     * only; this is the ledger.
+     *
+     * ORDERING, and it is a trap. diffstoreApply() below has ALREADY COMMITTED
+     * the edit by the time the old orphan-drop line ran, so a refusal down
+     * there would leave the world changed with the chest record intact —
+     * divergence in the other direction. Two ways out: check for room before
+     * the commit, or commit and roll back. This takes the FIRST. The room check
+     * and the whole payout are computed here, above diffstoreApply(), on a
+     * SCRATCH COPY of the bag, and that copy is only written back once the
+     * commit has succeeded. Three reasons: it is craftMake()'s existing shape
+     * in this codebase (world/crafting.h — attempt the whole recipe on a
+     * scratch copy, commit only if it succeeded); a scratch bag that is never
+     * committed needs no rollback path at all, so there is no second way for
+     * this function to leave half a transfer behind; and the rollback option is
+     * the one that does not exist cleanly here, because diffstoreApply() has no
+     * undo and "re-apply the previous block id" is a second edit with its own
+     * broadcast and its own chance to be refused.
+     *
+     * A FULL BAG REFUSES THE WHOLE BREAK. Nothing is destroyed and nothing
+     * changes: the block stays, the record stays with its contents, and the
+     * player empties their bag and breaks it again. Refusing is the only
+     * conserving answer available — this process has no entity system to drop
+     * items into, and paying out "as much as fits" would destroy the rest,
+     * which is the bug this exists to close.
+     *
+     * Placed after playerEditAllow() and before diffstoreApply() so a client
+     * hammering a break it cannot be paid for is still rate limited, exactly as
+     * the diff-table-full refusal below is. */
+    Inventory paid       = p->inv;   /* scratch bag; committed after the world commit */
+    unsigned  credited   = 0;        /* units the scratch bag actually took           */
+    bool      has_record = false;    /* a chest record stands here and is to be removed */
+
+    if (block != BLOCK_CHEST) {
+        const BsChest *found = cheststoreFind(&g->chests, x, y, z);
+        if (found != NULL) {
+            /* By VALUE, before anything can move it. cheststoreRemove() swaps
+             * the LAST entry into the hole (cheststore.c, and cheststore.h's
+             * comment on cheststoreAt() warns about it), so a `const BsChest *`
+             * held across the removal reads a DIFFERENT chest. */
+            const BsChest broken = *found;
+            has_record = true;
+
+            for (unsigned s = 0; s < BS_CHEST_SLOTS; s++) {
+                const uint8_t item  = broken.slot[s][0];
+                const uint8_t units = broken.slot[s][1];
+                if (item == 0 || units == 0) continue;
+
+                /* Never NULL for out_leftover. INV_ADD_PARTIAL is a real
+                 * outcome here — a bag with room for some of a stack — and the
+                 * enum on its own cannot say how much did not fit, which is
+                 * precisely the number that decides accept versus refuse. */
+                uint8_t leftover = 0;
+                (void)inventoryAdd(&paid, item, units, &leftover);
+                if (leftover != 0) {
+                    logf_("game: %s: refused break of chest at (%d,%d,%d): the bag has no room for"
+                          " %u of %u units of item %u — nothing destroyed, empty the bag and break"
+                          " it again",
+                          p->label, x, y, z, leftover, units, item);
+                    return;
+                }
+                credited += units;
+            }
+        }
+    }
+
     if (!diffstoreApply(&g->diffs, x, y, z, block)) {
         g->edits_rejected_full++;
         logf_("game: %s: rejected edit, diff table is full", p->label);
@@ -1460,7 +1574,86 @@ static void handle_block_edit(struct bs_game *g, BsPlayer *p, const uint8_t *msg
     }
     g->edits_accepted++;
 
+    /* v1.9.10. Orphan drop. A chest's record (cheststore.h) is keyed by
+     * position alone, so if the chest block leaves this cell and the record
+     * stayed, the next chest placed here would come up full of the old one's
+     * contents — free items for whoever breaks and re-places a chest. The
+     * edit is the moment the block goes, so the record goes with it. A
+     * chest-onto-chest edit keeps it: the block did not change.
+     *
+     * v1.9.10 fix: the contents are no longer "dropped". Every unit of them is
+     * already in `paid` — or this function returned above without touching
+     * anything. The scratch bag is committed in the same step as the removal so
+     * there is no window, even to a reader's eye, in which the record is gone
+     * and the units are not yet in the bag.
+     *
+     * v1.9.10 fix (2026-09-07), disk half. The bag write below (save_player_
+     * inventory, write-through+fsync+rename, world/inventory.c) is immediate;
+     * cheststoreRemove() above only marks the in-memory store dirty — the
+     * on-disk chests.bin would not catch up for up to BS_CHEST_FLUSH_MS
+     * (cheststore.h). MEASURED: prime a chest, SIGKILL inside that window, and
+     * inventory.dat already shows the credited units while chests.bin still
+     * holds the removed record's old contents — the bag and the chest store
+     * disagree on disk even though nothing was duplicated in-game. Forcing
+     * cheststoreFlush() here, in the same step as the removal and the bag
+     * save, closes that window at its only source: a chest break is the sole
+     * place a record disappears and its units move into a bag at once.
+     *
+     * Deliberately NOT a change to the debounce itself. An ordinary deposit or
+     * withdrawal (cheststoreDeposit()/cheststoreWithdraw() via
+     * handle_chest_action()) does not touch this path and keeps coalescing
+     * under BS_CHEST_FLUSH_MS exactly as before — those are frequent and the
+     * debounce exists to absorb them. A chest break is rare and already rate
+     * limited by playerEditAllow() above, so one forced whole-file rewrite
+     * here costs little. Logged, not fatal, on failure: the same stance
+     * tick()'s own debounced flush takes — the contents are live in memory
+     * either way, and the store stays dirty for the next due attempt. */
+    if (has_record) {
+        p->inv = paid;
+        (void)cheststoreRemove(&g->chests, x, y, z);
+        logf_("game: %s: chest at (%d,%d,%d) broken by block %u, %u units paid into the bag",
+              p->label, x, y, z, block, credited);
+
+        if (cheststoreFlush(&g->chests, now, true) < 0) {
+            logf_("game: failed to write %s: %s", g->chests.path, strerror(errno));
+        }
+    }
+
     broadcast_block_edit(g, p->sid, x, y, z, block);
+
+    /* handle_chest_action()'s shape, for its reasons: persist the bag exactly
+     * as a changed INV_ACTION is persisted — without this a restart resurrects
+     * the units in the chest AND leaves them in the bag, the duplication bug by
+     * a slower route — then tell the actor what they now hold. INV_STATE is the
+     * last word this server says about an action that touched a bag, matching
+     * handle_inv_action() and handle_chest_action(). Skipped when nothing was
+     * credited: an ordinary block break must not cost a disk write.
+     *
+     * ── the two disk writes are ordered on purpose; do not swap them ────────
+     *
+     * chests.bin is force-flushed above, players/<label>/inventory.dat is
+     * written here, and no transaction spans both. A crash in the gap has to
+     * lose one way or the other, and the order picks which way:
+     *
+     *   as written  record already gone, bag not yet saved -> the units are
+     *               LOST on restart.
+     *   if swapped  bag saved, record not yet gone -> the units are in the bag
+     *               AND still in the chest: DUPLICATION.
+     *
+     * Loss is the one to take. Duplication is exploitable — a player who can
+     * make the process die at will mints items — and it inflates a shared world
+     * permanently, whereas a loss is bounded to one chest and leaves the ledger
+     * self-consistent. It is also the preference the paragraph above already
+     * states; this ordering is what implements it rather than merely happening
+     * to agree with it.
+     *
+     * The gap is one broadcast_block_edit() send between two fsync'd renames,
+     * so it is small — but it is real and it is NOT closed. Closing it needs a
+     * single write covering both stores. */
+    if (credited > 0) {
+        save_player_inventory(g, p);
+        send_inv_state(g, p->sid, &p->inv);
+    }
 }
 
 static void handle_pos_update(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
@@ -1485,6 +1678,12 @@ static void handle_pos_update(struct bs_game *g, BsPlayer *p, const uint8_t *msg
  * turns out to be full below — this is what tells tick() the player is a
  * modern client and must never fall back to a legacy full WORLD_SYNC, which
  * would defeat the entire point of scoping (see BS_CHUNK_LEGACY_GRACE_MS). */
+/* Forward declaration only: the definition lives with the rest of the chest
+ * code far below, beside broadcast_chest_state() and the store it reads, and
+ * moving that whole section up here just to satisfy declaration order would
+ * scatter the feature across the file. */
+static void send_chunk_column_chests(struct bs_game *g, uint32_t sid, int32_t cx, int32_t cz);
+
 static void handle_chunk_sub(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
 {
     if (len != BS_CHUNK_SUB_BYTES) {
@@ -1510,6 +1709,14 @@ static void handle_chunk_sub(struct bs_game *g, BsPlayer *p, const uint8_t *msg,
     }
 
     send_chunk_diffs(g, p->sid, cx, cz);
+
+    /* v1.9.10 fix. And what is INSIDE the chests in that column — see
+     * send_chunk_column_chests() for why the chest snapshots ride this reply
+     * rather than the join burst. Deliberately after send_chunk_diffs(), and
+     * deliberately NOT inside the `playerSubAdd` failure path above: a player
+     * whose subscription table is full is not tracking the column, so sending
+     * them its chest contents would be the unscoped spray this avoids. */
+    send_chunk_column_chests(g, p->sid, cx, cz);
 }
 
 /* V127-A: the client has dropped column (cx, cz) and no longer wants its
@@ -1649,6 +1856,334 @@ static void handle_inv_action(struct bs_game *g, BsPlayer *p, const uint8_t *msg
     send_inv_state(g, p->sid, &p->inv);
 }
 
+/* v1.9.10. One chest's whole contents to EVERY connected player
+ * (BS_APP_CHEST_STATE). Not column-scoped like broadcast_block_edit(): a
+ * chest transfer is rare (a stylus tap), 29 bytes, and the client's
+ * receive side writes the snapshot into its block-state table by absolute
+ * position without consulting chunk residency (net/networld.c,
+ * applyChestState), so a player who cannot see the chest simply stores what
+ * they will find in it when they walk over. Sending to everyone also closes
+ * the gap a scoped send would open for a player standing between columns
+ * with an old subscription set. */
+static void broadcast_chest_state(struct bs_game *g, int32_t x, int32_t y, int32_t z)
+{
+    uint8_t payload[BS_CHEST_STATE_BYTES];
+    chestStateEncode(payload, x, y, z, cheststoreFind(&g->chests, x, y, z));
+    broadcast_except(g, 0, payload, sizeof payload);
+}
+
+/* v1.9.10 fix. The same snapshot to ONE player. Split out of
+ * broadcast_chest_state() above for send_chunk_column_chests() below, which
+ * answers a single joiner's CHUNK_SUB and must not spray a column's chest
+ * contents at everyone else who is already holding them. */
+static void send_chest_state(struct bs_game *g, uint32_t sid,
+                             int32_t x, int32_t y, int32_t z)
+{
+    uint8_t payload[BS_CHEST_STATE_BYTES];
+    chestStateEncode(payload, x, y, z, cheststoreFind(&g->chests, x, y, z));
+    send_data(g, sid, payload, sizeof payload);
+}
+
+/* v1.9.10 fix. Every chest standing in column (cx, cz), to the player who
+ * just subscribed to it.
+ *
+ * WHY THIS EXISTS. broadcast_chest_state() used to have exactly one caller —
+ * handle_chest_action() — so a chest's contents only ever reached a client
+ * that was connected at the moment somebody moved a stack. A player who
+ * joined afterwards opened a full chest and saw eight empty slots, could
+ * withdraw nothing from it, and, worse, could BREAK it: their client paid out
+ * from its own empty local record while handle_block_edit() below ran
+ * cheststoreRemove() and deleted the real contents. A chest was destroyed by
+ * a player who had no way to see what was in it.
+ *
+ * WHY ON CHUNK_SUB, and not in the join burst. Sending every known chest at
+ * join re-creates precisely what V127-A removed: bs_proto.h's comment on
+ * BS_APP_CHUNK_SUB says shipping the whole store to every joiner "overflows a
+ * 3DS client's pending store and wastes bandwidth on columns it will never
+ * render", and a full chest dump is that same storm with a different payload
+ * (BS_CHEST_MAX is 4096 records at BS_CHEST_STATE_BYTES each — 118 KB). It
+ * would also be largely wasted: the client's block-state table is a fixed
+ * BLOCKSTATE_SLOTS-entry array, so past that many chests the surplus
+ * snapshots are dropped on arrival (source/net/networld.c, applyChestState).
+ *
+ * Scoping to the column instead bounds the cost by chests-per-column rather
+ * than chests-per-world, needs NO new opcode (which would move the protocol
+ * pin mid-client-release), and is sufficient: a player cannot render, open or
+ * break a chest in a column they have not loaded, and CHUNK_SUB is what
+ * loading a column emits. The contents therefore arrive strictly before the
+ * first moment they could matter.
+ *
+ * Nothing about this asks the client to change. applyChestState() is already
+ * required to accept an unsolicited snapshot at an arbitrary time: it is
+ * deliberately NOT gated on what the local World holds at the cell, nor on
+ * chunk residency, because the BLOCK_EDIT that places a chest and the
+ * CHEST_STATE that fills it are already allowed to arrive in either order.
+ *
+ * Sent AFTER the column's diffs so the edit that puts the chest block down
+ * precedes the snapshot that fills it. Not load-bearing — see above — but it
+ * is the natural order and costs nothing.
+ *
+ * Linear scan of the whole store, for the reason send_chunk_diffs() gives for
+ * its own: CHUNK_SUB fires on player movement, not at tick frequency, and
+ * BS_CHEST_MAX is 4096. */
+static void send_chunk_column_chests(struct bs_game *g, uint32_t sid, int32_t cx, int32_t cz)
+{
+    const uint32_t total = cheststoreCount(&g->chests);
+
+    for (uint32_t i = 0; i < total; i++) {
+        const BsChest *c = cheststoreAt(&g->chests, i);
+        if (c == NULL) break;
+        if (bs_col_of(c->x) != cx || bs_col_of(c->z) != cz) continue;
+
+        send_chest_state(g, sid, c->x, c->y, c->z);
+    }
+}
+
+/* v1.9.10. One requested chest transfer (BS_APP_CHEST_ACTION,
+ * proto/bs_proto.h): a MOVE between two stores this process owns — the
+ * chest's slots and the actor's own bag — never a change to one of them
+ * alone.
+ *
+ * v1.9.10 fix (2026-09-07). This function used to touch the chest and nothing
+ * else, on the reasoning that "the client is authoritative for what it took
+ * out of, or put into, its own inventory". That reasoning was wrong, and the
+ * consequence was two silent duplication/destruction bugs, because THE CLIENT
+ * DOES NOT DO IT EITHER. The frozen design (docs/design-1.9.0-chest-
+ * multiplayer.md, "server validates ... applies the move; then broadcasts
+ * CHEST_STATE to everyone and sends INV_STATE to the actor. The client never
+ * applies its own chest mutation optimistically") is what the client
+ * implements: source/scene/ui.c's deposit and withdraw paths call the
+ * registered chest callback and RETURN, leaving the local Inventory
+ * untouched. So a deposit put 64 stone in the chest and left 64 stone in the
+ * bag — 64 stone existing twice — and a withdraw emptied the chest slot and
+ * credited nothing anywhere. Both were invisible from the chest side, which
+ * is every assertion the original test group made.
+ *
+ * The invariant this function now holds, and the one
+ * test_chest_conservation_invariant() measures: for every item id, the total
+ * units across (the actor's bag + this chest) is the SAME before and after,
+ * on an accepted transfer, on a partial one, and on a refusal.
+ *
+ * Field contract, agreed with the client (net/networld.c, v1.9.0):
+ *   DEPOSIT   a = the ITEM ID being deposited, b = the chest slot.
+ *   WITHDRAW  a = the chest slot, b = the inventory slot (still ignored --
+ *             the units are credited by inventoryAdd()'s own merge-then-
+ *             spill placement and the actor is told where they actually
+ *             landed by the INV_STATE that follows, so a destination slot
+ *             the server would have to second-guess buys nothing).
+ *   count     units, 1..BS_INV_STACK_MAX. A COUNT, never a pad: 0 is
+ *             refused, not read as "everything".
+ *
+ * The transfer rule, symmetric in both directions:
+ *
+ *   A SHORTFALL AT THE SOURCE REFUSES THE WHOLE ACTION. bs_proto.h's contract
+ *   for this message already says so — the server refuses "more units than
+ *   the source holds". For a WITHDRAW the source is the chest slot, and
+ *   cheststore.h refuses rather than rounding down. For a DEPOSIT the source
+ *   is the bag, so a deposit of more units than inventoryCount() finds is
+ *   refused for the same reason and in the same words.
+ *
+ *   A SHORTFALL AT THE DESTINATION CLAMPS, and exactly what fit is moved out
+ *   of the source. For a DEPOSIT that is the pre-existing behaviour: a slot at
+ *   95 asked for 10 goes to 99, and the bag is debited 4, not 10 — the actor
+ *   ends up holding precisely what the server did not accept. For a WITHDRAW
+ *   the destination is the bag, so a withdraw into a bag with room for only
+ *   part of the stack moves that part and leaves the rest in the chest.
+ *
+ * The bag side is committed FIRST in both directions and rolled back if the
+ * chest side then refuses. That order is deliberate: the bag's rollback
+ * cannot itself fail (units just removed always fit back; units just added
+ * can always be removed again), whereas rolling a chest back would mean
+ * re-deriving a slot that a concurrent packet may have moved.
+ *
+ * Refusals are silent on the wire and logged here, never a kick -- even a
+ * wrong-length packet, unlike handle_block_edit(): bs_proto.h's contract for
+ * this message is "refuses, silently and without a kick, anything that does
+ * not validate". A refused transfer changes nothing, so the client is told
+ * nothing, which is how a refused INV_ACTION already reads. An accepted one
+ * broadcasts CHEST_STATE to everyone and sends INV_STATE to the actor -- see
+ * handle_chest_action() for the order and why. */
+static bool chest_action_apply(struct bs_game *g, BsPlayer *p, const BsChestAction *act)
+{
+    if (!bsEditValid(act->x, act->y, act->z, BLOCK_CHEST)) {
+        logf_("game: %s: dropped CHEST_ACTION at (%d,%d,%d), out of range",
+              p->label, act->x, act->y, act->z);
+        return false;
+    }
+    const BsDiff *cell = diffstoreFind(&g->diffs, act->x, act->y, act->z);
+    if (cell == NULL || cell->block != BLOCK_CHEST) {
+        logf_("game: %s: dropped CHEST_ACTION at (%d,%d,%d), no chest there",
+              p->label, act->x, act->y, act->z);
+        return false;
+    }
+    if (act->count == 0 || act->count > (uint8_t)BS_INV_STACK_MAX) {
+        logf_("game: %s: dropped CHEST_ACTION at (%d,%d,%d), count %u outside 1..%u",
+              p->label, act->x, act->y, act->z, act->count, (unsigned)BS_INV_STACK_MAX);
+        return false;
+    }
+
+    switch (act->op) {
+    case BS_CHEST_OP_DEPOSIT: {
+        const uint8_t item = act->a, slot = act->b;
+        if (slot >= BS_CHEST_SLOTS || !inventoryCanHold(item)) {
+            logf_("game: %s: dropped DEPOSIT at (%d,%d,%d): item %u, chest slot %u",
+                  p->label, act->x, act->y, act->z, item, slot);
+            return false;
+        }
+        /* The SOURCE check, and the half that was missing. Without it a
+         * client deposits units it does not hold and the chest mints them. */
+        const uint32_t have = inventoryCount(&p->inv, item);
+        if (have < act->count) {
+            logf_("game: %s: dropped DEPOSIT at (%d,%d,%d): asked to move %u of item %u but the"
+                  " bag holds %u",
+                  p->label, act->x, act->y, act->z, act->count, item, have);
+            return false;
+        }
+
+        const uint8_t room  = cheststoreRoom(&g->chests, act->x, act->y, act->z, slot, item);
+        const uint8_t units = act->count < room ? act->count : room;
+        if (units == 0) {
+            logf_("game: %s: dropped DEPOSIT at (%d,%d,%d): slot %u has no room for item %u",
+                  p->label, act->x, act->y, act->z, slot, item);
+            return false;
+        }
+
+        /* Debit exactly what the chest is going to take -- `units`, never
+         * `act->count` -- so a deposit clamped by the slot's remaining room
+         * leaves the difference in the bag. */
+        const uint8_t debited = inventoryRemove(&p->inv, item, units);
+        if (debited != units) {
+            /* inventoryCount() vouched for `have >= act->count >= units` a
+             * few lines up, so this is unreachable; it is here because a
+             * partial debit is the one way this function could destroy
+             * units, and a silent one would look exactly like success. */
+            if (debited > 0) (void)inventoryAdd(&p->inv, item, debited, NULL);
+            logf_("game: %s: DEPOSIT at (%d,%d,%d) aborted: bag gave up %u of %u units, all"
+                  " returned",
+                  p->label, act->x, act->y, act->z, debited, units);
+            return false;
+        }
+
+        if (!cheststoreDeposit(&g->chests, act->x, act->y, act->z, slot, item, debited)) {
+            /* cheststoreRoom() just vouched for it, so only a full table
+             * (BS_CHEST_MAX) gets here -- and Room reports 0 for that too.
+             * The units are already out of the bag at this point, so they go
+             * back before the refusal: this is the rollback the commit order
+             * in this function's header exists to make safe. */
+            uint8_t unreturned = 0;
+            (void)inventoryAdd(&p->inv, item, debited, &unreturned);
+            logf_("game: %s: DEPOSIT at (%d,%d,%d) refused by the store after room check,"
+                  " %u units returned to the bag (%u could not be)",
+                  p->label, act->x, act->y, act->z, debited - unreturned, unreturned);
+            return false;
+        }
+        return true;
+    }
+
+    case BS_CHEST_OP_WITHDRAW: {
+        const uint8_t slot = act->a;
+        if (slot >= BS_CHEST_SLOTS) {
+            logf_("game: %s: dropped WITHDRAW at (%d,%d,%d): chest slot %u",
+                  p->label, act->x, act->y, act->z, slot);
+            return false;
+        }
+
+        /* Read the slot before moving anything: the item id is needed to
+         * credit the bag, and `held` is what decides between the source
+         * shortfall (refuse) and the destination shortfall (clamp). */
+        const BsChest *c = cheststoreFind(&g->chests, act->x, act->y, act->z);
+        const uint8_t item = c != NULL ? c->slot[slot][0] : 0u;
+        const uint8_t held = c != NULL ? c->slot[slot][1] : 0u;
+        if (item == 0 || held == 0) {
+            logf_("game: %s: dropped WITHDRAW at (%d,%d,%d): chest slot %u is empty",
+                  p->label, act->x, act->y, act->z, slot);
+            return false;
+        }
+        if (act->count > held) {
+            /* cheststoreWithdraw() would refuse this too. Refusing here as
+             * well is what keeps the bag out of it: crediting first and
+             * discovering the shortfall afterwards would mean a rollback on
+             * an entirely ordinary wrong answer. */
+            logf_("game: %s: dropped WITHDRAW at (%d,%d,%d): asked for %u from chest slot %u,"
+                  " which holds %u",
+                  p->label, act->x, act->y, act->z, act->count, slot, held);
+            return false;
+        }
+
+        /* The DESTINATION clamp. inventoryAdd() reports what did not fit
+         * rather than dropping it (world/inventory.h: "an item that does not
+         * fit is *reported*, never silently dropped"), and `out_leftover` is
+         * set on every path including INV_ADD_REFUSED, so `accepted` is
+         * exactly how many units the bag really took. */
+        uint8_t leftover = 0;
+        (void)inventoryAdd(&p->inv, item, act->count, &leftover);
+        const uint8_t accepted = (uint8_t)(act->count - leftover);
+        if (accepted == 0) {
+            logf_("game: %s: dropped WITHDRAW at (%d,%d,%d): the bag has no room for item %u",
+                  p->label, act->x, act->y, act->z, item);
+            return false;
+        }
+
+        const uint8_t taken = cheststoreWithdraw(&g->chests, act->x, act->y, act->z,
+                                                 slot, accepted, NULL);
+        if (taken != accepted) {
+            /* Unreachable: 1 <= accepted <= act->count <= held. Rolled back
+             * rather than trusted, for the reason the deposit's twin gives. */
+            (void)inventoryRemove(&p->inv, item, accepted);
+            if (taken > 0) (void)inventoryAdd(&p->inv, item, taken, NULL);
+            logf_("game: %s: WITHDRAW at (%d,%d,%d) aborted: chest slot %u gave up %u of %u"
+                  " units, the bag credit was rolled back",
+                  p->label, act->x, act->y, act->z, slot, taken, accepted);
+            return false;
+        }
+        return true;
+    }
+
+    default:
+        logf_("game: %s: dropped CHEST_ACTION at (%d,%d,%d), unknown op %u",
+              p->label, act->x, act->y, act->z, act->op);
+        return false;
+    }
+}
+
+static void handle_chest_action(struct bs_game *g, BsPlayer *p, const uint8_t *msg, size_t len)
+{
+    BsChestAction act;
+    if (!chestActionDecode(msg, len, &act)) {
+        logf_("game: %s: dropped CHEST_ACTION, malformed (%zu bytes)", p->label, len);
+        return;
+    }
+    if (!chest_action_apply(g, p, &act)) return;
+
+    /* v1.9.10 fix. An accepted transfer moved units out of, or into, this
+     * player's bag, so it is persisted exactly as a changed INV_ACTION is
+     * (handle_inv_action's write-through above) -- without this a restart
+     * would resurrect the deposited units in the bag AND leave them in the
+     * chest, which is the duplication bug again by a slower route. */
+    save_player_inventory(g, p);
+
+    /* BOTH snapshots are computed from the post-commit state, and that is the
+     * load-bearing part: the chest snapshot says +N and the inventory
+     * snapshot says -N, both describing the same truth, so a client applying
+     * them in EITHER arrival order converges on the correct total. No
+     * ordering of two post-commit snapshots can show a duplicate or a gap.
+     *
+     * What the order does decide is which one is more exposed to loss on a
+     * lossy link with a bounded client receive queue -- earlier in a burst is
+     * the safer slot -- and CHEST_STATE takes it because losing it is the
+     * more damaging of the two. A chest that reads emptier than it is is
+     * exactly what invites the break-it-and-destroy-the-contents path
+     * send_chunk_column_chests() above exists to close; a lost INV_STATE
+     * merely leaves the actor's bag reading richer than it is, and the next
+     * INV_ACTION they send is answered with a fresh INV_STATE unconditionally,
+     * refused or not.
+     *
+     * INV_STATE last also matches handle_inv_action's own shape: the
+     * inventory snapshot is the last word this server says about an action
+     * that touched a bag. */
+    broadcast_chest_state(g, act.x, act.y, act.z);
+    send_inv_state(g, p->sid, &p->inv);
+}
 /* The client's report of its own armour, XP and meters (BS_APP_PLAYER_REPORT,
  * proto/bs_proto.h). Taken on trust for the same reason and in the same
  * terms as INV_ACTION's PICKUP/CONSUME ops above: this server has no
@@ -1743,6 +2278,9 @@ static void handle_app_payload(struct bs_game *g, uint32_t sid, const uint8_t *b
     case BS_APP_REGISTRY_FETCH:
         handle_registry_fetch(g, p, body, len);
         break;
+    case BS_APP_CHEST_ACTION:
+        handle_chest_action(g, p, body, len);
+        break;
     default:
         send_kick(g, sid, "unknown application message type");
         playerFree(p);
@@ -1817,6 +2355,17 @@ static void tick(struct bs_game *g, uint64_t t)
         time_out[0] = BS_APP_TIME_SYNC;
         bs_put_u64(time_out + 1, g->day_time_ticks);
         broadcast_except(g, 0, time_out, sizeof time_out);
+    }
+
+    /* v1.9.10. chests.bin's debounced write — the store itself decides
+     * whether anything is dirty and whether BS_CHEST_FLUSH_MS has passed, so
+     * this is a couple of comparisons on most ticks. A failure is logged and
+     * the store stays dirty for the next due attempt (once a second, see
+     * cheststoreFlush) rather than taking the game down: the contents are
+     * live in memory either way, exactly diffstoreApply()'s stance on a
+     * failed append. */
+    if (cheststoreFlush(&g->chests, now, false) < 0) {
+        logf_("game: failed to write %s: %s", g->chests.path, strerror(errno));
     }
 
     for (unsigned i = 0; i < BS_GAME_MAX_PLAYERS; i++) {
@@ -1996,8 +2545,8 @@ static void usage(void)
         "usage: bsgame --game-socket PATH --gate-socket PATH --state-dir DIR\n"
         "  --game-socket PATH   unix socket this process binds (gate sends JOIN/DATA/LEAVE here)\n"
         "  --gate-socket PATH   unix socket bsgate binds (this process sends DATA/KICK there)\n"
-        "  --state-dir DIR      holds block_diffs.bin, world_seed.txt, world_gen.txt, day_time.txt\n"
-        "                       and, on SIGUSR1, status.txt\n"
+        "  --state-dir DIR      holds block_diffs.bin, chests.bin, world_seed.txt, world_gen.txt,\n"
+        "                       day_time.txt and, on SIGUSR1, status.txt\n"
         "  --world-seed N       force this world's terrain seed, overwriting world_seed.txt.\n"
         "                       Omit it: the stored seed is reused, or minted on first run.\n"
         "                       Changing it strands every edit already in block_diffs.bin.\n"
@@ -2127,6 +2676,20 @@ int main(int argc, char **argv)
     }
     registryFreeze();
 
+    /* v1.9.10. After the registry is settled, because loading sanitises
+     * every stored slot through inventoryCanHold() (cheststore.h), which
+     * reads it. Refuses to start on a damaged file, diffstoreOpen()'s
+     * posture: a chest silently coming up empty is an item loss nobody can
+     * see. */
+    unsigned chests_dropped = 0;
+    if (!cheststoreOpen(&g.chests, state_dir, err, sizeof err, &chests_dropped)) {
+        logf_("game: %s", err);
+        diffstoreClose(&g.diffs);
+        return 1;
+    }
+    logf_("game: %u chest(s) loaded from %s (%u record(s) dropped)",
+          cheststoreCount(&g.chests), state_dir, chests_dropped);
+
     if (!unix_bind(&g, g.game_sock_path)) {
         diffstoreClose(&g.diffs);
         return 1;
@@ -2205,6 +2768,12 @@ int main(int argc, char **argv)
      * TICK_HZ, 0) boundary — the periodic save in tick() is the steady-state
      * path, this is just the shutdown edge case it can't cover on its own. */
     day_time_save(&g);
+
+    /* v1.9.10. Same shutdown edge for chests.bin: whatever the debounce in
+     * tick() was still holding back goes out now, unconditionally. */
+    if (cheststoreFlush(&g.chests, now_ms(), true) < 0) {
+        logf_("game: failed to write %s at shutdown: %s", g.chests.path, strerror(errno));
+    }
 
     close(g.unix_fd);
     diffstoreClose(&g.diffs);

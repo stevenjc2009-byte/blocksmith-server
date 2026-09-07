@@ -106,7 +106,7 @@ LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack -Wl,--as-needed
 # into REGISTRY_INFO, and streams dynamic defs back on REGISTRY_FETCH.
 WORLD_OBJS := world/inventory.o world/crafting.o world/crc32.o world/registry.o world/tick.o
 
-OBJS := bsgame.o diffstore.o playerstate.o players.o validate.o $(WORLD_OBJS)
+OBJS := bsgame.o diffstore.o cheststore.o playerstate.o players.o validate.o $(WORLD_OBJS)
 
 # bsgame_test.o is not in OBJS (it carries its own main()), but it includes the
 # same headers, so it needs a dep file too or `make test` inherits the exact bug
@@ -152,7 +152,7 @@ all: check-world-drift bsgame
 bsgame: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
-bsgame_test: bsgame_test.o diffstore.o playerstate.o players.o validate.o $(WORLD_OBJS)
+bsgame_test: bsgame_test.o diffstore.o cheststore.o playerstate.o players.o validate.o $(WORLD_OBJS)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 test: check-world-drift all bsgame_test
